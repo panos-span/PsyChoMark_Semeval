@@ -1,0 +1,58 @@
+{
+  "created_utc": 1759660920,
+  "stamp": "20251005_134157",
+  "config": {
+    "data_dir": ".",
+    "output_root": "data\\derived",
+    "seed": 42,
+    "lsh_bands": 8,
+    "lsh_ham": 4,
+    "skip_preprocess": true
+  },
+  "notes": "Processed official train/dev splits. Cleaned cross-split leakage and internal train duplicates.",
+  "sizes": {
+    "train_raw": 3682,
+    "dev_raw": 100,
+    "train_final": 3360,
+    "dev_final": 100,
+    "train_docs_removed_leakage": 20,
+    "num_within_train_removed_docs": 302
+  },
+  "lsh": {
+    "bands": 8,
+    "ham": 4
+  },
+  "inputs": {
+    "train_path": "train_rehydrated.jsonl",
+    "dev_path": "dev_rehydrated.jsonl",
+    "train_sha256": "52c4e753235e090a33602a1a798bda271a9290c3ec6a75531be92f497f3976b7",
+    "dev_sha256": "27a53cf00d12b73b44ef7b9627d11fd8af12c6ca994434908b55861b046a46a9"
+  },
+  "artifacts": {
+    "class_weights.json": "C:\\Users\\panagiotis\\Desktop\\GitHub\\PsyChoMark_Semeval\\data\\derived\\psycomark_official_split_20251005_134157\\class_weights.json",
+    "dev.jsonl": "C:\\Users\\panagiotis\\Desktop\\GitHub\\PsyChoMark_Semeval\\data\\derived\\psycomark_official_split_20251005_134157\\dev.jsonl",
+    "dup_audit.csv": "C:\\Users\\panagiotis\\Desktop\\GitHub\\PsyChoMark_Semeval\\data\\derived\\psycomark_official_split_20251005_134157\\dup_audit.csv",
+    "leakage_removed_train.csv": "C:\\Users\\panagiotis\\Desktop\\GitHub\\PsyChoMark_Semeval\\data\\derived\\psycomark_official_split_20251005_134157\\leakage_removed_train.csv",
+    "length_priors.json": "C:\\Users\\panagiotis\\Desktop\\GitHub\\PsyChoMark_Semeval\\data\\derived\\psycomark_official_split_20251005_134157\\length_priors.json",
+    "train.jsonl": "C:\\Users\\panagiotis\\Desktop\\GitHub\\PsyChoMark_Semeval\\data\\derived\\psycomark_official_split_20251005_134157\\train.jsonl"
+  },
+  "offset_integrity": {
+    "train": {
+      "total_spans": 18712,
+      "ok_bounds": 18712,
+      "have_text": 18712,
+      "ok_exact": 18712,
+      "rate_ok_bounds": 1.0,
+      "rate_ok_exact_of_with_text": 1.0
+    },
+    "dev": {
+      "total_spans": 0,
+      "ok_bounds": 0,
+      "have_text": 0,
+      "ok_exact": 0,
+      "rate_ok_bounds": 0.0,
+      "rate_ok_exact_of_with_text": null
+    },
+    "skip_preprocess": true
+  }
+}

@@ -1,0 +1,17 @@
+s1_nms_iou:
+  Actor: 0.60
+  Victim: 0.60
+  Action: 0.50
+  Effect: 0.50
+  Evidence: 0.50
+
+s1_conflict_iou:
+  action_effect: 0.60
+  actor_victim: 0.55
+
+prior_penalty:
+  z_len_weight: 0.4
+  start_dist_weight: 0.6
+
+s2_gate: 0.60
+seed: 42

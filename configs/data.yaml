@@ -1,0 +1,3 @@
+data_root: data
+derived_root: data/derived
+latest_ptr: data/derived/psycomark_latest.txt

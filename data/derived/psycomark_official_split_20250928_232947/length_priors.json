@@ -1,0 +1,10 @@
+{
+  "q90_per_label": {
+    "Action": 59,
+    "Actor": 25,
+    "Effect": 75,
+    "Evidence": 80,
+    "Victim": 24
+  },
+  "lambda": 0.15
+}

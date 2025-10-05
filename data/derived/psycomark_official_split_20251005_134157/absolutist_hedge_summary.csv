@@ -1,0 +1,6 @@
+,abs_per_1k,abs_per_1k,abs_per_1k,abs_per_1k,hed_per_1k,hed_per_1k,hed_per_1k,hed_per_1k
+,mean,median,std,count,mean,median,std,count
+doc_label,,,,,,,,
+cant_tell,0.3375,0.0,1.2644,606,0.6803,0.0,1.7305,606
+conspiracy,0.4872,0.0,1.4356,1161,0.6139,0.0,1.4343,1161
+non,0.3058,0.0,1.0385,1593,0.6674,0.0,1.593,1593

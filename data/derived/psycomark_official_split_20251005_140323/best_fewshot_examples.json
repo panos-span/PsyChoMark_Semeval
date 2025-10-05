@@ -1,0 +1,314 @@
+{
+  "s1": [
+    {
+      "doc_id": "t1_f0jypww",
+      "text": "While looking into the Crowley family of Gibson Island, we came across a resident named Christian Crowley who had the same middle initials as Aleister Crowley's mentor. He also has a weird picture on his  mylife.com",
+      "spans": [
+        {
+          "label": "Victim",
+          "start": 88,
+          "end": 97
+        }
+      ],
+      "meta": {
+        "source_window": [
+          0,
+          217
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_hkef6r3",
+      "text": "sonal to me as it also happened to me. \n i was going to chi gong practice during a snowy evening in boston when i saw a dying man. \n i knew this because the falling snow was not melting, but rather sticking to him. \n he was freezing to death. \n this",
+      "spans": [
+        {
+          "label": "Victim",
+          "start": 120,
+          "end": 130
+        }
+      ],
+      "meta": {
+        "source_window": [
+          19,
+          269
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_jcut5y8",
+      "text": "combination of Tsarist history and Russian Orthodoxy to two ends: for inspiration and to mobilize his followers. In the process, Putin created an apocalyptical, metaphysical scheme that has served to fuel his own radicalization and helped pave the way to the invasion of Ukraine. The talk is based on research de Graaf and Niels Drost carried out on a collection of over 11,000 speeches, statements, dec",
+      "spans": [
+        {
+          "label": "Victim",
+          "start": 120,
+          "end": 283
+        }
+      ],
+      "meta": {
+        "source_window": [
+          352,
+          755
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_h6zqd2g",
+      "text": "ing of firearms contributed to the 2012 Sandy Hook school massacre. \n Seems like a pretty pivotal action, that may have tremendous ramifications beyond the firearm/self-defense industry. \n What do you think the long term ramifications of this ruling will be? Are t",
+      "spans": [
+        {
+          "label": "Effect",
+          "start": 120,
+          "end": 144
+        }
+      ],
+      "meta": {
+        "source_window": [
+          101,
+          365
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_ino5ury",
+      "text": "gue that the primary business model of legacy media is not providing entertainment or even selling ad space, but rather selling selective silence to deep pocketed interests: Whether they be the military industrial complex, big pharma, NGOs or ever more often, the g",
+      "spans": [
+        {
+          "label": "Effect",
+          "start": 120,
+          "end": 145
+        }
+      ],
+      "meta": {
+        "source_window": [
+          109,
+          374
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_gsypms1",
+      "text": "hundreds of billions of dollars across Africa, Eastern Europe, Latin America and Asia...  \n Mar 31, 2021 - (Reuters) - The terms of China’s loan deals with developing countries are unusually secretive and require borrowers to prioritise repayment of Chinese state-owned banks ahead of other creditors, a study of a cache of such contracts showed on Wednesday. The dataset - compiled over three years by AidData, a U.S. research lab at the College of William & Mary - comprises 100 Chinese loan contracts with 24 low- and middle-income countries, a number of which are struggling under mounting debt burdens amid the economic fallout from the COVID-10 pandemic...",
+      "spans": [
+        {
+          "label": "Effect",
+          "start": 120,
+          "end": 663
+        }
+      ],
+      "meta": {
+        "source_window": [
+          134,
+          797
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_e177pyz",
+      "text": "roseanne loses job over analogy. this dufus threatens a 4 yr girl and no consequences we need to speak out. this violence and complete ignorance needs to stop. it is up to us to spread light.",
+      "spans": [
+        {
+          "label": "Action",
+          "start": 70,
+          "end": 85
+        }
+      ],
+      "meta": {
+        "source_window": [
+          0,
+          191
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_hmfts82",
+      "text": "ed: \n \"I was endorsed by a number of celebrities. Dave Chappelle is the only one who came to Iowa and South Carolina to perform on my behalf - with proceeds going to the campaign - and even made phone calls and hung out with staff. He did it because he wants t",
+      "spans": [
+        {
+          "label": "Action",
+          "start": 120,
+          "end": 140
+        }
+      ],
+      "meta": {
+        "source_window": [
+          151,
+          411
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_fr06d4w",
+      "text": "was going through some of my old photos. And came across this, wasn’t on reddit back then. I used to creep the world on SnapMaps like I did and came across this one day. Always thought it was weird. \n This was a",
+      "spans": [
+        {
+          "label": "Action",
+          "start": 91,
+          "end": 92
+        }
+      ],
+      "meta": {
+        "source_window": [
+          0,
+          212
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_faejhk5",
+      "text": "Israeli terror & disproportional animal brutality on innocent children, women, & men of occupied Palestine for alleged infractions is so common now it's deemed normal. When inevitable blowback comes, humanity will wonder how it was slyly deceived.",
+      "spans": [
+        {
+          "label": "Evidence",
+          "start": 111,
+          "end": 130
+        }
+      ],
+      "meta": {
+        "source_window": [
+          0,
+          247
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_gu8ea7e",
+      "text": "o counter “lies and slander” released by a network of “anti-China forces” abroad. \n 'DADDY, WHEN WILL YOU COME BACK?’ \n Uighurs living overseas have said videos of relatives, often produced by Chinese state media outlets, are staged. “The piece is basically pushi",
+      "spans": [
+        {
+          "label": "Evidence",
+          "start": 120,
+          "end": 143
+        }
+      ],
+      "meta": {
+        "source_window": [
+          294,
+          557
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_h75nq68",
+      "text": "ter. Its frustrating to see how News outlets on the left and right widely omit stories that are relevant to the public, but conflict with the ideology that animates and informs their editorial decisions. In this case  not a single right leaning outlet reported on this story .  According to the researchers responsible for raising the alarm here, these heatwaves are almost certainly caused by climate change. Is there anyway for a shared narrative of Humanity's impact on the climate to become accepted by tribes on the left and right? What can be done to foster shared reality amongst news readers who may not be made aware of events, because of the editorial bias of the news organizations they subscribe to? \n Original Article The Hill \n Also good article \n The Guardian",
+      "spans": [
+        {
+          "label": "Evidence",
+          "start": 120,
+          "end": 774
+        }
+      ],
+      "meta": {
+        "source_window": [
+          134,
+          908
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_e42of0s",
+      "text": "You can't say that's a homeless encampment. 11 children found in squalor. 5 adults were identified and arrested. Even though that site was reported several times, police didn't pay attention. Sounds fam",
+      "spans": [
+        {
+          "label": "Actor",
+          "start": 74,
+          "end": 82
+        }
+      ],
+      "meta": {
+        "source_window": [
+          0,
+          202
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_hru9mlm",
+      "text": "This is happening in the US and Canada despite the mass firing of unvaccinated health care workers. Hospitals figure it's OK for staff to be vaxxed and covid-positive, but unvaxxed covid-negative staff can't be permitted to work",
+      "spans": [
+        {
+          "label": "Actor",
+          "start": 100,
+          "end": 109
+        }
+      ],
+      "meta": {
+        "source_window": [
+          0,
+          229
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    },
+    {
+      "doc_id": "t1_gtbhy8i",
+      "text": "Mar 30, 2021 - The U.S. on Tuesday said it would provide almost $600 million in humanitarian assistance to Syria aimed at helping the millions of refugees in neighboring countries as well as the Syrian population. U.S. Ambassador to the United Nations Linda Thomas-Greenfield announced the aid at a U.N. conference on Syria’s future. It comes as the war passes its 10th year and remains one of the world’s worst humanitarian crises. A U.N.-coordinated effort is seeking some $4.2 billion to help Syrians inside the country and $5.8 billion for countries hosting refugees. The U.S.’s announcement marked a break from the Trump administration’s repeated efforts to cut aid to Syria, part of its broad effort to slash U.S. foreign-assistance funding. Congress opposed those efforts. Despite former President Trump’s opposition to foreign aid, U.S. assistance to Syria remained steady through the Trump administration, and even rose slightly in 2020, according to U.S. foreign-assistance data...",
+      "spans": [
+        {
+          "label": "Actor",
+          "start": 0,
+          "end": 991
+        }
+      ],
+      "meta": {
+        "source_window": [
+          0,
+          991
+        ],
+        "reason": "prior_closeness+ambiguous_pair_bonus"
+      }
+    }
+  ],
+  "s2": [
+    {
+      "doc_id": "t1_kat9fvt",
+      "text": "Per  Politico :     \n \n Already, Israel is using self-piloting drones from Shield AI for close-quarters indoor combat \n \n What can it do:   \nNova 2 is designed for use in urban settings and  can autonomously navigate complex subterranean and multi-story buildings without GPS, comms, or a human pilot . It uses state-of-the-art path planning and computer vision algorithms to inspect routes for mission. It is powered by Hivemind, Shield AI's autonomy and artificial intelligence stack, which helps drones and aircraft maneuver interactively and autonomously in GPS- and communication-degraded environments. It is also capable of carrying and dropping small payloads. \n Sound pretty much ideal for mapping Gaza Metro.",
+      "label": "conspiracy",
+      "rationale": ""
+    },
+    {
+      "doc_id": "t1_hbkwj3z",
+      "text": "These documents from the world bank is based on Rwandaβ€™s vision 2030 plan.\nIt breaks it down into human capital, transformation through trade and integration of regional economy, urbanization, enterprise growth, transitioning food and agriculture as engines of growth and a capable and accountable state institution.",
+      "label": "conspiracy",
+      "rationale": ""
+    },
+    {
+      "doc_id": "t1_k6srlu5",
+      "text": "Apparently he wrote the book on the UK's interpretation of LOAC. Highlights: \n- Israel's siege is 'perfectly legitimate' \n - 'Proportionate' means '[enough to] make the threat go away' \n - 'too many people spending too little time studying warfare and the law and spouting about it'",
+      "label": "non",
+      "rationale": ""
+    },
+    {
+      "doc_id": "t1_k6z1u6l",
+      "text": "This is a  \n \n 120 mm mortar munition equipped with both laser and GPS guidance, allowing for pinpoint strikes on terror targets within urban environments while minimizing risk to civilians.      \n \n Sounds a bit like a \"mortar JDAM\" round, but presumably far cheaper since it doesn't involve deploying a figher jet. One  Israeli 120 mm mortar has 7km range , which would bring the entire Gaza strip into range from the periphery. I couldn't find range info for Iron Sting specifically though.     \n Here's  Drone footage of Hamas rocket launchers under attack by Iron Sting .",
+      "label": "non",
+      "rationale": ""
+    },
+    {
+      "doc_id": "t1_kf54yml",
+      "text": "I've seen a few similar claims, but no credible info on that project since the 60s? Any word on the street? \n The IMEC Corridor OTOH, was announced in September... \n *Who else thought the cabbage would be some kind of visual aid?",
+      "label": "non",
+      "rationale": "Insufficient evidence for a concrete conspiracy claim; statements are ambiguous or hedged.",
+      "source_label": "cant_tell"
+    },
+    {
+      "doc_id": "t1_i9ftbk6",
+      "text": "African men bred irresponsibly in Ukraine, creating unwanted mix raced kids in an Anti-black country.  \n For some time now, reports have come that these kids are  abandoned  in the orphanages during the war.  \n Iβ€™m sorry but what kind of men are these? Go back and get your kids. 1) They should not be orphans. 2) they should not be used as bomb shields by racist Ukrainians.",
+      "label": "non",
+      "rationale": "Insufficient evidence for a concrete conspiracy claim; statements are ambiguous or hedged.",
+      "source_label": "cant_tell"
+    }
+  ]
+}

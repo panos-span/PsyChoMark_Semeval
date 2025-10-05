@@ -1,0 +1,8 @@
+{
+  "cant_tell": {
+    "s2_training_excluded": true,
+    "fewshot_negatives_added": 2,
+    "rationale": "Insufficient evidence for a concrete conspiracy claim; statements are ambiguous or hedged."
+  },
+  "seed": 42
+}

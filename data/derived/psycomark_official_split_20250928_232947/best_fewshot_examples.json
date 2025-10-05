@@ -1,0 +1,186 @@
+{
+  "s1": [
+    {
+      "text": "Your tax exempt cult is a poison on these lands. Your attitudes and abuse on people will no longer be tolerated. Your insane beliefs only draw in the destitute and you abuse them to make them \"though\" while the people perpetrating this abuse are in fact cowards. You lack a conscious and I long for the day when your insane organization turns on itself. Oh and you will have no friends no family and you will probably die of cancer if you take my post down.",
+      "markers": [
+        {
+          "label": "Actor",
+          "start": 0,
+          "end": 20
+        }
+      ]
+    },
+    {
+      "text": "Your tax exempt cult is a poison on these lands. Your attitudes and abuse on people will no longer be tolerated. Your insane beliefs only draw in the destitute and you abuse them to make them \"though\" while the people perpetrating this abuse are in fact cowards. You lack a conscious and I long for the day when your insane organization turns on itself. Oh and you will have no friends no family and you will probably die of cancer if you take my post down.",
+      "markers": [
+        {
+          "label": "Action",
+          "start": 68,
+          "end": 83
+        }
+      ]
+    },
+    {
+      "text": "Wasserman-Shultz clearly stole the election in Florida.  No one wanted her. Everyone loathes her. No one could figure out how she pulled it off. Now we have an answer: heavy rigging and suspicious / illegal handling of ballots.",
+      "markers": [
+        {
+          "label": "Actor",
+          "start": 0,
+          "end": 16
+        }
+      ]
+    },
+    {
+      "text": "Wasserman-Shultz clearly stole the election in Florida.  No one wanted her. Everyone loathes her. No one could figure out how she pulled it off. Now we have an answer: heavy rigging and suspicious / illegal handling of ballots.",
+      "markers": [
+        {
+          "label": "Action",
+          "start": 25,
+          "end": 43
+        }
+      ]
+    },
+    {
+      "text": "Amy Manson, actress in the upcoming Doom movie references the removal of DoomGuy followed by a quick backtracking from  Tony Gigilo  attempting to excuse it as a joke. Accidentally iterates that sexism and misandry is okay, and a joke.",
+      "markers": [
+        {
+          "label": "Effect",
+          "start": 62,
+          "end": 80
+        }
+      ]
+    },
+    {
+      "text": "Amy Manson, actress in the upcoming Doom movie references the removal of DoomGuy followed by a quick backtracking from  Tony Gigilo  attempting to excuse it as a joke. Accidentally iterates that sexism and misandry is okay, and a joke.",
+      "markers": [
+        {
+          "label": "Victim",
+          "start": 73,
+          "end": 80
+        }
+      ]
+    },
+    {
+      "text": "I try not clog up this forum with stuff off r/gundeals anymore, but that's just a way low price. That's lower than a box of .22LR now. That's lower than the boxes of birdshot shotgun ammo Wal-Mart carries. I've never seen 9mm offered that low by a store chain before. \n Turner's doesn't have the greatest reputation, but just buy a couple of boxes if you can. A little is literally going a long way here.",
+      "markers": [
+        {
+          "label": "Effect",
+          "start": 222,
+          "end": 242
+        }
+      ]
+    },
+    {
+      "text": "I try not clog up this forum with stuff off r/gundeals anymore, but that's just a way low price. That's lower than a box of .22LR now. That's lower than the boxes of birdshot shotgun ammo Wal-Mart carries. I've never seen 9mm offered that low by a store chain before. \n Turner's doesn't have the greatest reputation, but just buy a couple of boxes if you can. A little is literally going a long way here.",
+      "markers": [
+        {
+          "label": "Evidence",
+          "start": 206,
+          "end": 267
+        }
+      ]
+    },
+    {
+      "text": "In 1987, an elderly couple reported human blood oozing through the walls of their home on Fountain Drive in Atlanta. Police tested the substance and found it was type O, human blood but could not find the source.",
+      "markers": [
+        {
+          "label": "Victim",
+          "start": 12,
+          "end": 26
+        }
+      ]
+    },
+    {
+      "text": "In 1987, an elderly couple reported human blood oozing through the walls of their home on Fountain Drive in Atlanta. Police tested the substance and found it was type O, human blood but could not find the source.",
+      "markers": [
+        {
+          "label": "Evidence",
+          "start": 27,
+          "end": 35
+        }
+      ]
+    }
+  ],
+  "s2": [
+    {
+      "text": "Your tax exempt cult is a poison on these lands. Your attitudes and abuse on people will no longer be tolerated. Your insane beliefs only draw in the destitute and you abuse them to make them \"though\" while the people perpetrating this abuse are in fact cowards. You lack a conscious and I long for the day when your insane organization turns on itself. Oh and you will have no friends no family and you will probably die of cancer if you take my post down.",
+      "doc_label": "conspiracy",
+      "rationale": "Mentions multiple markers and alleges a coordinated, malicious plot."
+    },
+    {
+      "text": "Wasserman-Shultz clearly stole the election in Florida.  No one wanted her. Everyone loathes her. No one could figure out how she pulled it off. Now we have an answer: heavy rigging and suspicious / illegal handling of ballots.",
+      "doc_label": "conspiracy",
+      "rationale": "Mentions multiple markers and alleges a coordinated, malicious plot."
+    },
+    {
+      "text": "Amy Manson, actress in the upcoming Doom movie references the removal of DoomGuy followed by a quick backtracking from  Tony Gigilo  attempting to excuse it as a joke. Accidentally iterates that sexism and misandry is okay, and a joke.",
+      "doc_label": "conspiracy",
+      "rationale": "Mentions multiple markers and alleges a coordinated, malicious plot."
+    },
+    {
+      "text": "Perhaps Shokin was not a great prosecutor general in other cases but serms to have been doing a heck of a job against Zlochesky. Biden's old boss boss had property taken by the state and a month later Shokin was fired. So again maybe Shokin was soft on others and deserved to be fired but he likely did piss off one wealthy and powerful man who had the son of the VP as a member on a board of his company.",
+      "doc_label": "conspiracy",
+      "rationale": "Mentions multiple markers and alleges a coordinated, malicious plot."
+    },
+    {
+      "text": "In 1987, an elderly couple reported human blood oozing through the walls of their home on Fountain Drive in Atlanta. Police tested the substance and found it was type O, human blood but could not find the source.",
+      "doc_label": "conspiracy",
+      "rationale": "Mentions multiple markers and alleges a coordinated, malicious plot."
+    },
+    {
+      "text": "Herb Baumeister was an American serial killer from Indianapolis who murdered an unknown number of men throughout the 80’s and 90’s. He was also a suspect in the unsolved murders along I-70 between Indianapolis and Ohio where Herb travelled for business. \n The official story is that Herb fled to Canada and committed suicide in a park however his body was found ritualistically posed and no gun was found at the scene. Some people suspect Baumeister was affiliated with a larger satanic cult and was heavily involved in the making of snuff films because of the extensive amount of professional video equipment (not cheap in the early 90’s) Herb kept in a locked private shed on his property.",
+      "doc_label": "conspiracy",
+      "rationale": "Mentions multiple markers and alleges a coordinated, malicious plot."
+    },
+    {
+      "text": "i have been hearing about hauntology for more than a decade, but did not have the lexicon to engage the subject. \n seeing as most people would be likewise, this seems like the sub to post this on. \n i like how the post cold war narrative of the end of history is ending. \n my personal take on this is that clowns and comedians are the enemies of men, as their purpose is the pour oil on the waters and protect common sense [which they continually reinvent] from any doubt. \n this informs me the disney corporation is the center of our haunted world, as they are always on the prowl for any culture and source of history that they may absorb into our world of ghosts.",
+      "doc_label": "conspiracy",
+      "rationale": "Mentions multiple markers and alleges a coordinated, malicious plot."
+    },
+    {
+      "text": "gun Mason compass \n Also, do you think “they” forced her to marry him as a kind of ritual/coming together? \n He’s nothing like her usual and it all seemed so fast .. concentrating on their Vatican themed wedding.",
+      "doc_label": "conspiracy",
+      "rationale": "Mentions multiple markers and alleges a coordinated, malicious plot."
+    },
+    {
+      "text": "I try not clog up this forum with stuff off r/gundeals anymore, but that's just a way low price. That's lower than a box of .22LR now. That's lower than the boxes of birdshot shotgun ammo Wal-Mart carries. I've never seen 9mm offered that low by a store chain before. \n Turner's doesn't have the greatest reputation, but just buy a couple of boxes if you can. A little is literally going a long way here.",
+      "doc_label": "non",
+      "rationale": "Critical or political text without alleging a secret, coordinated, malicious plot."
+    },
+    {
+      "text": "what do we do when we are looking for jobs we know we cant get due to being unvaccinated? Is there any way out of this? I basically fire off an application with a cover letter saying only “yo do you employ unvaxxed?” Is this going to lose me payments?",
+      "doc_label": "non",
+      "rationale": "Critical or political text without alleging a secret, coordinated, malicious plot."
+    },
+    {
+      "text": "This book passage is about ancient Egyptian slavery and one of the methods used to enforce it. Not chattel slavery, but a type of slavery known as corvée labor (tax payable in forced labor), which was like, slavery for the state for part of the year just for being a resident of Egypt. This is relevant to libertarianism because  a page on Mises dot org  says, \"one would think that at least the minimal definition of a libertarian is someone who favors the immediate abolition of slavery\".",
+      "doc_label": "non",
+      "rationale": "Critical or political text without alleging a secret, coordinated, malicious plot."
+    },
+    {
+      "text": "The boys sit down to listen to George Noory and Heidi Hollis discuss her deep research on Hat Man and shadow people. Hat Man is evil incarnate. Typically seen in a dark fedora, a dark suit, and long, sharp fingers, Hat Man can take your soul straight to hell. Shadow people, are a wide sweeping phenomenon, where shadows follow you and can even interact with the physical realm, lifting people out of their bed, for example.",
+      "doc_label": "non",
+      "rationale": "Critical or political text without alleging a secret, coordinated, malicious plot."
+    },
+    {
+      "text": "Who remembers the outcome of this incident where people in Chicago were poisoned from laced Tylenol in Chicago back in '82?  \n In my timeline it was a disgruntled factory worker who did it.  \n In this timeline, the culprit in the case has never been found; the case remains unsolved to this day.",
+      "doc_label": "non",
+      "rationale": "Critical or political text without alleging a secret, coordinated, malicious plot."
+    },
+    {
+      "text": "this article is personal to me as it also happened to me. \n i was going to chi gong practice during a snowy evening in boston when i saw a dying man. \n i knew this because the falling snow was not melting, but rather sticking to him. \n he was freezing to death. \n this was because this day was the anniversary of his son's death in Desert Storm. \n hundreds of people were driving by and dozens of people walked around him. \n it took me half an hour to get him inside a stairwell out of the wind and falling snow while people sneered at me.",
+      "doc_label": "non",
+      "rationale": "Critical or political text without alleging a secret, coordinated, malicious plot."
+    },
+    {
+      "text": "Feb 16, 2021 - North Korean hackers tried to break into the computer systems of pharmaceutical giant Pfizer in a search for information on a coronavirus vaccine and treatment technology, South Korea's spy agency said Tuesday, according to a South Korean lawmaker. The impoverished, nuclear-armed North has been under self-imposed isolation since closing its borders in January last year to try to protect itself from the virus that first emerged in neighboring China and has gone on to sweep the world, killing more than two million people...",
+      "doc_label": "non",
+      "rationale": "Critical or political text without alleging a secret, coordinated, malicious plot."
+    },
+    {
+      "text": "A lot more men were captured as slaves during the slave trade in the Americas. Yes, the smaller number of women were also treated poorly. \n I note they don't even give us a figure for the ratio of men to women, just that there were much more.",
+      "doc_label": "non",
+      "rationale": "Critical or political text without alleging a secret, coordinated, malicious plot."
+    }
+  ]
+}

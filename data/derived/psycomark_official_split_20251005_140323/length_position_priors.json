@@ -1,0 +1,67 @@
+{
+  "Evidence": {
+    "length_lognorm": {
+      "mu": 2.9776329604745335,
+      "sigma": 1.046134145626707
+    },
+    "start_beta": {
+      "alpha": 0.7025060924045281,
+      "beta": 0.9353908049781001
+    },
+    "q90_len": 80,
+    "coverage_rate": 0.8494047619047619,
+    "avg_spans_per_doc": 1.0
+  },
+  "Action": {
+    "length_lognorm": {
+      "mu": 2.868895895903885,
+      "sigma": 0.9010036441698187
+    },
+    "start_beta": {
+      "alpha": 0.8130790012031379,
+      "beta": 1.429586390246717
+    },
+    "q90_len": 59,
+    "coverage_rate": 1.1345238095238095,
+    "avg_spans_per_doc": 1.0
+  },
+  "Effect": {
+    "length_lognorm": {
+      "mu": 3.1312673411715144,
+      "sigma": 0.9261483489189323
+    },
+    "start_beta": {
+      "alpha": 1.2726506651691478,
+      "beta": 1.2311948153425258
+    },
+    "q90_len": 75,
+    "coverage_rate": 0.8726190476190476,
+    "avg_spans_per_doc": 1.0
+  },
+  "Victim": {
+    "length_lognorm": {
+      "mu": 2.1262110749673364,
+      "sigma": 0.8659394871457857
+    },
+    "start_beta": {
+      "alpha": 1.040703988289495,
+      "beta": 1.114889547143752
+    },
+    "q90_len": 25,
+    "coverage_rate": 0.7806547619047619,
+    "avg_spans_per_doc": 1.0
+  },
+  "Actor": {
+    "length_lognorm": {
+      "mu": 2.1665961237889073,
+      "sigma": 0.876650169922696
+    },
+    "start_beta": {
+      "alpha": 0.5797205759260234,
+      "beta": 1.0516180414085248
+    },
+    "q90_len": 25,
+    "coverage_rate": 1.5199404761904762,
+    "avg_spans_per_doc": 1.0
+  }
+}
