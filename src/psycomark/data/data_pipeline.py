@@ -46,6 +46,16 @@ DOC_LABELS = ["conspiracy", "non", "cant_tell"]
 # === Cant_tell policy & CV folds helpers ===
 ALLOWED_S2_LABELS = {"conspiracy", "non"}  # cant_tell excluded from S2 training
 
+VALID_LSH_BANDS = (1, 2, 4, 8, 16, 32, 64)
+
+
+def normalize_lsh_bands(b: int) -> int:
+    """Return the nearest valid divisor of 64 for LSH bands."""
+    if b in VALID_LSH_BANDS:
+        return b
+    # choose nearest by absolute distance, tie -> smaller
+    return sorted(VALID_LSH_BANDS, key=lambda x: (abs(x - b), x))[0]
+
 
 # ==============================================================================
 # SECTION 1: CORE UTILITY FUNCTIONS
@@ -249,13 +259,17 @@ def simhash64(tokens: List[str]) -> int:
     return out
 
 
-def lsh_buckets(simhash_val: int, bands: int) -> List[Tuple[int, int]]:
-    assert 64 % bands == 0
-    r = 64 // bands
-    return [
-        (b, (simhash_val & (((1 << r) - 1) << (b * r))) >> (b * r))
-        for b in range(bands)
-    ]
+def lsh_buckets(simhash_val: int, bands: int = 16):
+    # instead of: assert 64 % bands == 0
+    if 64 % bands != 0:
+        # auto-normalize defensively if called directly
+        nb = normalize_lsh_bands(bands)
+        if nb != bands:
+            bands = nb
+    r = 64 // bands  # bits per band
+    mask = (1 << r) - 1
+    for b in range(bands):
+        yield (b, (simhash_val >> (b * r)) & mask)
 
 
 class UF:
@@ -496,6 +510,19 @@ def main(args):
     start_time = time.time()
     np.random.seed(args.seed)
     random.seed(args.seed)
+    # sanity for LSH bands
+    orig_bands = args.lsh_bands
+    args.lsh_bands = normalize_lsh_bands(args.lsh_bands)
+    if args.lsh_bands != orig_bands:
+        logging.warning(
+            f"lsh_bands={orig_bands} is invalid (must divide 64). "
+            f"Using normalized value: {args.lsh_bands}."
+        )
+    # sanity for ham threshold
+    if not (0 <= args.lsh_ham <= 64):
+        logging.warning(f"lsh_ham={args.lsh_ham} out of range [0,64]. Clamping.")
+        args.lsh_ham = max(0, min(64, args.lsh_ham))
+
     STAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     OUTDIR = args.output_root / f"psycomark_official_split_{STAMP}"
     OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -643,6 +670,10 @@ def main(args):
 
     logging.info(f"Final sizes: Train={len(final_train_df)}, Dev={len(final_dev_df)}")
 
+    # Set _id field for compatibility
+    final_train_df["_id"] = final_train_df["doc_id"]
+    final_dev_df["_id"] = final_dev_df["doc_id"]
+
     # --- 5. Export Artifacts ---
     logging.info("Exporting final artifacts...")
     train_path = OUTDIR / "train.jsonl"
@@ -758,7 +789,7 @@ def main(args):
             "train_docs_removed_leakage": len(leaky_train_docs_ids),
             "num_within_train_removed_docs": num_within_train_removed_docs,
         },
-        "lsh": {"bands": args.lsh_bands, "ham": args.lsh_ham},
+        "lsh": {"bands": int(args.lsh_bands), "ham": int(args.lsh_ham)},
         "inputs": {
             "train_path": str(train_rehydrated_path),
             "dev_path": str(dev_rehydrated_path),

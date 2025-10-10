@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Rule-based post-processor for span predictions.
 - Resolves Action↔Effect and Actor↔Victim overlaps using priors & overlap stats.
@@ -6,29 +7,99 @@ Rule-based post-processor for span predictions.
 - Writes post-processed JSONL and a small summary.
 
 Usage:
-  python postprocess_spans.py \
-     --pred path/to/bedrock_preds_s1_*.jsonl \
-     --data path/to/dev.jsonl \
-     --priors path/to/length_position_priors.json \
-     --pairs  path/to/overlap_pair_stats.json \
-     --pairs-ci path/to/overlap_pair_stats_ci.json \
-     --cdf path/to/first_occurrence_cdf.csv  # optional
+  python postprocess_spans.py ^
+     --pred path/to/dev_raw.jsonl ^
+     --data path/to/dev.jsonl ^
+     --priors path/to/length_position_priors.json ^
+     --pairs-ci path/to/overlap_pair_stats_ci.json ^
+     --cdf path/to/first_occurrence_cdf.csv ^
+     --out runs/s1_merge/dev_pp.jsonl
 """
-import argparse, json, math, sys
+from __future__ import annotations
+
+import argparse
+import json
+import math
 from pathlib import Path
+import os
 import numpy as np
 import pandas as pd
 
 ALLOWED = {"Actor", "Action", "Effect", "Victim", "Evidence"}
 
 
-def load_jsonl(p):
+# -----------------------------
+# IO helpers
+# -----------------------------
+def load_jsonl(p: Path):
     with open(p, "r", encoding="utf-8") as f:
         for line in f:
-            if line.strip():
-                yield json.loads(line)
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                yield json.loads(s)
+            except Exception:
+                continue
 
 
+def normalize_spans_record(rec: dict):
+    """
+    Accept multiple input schemas and return a normalized (_id, spans, base_text).
+
+    Accepts:
+      - {"_id"/"doc_id"/"id", "markers": [ {label,start,end,text?,score?} ... ]}
+      - {"_id"/"doc_id"/"id", "prediction": [ {label/startIndex,...} or {"spans":[...]} ]}
+    Returns:
+      did: str | None
+      spans: List[dict] | None   (each: {label,start,end,text?,score?})
+      base_text: str | ""
+    """
+    did = rec.get("_id") or rec.get("doc_id") or rec.get("id")
+    base_text = rec.get("text", "") or ""
+    spans = None
+
+    # unified schema (markers)
+    if isinstance(rec.get("markers"), list):
+        spans = rec["markers"]
+
+    # older/alternative schema (prediction)
+    elif "prediction" in rec:
+        pred = rec["prediction"]
+        if isinstance(pred, dict) and isinstance(pred.get("spans"), list):
+            spans = pred["spans"]
+        elif isinstance(pred, list):
+            spans = pred
+
+    if did is None or spans is None:
+        return None, None, base_text
+
+    # normalize fields
+    out = []
+    for s in spans:
+        if not isinstance(s, dict):
+            continue
+        lab = s.get("label") or s.get("type")
+        st = s.get("start") or s.get("startIndex")
+        en = s.get("end") or s.get("endIndex")
+        if lab is None or st is None or en is None:
+            continue
+        item = {"label": str(lab), "start": int(st), "end": int(en)}
+        if "text" in s:
+            item["text"] = s["text"]
+        if "score" in s:
+            try:
+                item["score"] = float(s["score"])
+            except Exception:
+                pass
+        out.append(item)
+
+    return did, out, base_text
+
+
+# -----------------------------
+# math & rule helpers
+# -----------------------------
 def iou(a, b):
     s1, e1 = a
     s2, e2 = b
@@ -59,9 +130,9 @@ def prior_dist_pos(priors, label, start_pos):
 
 def decide_action_effect(spanA, spanE, priors, text_len, pair_stats_ci):
     """
-    If IoU>=0.6 and Action/Effect 'starts_first_rate' ~ tie (≈0.5),
-    prefer the label whose boundary better matches start Beta mode AND length lognormal (smaller composite distance).
-    Else, if IoU@0.5 rate < 0.5 in corpus, keep both.
+    If IoU>=0.6 -> decide by prior closeness.
+    Else keep both.
+    Minor tie-break: if corpus IoU@0.5 is high (>=0.5), prefer earlier as Action.
     """
     sA, eA = spanA["start"], spanA["end"]
     sE, eE = spanE["start"], spanE["end"]
@@ -71,11 +142,10 @@ def decide_action_effect(spanA, spanE, priors, text_len, pair_stats_ci):
 
     stats = pair_stats_ci.get("Action/Effect", {})
     iou05_rate = stats.get("iou@0.5", 0.5)
-    # keep-both policy if overlaps rarely exceed 0.5 in corpus
+
     if i < 0.6:
         return "keep_both"
 
-    # tie on who starts first? we use closeness to priors
     dA = 0.6 * prior_dist_pos(priors, "Action", doc_pos_A) + 0.4 * prior_z_len(
         priors, "Action", eA - sA
     )
@@ -87,27 +157,23 @@ def decide_action_effect(spanA, spanE, priors, text_len, pair_stats_ci):
     elif dE < dA:
         return "prefer_effect"
     else:
-        # still undecided; if corpus says high IoU@0.5 is common, pick earlier span as Action heuristic
-        if iou05_rate >= 0.5:
-            return "prefer_action" if sA <= sE else "prefer_effect"
-        else:
-            return "keep_both"
+        return "prefer_action" if (iou05_rate >= 0.5 and sA <= sE) else "keep_both"
 
 
 def decide_actor_victim(
     spanActor, spanVictim, priors, text_len, cdf_q1=None, pair_stats_ci=None
 ):
     """
-    Prefer Actor when normalized start position is in the first quartile (per CDF if available; else 0.25),
-    else keep Victim. Suppress duplicates when containment is likely.
+    Prefer Actor when normalized start is in first quartile (from CDF if available, else 0.25).
+    If containment, keep smaller. If IoU<0.5 keep both.
     """
     sX, eX = spanActor["start"], spanActor["end"]
     sY, eY = spanVictim["start"], spanVictim["end"]
     i = iou((sX, eX), (sY, eY))
     q1 = float(cdf_q1.get("Actor", 0.25)) if cdf_q1 else 0.25
     posA = sX / max(1, text_len)
-    # containment heuristic: if one fully contains the other, keep the smaller span
     contains = (sX <= sY and eX >= eY) or (sY <= sX and eY >= eX)
+
     if contains:
         return "keep_smaller"
     if i < 0.5:
@@ -115,83 +181,82 @@ def decide_actor_victim(
     return "prefer_actor" if posA <= q1 else "prefer_victim"
 
 
-def apply_rules_one(doc_pred, priors, pair_stats_ci, cdf_q1):
-    text = doc_pred.get("text") or ""
-    spans = [s for s in (doc_pred.get("prediction") or []) if s.get("label") in ALLOWED]
+def apply_rules_one(spans, text, priors, pair_stats_ci, cdf_q1):
+    """Apply pairwise rules to a list of spans; return filtered list and stats."""
+    spans = [s for s in spans if s.get("label") in ALLOWED]
     if not spans:
         return spans, {"decisions": 0, "removed": 0}
 
     changed = 0
     removed = 0
     keep = [True] * len(spans)
+    n = len(spans)
 
-    # iterate pairwise and apply specific rules
-    for i in range(len(spans)):
-        for j in range(i + 1, len(spans)):
-            if not (keep[i] and keep[j]):
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, n):
+            if not keep[j]:
                 continue
             Li, Lj = spans[i]["label"], spans[j]["label"]
             pair = tuple(sorted([Li, Lj]))
+
             if pair == ("Action", "Effect"):
                 A = spans[i] if Li == "Action" else spans[j]
                 E = spans[j] if Li == "Action" else spans[i]
                 dec = decide_action_effect(A, E, priors, len(text), pair_stats_ci)
                 if dec == "prefer_action":
-                    # drop Effect
                     idx = j if Li == "Action" else i
                     keep[idx] = False
-                    removed += 1
                     changed += 1
+                    removed += 1
                 elif dec == "prefer_effect":
                     idx = i if Li == "Action" else j
                     keep[idx] = False
-                    removed += 1
                     changed += 1
-                # else keep_both -> no change
+                    removed += 1
+                # keep_both → no-op
+
             elif pair == ("Actor", "Victim"):
                 Act = spans[i] if Li == "Actor" else spans[j]
                 Vic = spans[j] if Li == "Actor" else spans[i]
-                # optional: only if substantial overlap
                 dec = decide_actor_victim(
-                    Act,
-                    Vic,
-                    priors,
-                    len(text),
-                    cdf_q1=cdf_q1,
-                    pair_stats_ci=pair_stats_ci,
+                    Act, Vic, priors, len(text), cdf_q1, pair_stats_ci
                 )
                 if dec == "prefer_actor":
                     idx = j if Li == "Actor" else i
                     keep[idx] = False
-                    removed += 1
                     changed += 1
+                    removed += 1
                 elif dec == "prefer_victim":
                     idx = i if Li == "Actor" else j
                     keep[idx] = False
-                    removed += 1
                     changed += 1
+                    removed += 1
                 elif dec == "keep_smaller":
-                    # drop the longer span
                     li = spans[i]["end"] - spans[i]["start"]
                     lj = spans[j]["end"] - spans[j]["start"]
                     if li >= lj:
                         keep[i] = False
                     else:
                         keep[j] = False
-                    removed += 1
                     changed += 1
+                    removed += 1
             # other pairs: leave as-is
 
     new_spans = [s for s, k in zip(spans, keep) if k]
     return new_spans, {"decisions": changed, "removed": removed}
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--pred",
         required=True,
-        help="JSONL from Bedrock runner with fields: doc_id, prediction, raw/error",
+        help="JSONL: accepts 'markers' or 'prediction' schemas.",
     )
     ap.add_argument("--data", required=True, help="dev/train jsonl (to access text)")
     ap.add_argument("--priors", required=True, help="length_position_priors.json")
@@ -203,22 +268,27 @@ def main():
     )
     args = ap.parse_args()
 
-    texts = {
-        r["doc_id"]: (r["text"] or "")
-        for _, r in pd.read_json(args.data, lines=True).iterrows()
-    }
-    PRIORS = json.loads(Path(args.priors).read_text())
+    # Load text by id to backfill
+    df_data = pd.read_json(args.data, lines=True)
+    id_to_text = {}
+    for _, r in df_data.iterrows():
+        did = r.get("doc_id") or r.get("_id") or r.get("id")
+        if did is not None:
+            id_to_text[did] = r.get("text", "") or ""
+
+    PRIORS = json.loads(Path(args.priors).read_text(encoding="utf-8"))
     pair_stats_ci = {}
     if args.pairs_ci and Path(args.pairs_ci).exists():
-        pair_stats_ci.update(json.loads(Path(args.pairs_ci).read_text()))
+        pair_stats_ci.update(
+            json.loads(Path(args.pairs_ci).read_text(encoding="utf-8"))
+        )
     elif args.pairs and Path(args.pairs).exists():
-        pair_stats_ci.update(json.loads(Path(args.pairs).read_text()))
+        pair_stats_ci.update(json.loads(Path(args.pairs).read_text(encoding="utf-8")))
 
     # optional first-occurrence quartiles
     cdf_q1 = None
     if args.cdf and Path(args.cdf).exists():
         cdf = pd.read_csv(args.cdf, index_col=0)
-        # column '0.25' from previous export; if not present, default to 0.25
         if "0.25" in cdf.columns:
             cdf_q1 = {lab: float(cdf.loc[lab, "0.25"]) for lab in cdf.index}
 
@@ -226,29 +296,48 @@ def main():
     out_path = (
         Path(args.out) if args.out else in_path.with_name(in_path.stem + "_pp.jsonl")
     )
+    os.makedirs(out_path.parent.as_posix(), exist_ok=True)
 
     changes = 0
     removed = 0
     total = 0
+
     with open(out_path, "w", encoding="utf-8") as fout:
         for rec in load_jsonl(in_path):
-            doc_id = rec.get("doc_id")
-            # copy original prediction list under 'prediction_raw' for A/B
-            rec["prediction_raw"] = rec.get("prediction", [])
-            # attach text (if not already)
-            rec_text = texts.get(doc_id, "")
-            rec["text"] = rec.get("text") or rec_text
+            did, spans, base_text = normalize_spans_record(rec)
+            if did is None or spans is None:
+                continue
+
+            # backfill text; and fill per-span "text" slices if absent
+            text = base_text or id_to_text.get(did, "")
+            if text:
+                for s in spans:
+                    if (
+                        "text" not in s
+                        and isinstance(s.get("start"), int)
+                        and isinstance(s.get("end"), int)
+                    ):
+                        st, en = s["start"], s["end"]
+                        if 0 <= st < en <= len(text):
+                            s["text"] = text[st:en]
+
             new_spans, stats = apply_rules_one(
-                {"prediction": rec["prediction"], "text": rec["text"]},
-                PRIORS,
-                pair_stats_ci,
-                cdf_q1,
+                spans, text, PRIORS, pair_stats_ci, cdf_q1
             )
-            rec["prediction"] = new_spans
             changes += stats["decisions"]
             removed += stats["removed"]
             total += 1
-            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            # preserve original, write unified 'prediction'
+            out_rec = dict(rec)
+            out_rec["prediction_raw"] = spans
+            out_rec["prediction"] = new_spans
+            if "text" not in out_rec:
+                out_rec["text"] = text
+            if "_id" not in out_rec and "doc_id" in out_rec:
+                out_rec["_id"] = out_rec["doc_id"]
+
+            fout.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
 
     summary = {
         "input": str(in_path),

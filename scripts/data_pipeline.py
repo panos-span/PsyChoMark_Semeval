@@ -8,8 +8,8 @@ if __name__ == "__main__":
     ap.add_argument("--output-root", default="data/derived")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-preprocess", action="store_true")
-    ap.add_argument("--lsh-bands", type=int, default=20)
-    ap.add_argument("--lsh-ham", type=int, default=3)
+    ap.add_argument("--lsh-bands", type=int, default=8)
+    ap.add_argument("--lsh-ham", type=int, default=4)
     args = ap.parse_args()
     # coerce to Paths for your pipeline’s arg handling
     args.data_dir = pathlib.Path(args.data_dir)

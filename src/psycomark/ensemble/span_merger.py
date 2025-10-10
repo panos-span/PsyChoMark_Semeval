@@ -119,12 +119,19 @@ if __name__ == "__main__":
         for d in out:
             f.write(json.dumps({"_id": d["_id"], "markers": d["markers"]}) + "\n")
 
-    # run your cross-label rules post-processor
+    # --- run cross-label rules post-processor ---
     import subprocess, sys
+    from pathlib import Path
+
+    # resolve postprocessor path robustly: project_root/src/psycomark/postproc/postprocess_spans.py
+    POSTPROC = Path(__file__).resolve().parents[1] / "postproc" / "postprocess_spans.py"
+
+    # ensure output folder exists
+    Path(args.out_pp).parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [
         sys.executable,
-        "postprocess_spans.py",
+        str(POSTPROC),
         "--pred",
         args.out_raw,
         "--data",
