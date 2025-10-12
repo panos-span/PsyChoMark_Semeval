@@ -72,6 +72,28 @@ def _filter_docclf(df):
     return df.loc[keep, cols].copy()
 
 
+def has_labels(path):
+    import json
+
+    n, y = 0, 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            lab = r.get("conspiracy") or r.get("doc_label")
+            if (
+                lab is not None
+                and str(lab).strip() != ""
+                and str(lab).lower() != "null"
+            ):
+                y += 1
+            n += 1
+            if n >= 5000:
+                break  # sample check for speed
+    return y > 0
+
+
 def _stratified_component_folds(df_with_comp, k=5, seed=42):
     """
     Assigns fold id ∈ [0..k-1] per dup_comp, stratified by majority doc_label.
@@ -545,6 +567,22 @@ def main(args):
     dev_records = load_jsonl(dev_rehydrated_path)
     dev_df = build_dataframe(dev_records, name="dev")
 
+    # auto-detect unlabeled dev (no doc_label and no markers anywhere)
+    def _is_unlabeled(df):
+        has_any_doclab = df["doc_label"].notna().any()
+        has_any_markers = (
+            df["markers"].map(lambda x: isinstance(x, list) and len(x) > 0).any()
+        )
+        return (not has_any_doclab) and (not has_any_markers)
+
+    auto_cv_only = _is_unlabeled(dev_df)
+    if auto_cv_only and not args.cv_only:
+        logging.warning(
+            "Dev set appears unlabeled (no doc_label and no markers). "
+            "Switching to CV-only mode based on TRAIN."
+        )
+    args.cv_only = args.cv_only or auto_cv_only
+
     for df, nm in [(train_df, "train"), (dev_df, "dev")]:
         if not args.skip_preprocess:
             logging.info(f"Applying text preprocessing to {nm} set...")
@@ -555,44 +593,58 @@ def main(args):
             n <= 1000
         ).mean() > 0.98, f"{nm} length gate drift: too many >1000 chars"
 
-    # --- 2. Identify Cross-Split Duplicates ---
-    logging.info("Auditing official split for cross-set leakage...")
-    train_df["split_source"] = "train"
-    dev_df["split_source"] = "dev"
-    all_df = pd.concat([train_df, dev_df], ignore_index=True)
+    # --- 2. Identify Duplicates / Leakage (supports CV-only) ---
+    if not args.cv_only:
+        logging.info("Auditing official split for cross-set leakage...")
+        train_df["split_source"] = "train"
+        dev_df["split_source"] = "dev"
+        all_df = pd.concat([train_df, dev_df], ignore_index=True)
+    else:
+        logging.info(
+            "CV-only mode: skipping cross-train/dev leakage audit; deduping TRAIN internally."
+        )
+        train_df["split_source"] = "train"
+        # keep dev_df untouched; we won't use it for leakage ops
+        all_df = train_df.copy()
 
+    # Build duplicate components for whichever frame we decided to use
     dup_components_df = create_duplicate_components(
         all_df, args.lsh_bands, args.lsh_ham
     )
     df_with_comps = all_df.merge(dup_components_df, on="doc_id")
 
-    # Find components that span both train and dev
-    comp_splits = df_with_comps.groupby("dup_comp")["split_source"].unique()
-    leaky_comps = comp_splits[comp_splits.apply(lambda x: len(x) > 1)].index
+    if not args.cv_only:
+        # Find components that span both train and dev
+        comp_splits = df_with_comps.groupby("dup_comp")["split_source"].unique()
+        leaky_comps = comp_splits[comp_splits.apply(lambda x: len(x) > 1)].index
 
-    leaky_train_docs_ids = set(
-        df_with_comps[
-            (df_with_comps["dup_comp"].isin(leaky_comps))
-            & (df_with_comps["split_source"] == "train")
-        ]["doc_id"]
-    )
-
-    leak_report = df_with_comps[df_with_comps["doc_id"].isin(leaky_train_docs_ids)][
-        ["doc_id", "dup_comp", "text"]
-    ]
-    if not leak_report.empty:
-        leak_report.to_csv(OUTDIR / "leakage_removed_train.csv", index=False)
-
-    dev_dup = df_with_comps[df_with_comps["split_source"] == "dev"]
-    dev_internal_dup = len(dev_dup) - dev_dup["dup_comp"].nunique()
-    logging.info(f"Dev internal duplicates (kept as-is): {dev_internal_dup}")
-
-    if leaky_train_docs_ids:
-        logging.warning(
-            f"Found {len(leaky_train_docs_ids)} train documents that are duplicates of dev documents. Removing them from the training set to prevent data leakage."
+        leaky_train_docs_ids = set(
+            df_with_comps[
+                (df_with_comps["dup_comp"].isin(leaky_comps))
+                & (df_with_comps["split_source"] == "train")
+            ]["doc_id"]
         )
+
+        leak_report = df_with_comps[df_with_comps["doc_id"].isin(leaky_train_docs_ids)][
+            ["doc_id", "dup_comp", "text"]
+        ]
+        if not leak_report.empty:
+            leak_report.to_csv(OUTDIR / "leakage_removed_train.csv", index=False)
+
+        dev_dup = df_with_comps[df_with_comps["split_source"] == "dev"]
+        dev_internal_dup = len(dev_dup) - dev_dup["dup_comp"].nunique()
+        logging.info(f"Dev internal duplicates (kept as-is): {dev_internal_dup}")
+
+        if leaky_train_docs_ids:
+            logging.warning(
+                f"Found {len(leaky_train_docs_ids)} train documents that are duplicates of dev documents. Removing them from the training set to prevent data leakage."
+            )
+        else:
+            logging.info("Verification successful: No cross-split duplicates found.")
     else:
-        logging.info("Verification successful: No cross-split duplicates found.")
+        # No cross-split leakage in CV-only mode
+        leaky_train_docs_ids = set()
+        dev_internal_dup = 0
 
     # --- 3. Deduplicate Training Set Internally ---
     logging.info("Deduplicating training set internally...")
@@ -651,7 +703,9 @@ def main(args):
     final_train_df = train_df[train_df["doc_id"].isin(kept_train_ids)].drop(
         columns=["split_source"]
     )
-    final_dev_df = dev_df.drop(columns=["split_source"])  # Dev set is untouched
+    final_dev_df = dev_df.drop(
+        columns=["split_source"], errors="ignore"
+    )  # Dev set is untouched
 
     # doc-level count of removed within-train duplicates
     num_within_train_removed_docs = len(clean_train_candidates) - len(kept_train_docs)
@@ -683,7 +737,11 @@ def main(args):
 
     # --- S2 doc-classification views (cant_tell excluded) ---
     train_docclf = _filter_docclf(final_train_df)
-    dev_docclf = _filter_docclf(final_dev_df)
+    dev_docclf = (
+        _filter_docclf(final_dev_df)
+        if not args.cv_only
+        else final_dev_df.iloc[0:0].copy()
+    )
 
     train_docclf_path = OUTDIR / "train_docclf.jsonl"
     dev_docclf_path = OUTDIR / "dev_docclf.jsonl"
@@ -800,6 +858,13 @@ def main(args):
             p.name: str(p.resolve()) for p in OUTDIR.glob("*") if p.is_file()
         },
     }
+
+    manifest["mode"] = "cv_only" if args.cv_only else "official_train_dev"
+    manifest["notes"] = (
+        "Processed train only (CV mode) because dev is unlabeled."
+        if args.cv_only
+        else manifest["notes"]
+    )
 
     # Cant_tell policy details
     manifest.setdefault("policy", {})
@@ -948,6 +1013,11 @@ if __name__ == "__main__":
         action="store_true",
         default=True,
         help="If set (default), assumes input JSONL is already preprocessed/rehydrated and will NOT re-apply preprocess().",
+    )
+    parser.add_argument(
+        "--cv-only",
+        action="store_true",
+        help="Ignore dev labels and build CV folds from train only (auto-enabled if dev has no labels/markers).",
     )
 
     args = parser.parse_args()
