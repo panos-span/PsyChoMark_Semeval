@@ -47,22 +47,21 @@ def find_latest_checkpoint(base_path):
 
 def load_competition_test_data(file_path):
     """
-    Loads all data from a JSONL file for inference, preserving order,
-    and retaining the document's unique ID.
+    Loads JSONL for inference, preserving order and returning a list of
+    {unique_sample_id, text}. Accepts either '_id' or 'doc_id' (or 'id').
     """
     data = []
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             try:
                 item = json.loads(line)
-                sample_id = item.get("_id", f"sample_{i}")
-                data.append(
-                    {"unique_sample_id": sample_id, "text": item.get("text", "")}
-                )
             except json.JSONDecodeError:
-                print(
-                    f"Skipping invalid JSON line at index {i} in {file_path}: {line.strip()}"
-                )
+                print(f"Skipping invalid JSON at index {i}: {line[:120]!r}")
+                continue
+            sample_id = (
+                item.get("_id") or item.get("doc_id") or item.get("id") or f"sample_{i}"
+            )
+            data.append({"unique_sample_id": sample_id, "text": item.get("text", "")})
     print(f"Loaded {len(data)} samples for inference.")
     return data
 
@@ -77,6 +76,19 @@ def tokenize_data(dataset, tokenizer):
 
 
 if __name__ == "__main__":
+
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--test-file", default=TEST_FILE)
+    ap.add_argument("--submission-file", default=SUBMISSION_FILE)
+    args = ap.parse_args()
+
+    TEST_FILE = args.test_file
+    SUBMISSION_FILE = args.submission_file
+
+    out_dir = os.path.dirname(SUBMISSION_FILE) or "."
+    os.makedirs(out_dir, exist_ok=True)
 
     # 1. Load Data
     raw_data = load_competition_test_data(TEST_FILE)
@@ -158,23 +170,19 @@ if __name__ == "__main__":
 
     print(f"Submission file '{SUBMISSION_FILE}' generated successfully.")
 
-    # --- NEW: also write probabilities for ensembling/calibration ---
-    import numpy as np, json, os
+    # Softmax
+    logits_arr = np.asarray(logits, dtype=np.float32)
+    exps = np.exp(logits_arr - logits_arr.max(axis=1, keepdims=True))
+    y_prob = exps / exps.sum(axis=1, keepdims=True)  # [N,2]
 
-    probs_path = os.path.join(
-        os.path.dirname(args.output), "dev_probs.jsonl"
-    )  # adjust if needed
+    # Derive output path next to SUBMISSION_FILE
+    out_dir = os.path.dirname(SUBMISSION_FILE) or "."
+    probs_path = os.path.join(out_dir, "dev_probs.jsonl")
 
     with open(probs_path, "w", encoding="utf-8") as f:
-        for _id, p in zip(
-            example_ids, y_prob
-        ):  # y_prob is sigmoid/softmax output (shape [N,2])
-            # If your model is sigmoid-on-1logit, convert to 2-class; else keep softmax
-            if p.ndim == 0 or (hasattr(p, "shape") and p.shape == ()):  # single logit
-                p1 = float(1 / (1 + np.exp(-p)))
-                p0 = 1.0 - p1
-            else:
-                p0, p1 = float(p[0]), float(p[1])
-            f.write(json.dumps({"_id": _id, "p_non": p0, "p_conspiracy": p1}) + "\n")
+        for uid, p in zip(unique_ids, y_prob):
+            # Assuming LABEL_MAP = {0: "No", 1: "Yes"}  → index 0 = non, 1 = conspiracy
+            p0, p1 = float(p[0]), float(p[1])
+            f.write(json.dumps({"_id": uid, "p_non": p0, "p_conspiracy": p1}) + "\n")
 
     print(f"[infer_binary] wrote calibrated-ready probs to: {probs_path}")

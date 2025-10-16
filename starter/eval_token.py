@@ -3,6 +3,7 @@ import os
 import sys
 import argparse
 import re
+import logging
 from typing import Dict, List, Set, Tuple
 
 # --- Configuration ---
@@ -14,19 +15,20 @@ MARKER_TYPES = {"Action", "Actor", "Effect", "Evidence", "Victim"}
 DEFAULT_IOU_THRESHOLD = 0.5
 
 
+# ---------------- Logging ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+
 # --- Tokenization and Span Conversion ---
-
-
 def tokenize_text(text: str) -> List[Tuple[int, int]]:
     """
-    Performs simple, robust tokenization based on non-whitespace, non-word characters.
-    Returns a list of (start_char, end_char) tuples for each token.
-    This mimics simple NLP tokenizers without external libraries.
+    Simple, robust tokenization: words or single punctuation symbols.
+    Returns a list of (start_char, end_char) tuples.
     """
-    # Matches words (\w+) or non-whitespace/non-word punctuation ([^\w\s])
-    # This ensures punctuation is treated as separate tokens.
     token_spans = []
-    # Use re.finditer to get all matches and their start/end indices
     for match in re.finditer(r"(\w+|[^\w\s])", text):
         token_spans.append((match.start(), match.end()))
     return token_spans
@@ -36,76 +38,66 @@ def char_span_to_token_set(
     char_start: int, char_end: int, token_spans: List[Tuple[int, int]]
 ) -> Set[int]:
     """
-    Converts a character span (start, end) into a set of token indices it covers.
-    A token is covered if the character span overlaps with the token's character span.
+    Convert a character span to indices of tokens it overlaps.
+    Overlap if: start_A < end_B AND end_A > start_B
     """
-    covered_token_indices = set()
-
-    for token_idx, (t_start, t_end) in enumerate(token_spans):
-        # Overlap exists if: (start_A < end_B) AND (end_A > start_B)
-        # Check for character overlap between marker span and token span
+    covered = set()
+    for idx, (t_start, t_end) in enumerate(token_spans):
         if char_start < t_end and char_end > t_start:
-            covered_token_indices.add(token_idx)
-
-    return covered_token_indices
+            covered.add(idx)
+    return covered
 
 
 def calculate_token_iou(set_a: Set[int], set_b: Set[int]) -> float:
-    """Calculates IoU based on the intersection and union of token index sets."""
+    """IoU over token index sets."""
     if not set_a and not set_b:
-        return 1.0  # Both empty sets, perfect match
-
-    intersection = set_a.intersection(set_b)
-    union = set_a.union(set_b)
-
+        return 1.0
+    inter = set_a & set_b
+    union = set_a | set_b
     if not union:
         return 0.0
-
-    return len(intersection) / len(union)
+    return len(inter) / len(union)
 
 
 # --- Data Handling and Evaluation ---
-
-
 def parse_args():
-    """Parses command-line arguments for file paths and configuration."""
     parser = argparse.ArgumentParser(
-        description="Evaluate span extraction predictions against ground truth using TOKEN-BASED Overlap F1 (IoU >= threshold)."
+        description="Evaluate span extraction with TOKEN-BASED Overlap F1 (IoU >= threshold)."
     )
-
-    # Positional Arguments (Codabench style)
     parser.add_argument(
         "--ground_truth_file",
         nargs="?",
         default=DEFAULT_TEST_FILE,
-        help="Path to the ground truth (test) JSONL file, which MUST contain the 'text' field. (Default: %(default)s)",
+        help="Ground-truth JSONL with 'text' and gold 'markers'.",
     )
     parser.add_argument(
         "--prediction_file",
         nargs="?",
         default=DEFAULT_SUBMISSION_FILE,
-        help="Path to the submission (predicted) JSONL file. (Default: %(default)s)",
+        help="Predicted JSONL (Codabench submission format).",
     )
     parser.add_argument(
         "--scores_output_file",
         nargs="?",
         default=DEFAULT_SCORES_FILE,
-        help="Path to the output JSON file for Codabench scores. (Default: %(default)s)",
+        help="Output JSON with scores (Codabench-style keys).",
     )
-
-    # Optional Flag for Threshold
     parser.add_argument(
         "--iou_threshold",
         type=float,
         default=DEFAULT_IOU_THRESHOLD,
-        help="The minimum token IoU required to consider a match a True Positive. (Default: %(default).1f)",
+        help=f"Minimum token IoU to count a TP (default {DEFAULT_IOU_THRESHOLD}).",
     )
-
+    parser.add_argument(
+        "--strict-extra-preds",
+        action="store_true",
+        help="If set, count predictions for IDs missing in ground truth as false positives.",
+    )
     return parser.parse_args()
 
 
 def load_jsonl(file_path):
-    """Loads all data from a JSONL file, ensuring file existence check."""
+    """Load JSONL; returns list of dicts or None on missing file."""
     data = []
     if not os.path.exists(file_path):
         print(f"Error: Required file not found at {file_path}", file=sys.stderr)
@@ -113,29 +105,30 @@ def load_jsonl(file_path):
             sys.exit(1)
         return None
 
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                data.append(json.loads(line.strip()))
+                data.append(json.loads(line))
             except json.JSONDecodeError:
-                print(
-                    f"Skipping invalid JSON line in {file_path}: {line.strip()}",
-                    file=sys.stderr,
+                logging.warning(
+                    f"Skipping invalid JSON line in {file_path}: {line[:120]}..."
                 )
     return data
 
 
 def extract_markers(data: List[Dict]) -> Dict[str, List[Dict]]:
     """
-    Extracts markers from data, mapping _id to a list of mutable marker objects
-    with a 'matched' flag.
+    Map _id -> list of predicted markers, each with a 'matched' flag.
+    Expects submission format: {"_id": ..., "markers":[{"type", "startIndex", "endIndex"}]}
     """
-    prepared = {}
+    prepared: Dict[str, List[Dict]] = {}
     for item in data:
-        doc_id = item.get("_id")
+        doc_id = item.get("_id") or item.get("doc_id")
         if not doc_id:
             continue
-
         markers_list = [
             {
                 "start": m.get("startIndex"),
@@ -155,256 +148,249 @@ def extract_markers(data: List[Dict]) -> Dict[str, List[Dict]]:
 
 def prepare_true_data(data: List[Dict]) -> Dict[str, Dict]:
     """
-    Prepares ground truth data: tokenizes text and extracts true markers.
+    Prepare ground truth map: _id -> {"token_spans": [...], "markers": [...]}
+    Tokenization is done once per doc on the ground-truth TEXT.
     """
-    prepared = {}
+    prepared: Dict[str, Dict] = {}
     for item in data:
-        doc_id = item.get("_id")
-        text = item.get("text", "")  # Text is MANDATORY for ground truth here
+        doc_id = item.get("_id") or item.get("doc_id")
+        text = item.get("text", "")
         if not doc_id or not text:
-            # Skip documents without text (required for tokenization)
+            # Skip GT rows without text (cannot tokenize)
             continue
 
-        # 1. Tokenize the text once per document
         token_spans = tokenize_text(text)
 
-        # 2. Extract and prepare markers
-        markers_list = [
-            {
-                "start": m.get("startIndex"),
-                "end": m.get("endIndex"),
-                "type": m.get("type"),
-                "matched": False,
-            }
-            for m in item.get("markers", [])
-            if m.get("type") in MARKER_TYPES
-            and isinstance(m.get("startIndex"), int)
-            and isinstance(m.get("endIndex"), int)
-            and m.get("startIndex") < m.get("endIndex")
-        ]
+        markers_list = []
+        for m in item.get("markers", []):
+            m_type = m.get("type") or m.get("label")
+            s = (
+                m.get("startIndex")
+                if m.get("startIndex") is not None
+                else m.get("start")
+            )
+            e = m.get("endIndex") if m.get("endIndex") is not None else m.get("end")
+            try:
+                s = int(s)
+                e = int(e)
+            except Exception:
+                continue
+            if (
+                m_type in MARKER_TYPES
+                and isinstance(s, int)
+                and isinstance(e, int)
+                and s < e
+            ):
+                markers_list.append(
+                    {
+                        "start": s,
+                        "end": e,
+                        "type": m_type,
+                        "matched": False,
+                    }
+                )
 
         prepared[doc_id] = {"token_spans": token_spans, "markers": markers_list}
     return prepared
 
 
-def evaluate(true_data, pred_data, iou_threshold):
+def evaluate(true_data, pred_data, iou_threshold, strict_extra_preds=False):
     """
-    Calculates Token-Based Overlap Match F1-Score for spans.
+    Compute Token-Based Overlap F1 across all docs/types.
     """
     if true_data is None or pred_data is None:
-        return {"Error": "Data loading failed."}
+        return {"Error": "Data loading failed."}, {}
 
-    # Prepare GT data: Tokenize text and prepare true markers
     true_docs = prepare_true_data(true_data)
-
-    # Prepare predicted markers (only character offsets needed)
     pred_markers_map = extract_markers(pred_data)
 
-    # Aggregate counters for all types
-    total_tp, total_fp, total_fn = 0, 0, 0
+    logging.info(f"GT docs usable (have text): {len(true_docs)}")
+    logging.info(f"Pred docs: {len(pred_markers_map)}")
+
+    total_tp = total_fp = total_fn = 0
     type_metrics = {t: {"tp": 0, "fp": 0, "fn": 0} for t in MARKER_TYPES}
 
-    # Only iterate over IDs present in the ground truth set
-    all_ids = true_docs.keys()
+    gt_ids = set(true_docs.keys())
+    pred_ids = set(pred_markers_map.keys())
 
-    for doc_id in all_ids:
+    missing_in_pred = gt_ids - pred_ids
+    extra_in_pred = pred_ids - gt_ids
+
+    if missing_in_pred:
+        logging.info(
+            f"Predictions missing for {len(missing_in_pred)} GT docs (these can still get FN via unmatched GT spans)."
+        )
+    if extra_in_pred:
+        if strict_extra_preds:
+            logging.info(
+                f"Counting {len(extra_in_pred)} extra predicted doc IDs as FPs (strict mode)."
+            )
+        else:
+            logging.info(
+                f"Ignoring {len(extra_in_pred)} extra predicted doc IDs (default Codabench-like behavior)."
+            )
+
+    # Evaluate only over GT docs (Codabench style)
+    for doc_id in gt_ids:
         true_doc = true_docs.get(doc_id)
-
-        # If true_doc is missing, it means the GT document was skipped because it lacked 'text',
-        # but we shouldn't run logic on it anyway.
         if not true_doc:
             continue
 
         true_spans = true_doc["markers"]
-        token_spans = true_doc["token_spans"]  # Use ground truth token spans
-        pred_spans = pred_markers_map.get(
-            doc_id, []
-        )  # Get predicted spans for this doc
+        token_spans = true_doc["token_spans"]
+        pred_spans = pred_markers_map.get(doc_id, [])
 
-        # --- Matching Loop ---
-        for true_span in true_spans:
-            true_token_set = char_span_to_token_set(
-                true_span["start"], true_span["end"], token_spans
-            )
+        # Match loop
+        for tspan in true_spans:
+            true_set = char_span_to_token_set(tspan["start"], tspan["end"], token_spans)
 
             best_iou = -1.0
-            best_pred_idx = -1
+            best_idx = -1
 
-            # 1. Find the best *unmatched* predicted span of the same type
-            for pred_idx, pred_span in enumerate(pred_spans):
-                if pred_span["matched"] or pred_span["type"] != true_span["type"]:
+            for idx, pspan in enumerate(pred_spans):
+                if pspan["matched"] or pspan["type"] != tspan["type"]:
                     continue
-
-                # Convert predicted char span to token set using the GT token map
-                pred_token_set = char_span_to_token_set(
-                    pred_span["start"], pred_span["end"], token_spans
+                pred_set = char_span_to_token_set(
+                    pspan["start"], pspan["end"], token_spans
                 )
-
-                iou = calculate_token_iou(true_token_set, pred_token_set)
-
+                iou = calculate_token_iou(true_set, pred_set)
                 if iou > best_iou:
-                    best_iou = iou
-                    best_pred_idx = pred_idx
+                    best_iou, best_idx = iou, idx
 
-            # 2. Check if the best match meets the IoU threshold
-            if best_iou >= iou_threshold and best_pred_idx != -1:
-                # True Positive (TP)
+            if best_iou >= iou_threshold and best_idx != -1:
                 total_tp += 1
-                type_metrics[true_span["type"]]["tp"] += 1
-                true_span["matched"] = True
-                pred_spans[best_pred_idx]["matched"] = True
+                type_metrics[tspan["type"]]["tp"] += 1
+                tspan["matched"] = True
+                pred_spans[best_idx]["matched"] = True
 
-        # 3. After matching, calculate FP and FN
-
-        # FN: Unmatched true spans
-        for true_span in true_spans:
-            if not true_span["matched"]:
+        # Count FN and FP within this doc
+        for tspan in true_spans:
+            if not tspan["matched"]:
                 total_fn += 1
-                type_metrics[true_span["type"]]["fn"] += 1
+                type_metrics[tspan["type"]]["fn"] += 1
 
-        # FP: Unmatched predicted spans
-        for pred_span in pred_spans:
-            if not pred_span["matched"]:
-                if pred_span["type"] in MARKER_TYPES:
+        for pspan in pred_spans:
+            if not pspan["matched"] and pspan["type"] in MARKER_TYPES:
+                total_fp += 1
+                type_metrics[pspan["type"]]["fp"] += 1
+
+    # Strict mode: extra doc IDs count as FP (every predicted span)
+    if strict_extra_preds and extra_in_pred:
+        for doc_id in extra_in_pred:
+            for pspan in pred_markers_map.get(doc_id, []):
+                if pspan["type"] in MARKER_TYPES:
                     total_fp += 1
-                    type_metrics[pred_span["type"]]["fp"] += 1
+                    type_metrics[pspan["type"]]["fp"] += 1
 
-    final_results = {}
-    all_f1_scores = []
+    # Aggregate metrics
+    final_results: Dict[str, float] = {}
+    all_f1 = []
 
-    # Calculate Per-Type Metrics
-    for m_type in sorted(MARKER_TYPES):
-        metrics = type_metrics[m_type]
-        tp, fp, fn = metrics["tp"], metrics["fp"], metrics["fn"]
+    for mtype in sorted(MARKER_TYPES):
+        tp = type_metrics[mtype]["tp"]
+        fp = type_metrics[mtype]["fp"]
+        fn = type_metrics[mtype]["fn"]
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        all_f1.append(f1)
+        final_results[f"P ({mtype})"] = p
+        final_results[f"R ({mtype})"] = r
+        final_results[f"F1 ({mtype})"] = f1
 
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = (
-            2 * (precision * recall) / (precision + recall)
-            if (precision + recall) > 0
-            else 0
-        )
+    f1_macro = sum(all_f1) / len(MARKER_TYPES) if MARKER_TYPES else 0.0
+    p_agg = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    r_agg = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    f1_agg = 2 * p_agg * r_agg / (p_agg + r_agg) if (p_agg + r_agg) > 0 else 0.0
 
-        all_f1_scores.append(f1)
-
-        final_results[f"P ({m_type})"] = precision
-        final_results[f"R ({m_type})"] = recall
-        final_results[f"F1 ({m_type})"] = f1
-
-    # Calculate Macro F1
-    f1_macro = sum(all_f1_scores) / len(MARKER_TYPES) if MARKER_TYPES else 0
     final_results["F1 (Macro)"] = f1_macro
-
-    # Calculate Aggregate (Micro) Metrics
-    precision_agg = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
-    recall_agg = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
-    f1_agg = (
-        2 * (precision_agg * recall_agg) / (precision_agg + recall_agg)
-        if (precision_agg + recall_agg) > 0
-        else 0
-    )
-
-    final_results["P (Agg)"] = precision_agg
-    final_results["R (Agg)"] = recall_agg
+    final_results["P (Agg)"] = p_agg
+    final_results["R (Agg)"] = r_agg
     final_results["F1 (Agg)"] = f1_agg
 
-    # Store formatted strings for console output
-    final_results_formatted = {"--- Per-Type Results (Token IoU) ---": "---"}
-    for m_type in sorted(MARKER_TYPES):
-        final_results_formatted[f"P ({m_type})"] = (
-            f"{final_results[f'P ({m_type})']:.4f}"
-        )
-        final_results_formatted[f"R ({m_type})"] = (
-            f"{final_results[f'R ({m_type})']:.4f}"
-        )
-        final_results_formatted[f"F1 ({m_type})"] = (
-            f"{final_results[f'F1 ({m_type})']:.4f}"
-        )
+    # Pretty-printable summary
+    formatted = {"--- Per-Type Results (Token IoU) ---": "---"}
+    for mtype in sorted(MARKER_TYPES):
+        formatted[f"P ({mtype})"] = f"{final_results[f'P ({mtype})']:.4f}"
+        formatted[f"R ({mtype})"] = f"{final_results[f'R ({mtype})']:.4f}"
+        formatted[f"F1 ({mtype})"] = f"{final_results[f'F1 ({mtype})']:.4f}"
 
-    final_results_formatted["--- Aggregate Results ---"] = "---"
-    final_results_formatted["IoU Threshold"] = iou_threshold
-    final_results_formatted["True Positives (Agg)"] = total_tp
-    final_results_formatted["False Positives (Agg)"] = total_fp
-    final_results_formatted["False Negatives (Agg)"] = total_fn
-    final_results_formatted["Precision (Agg)"] = f"{precision_agg:.4f}"
-    final_results_formatted["Recall (Agg)"] = f"{recall_agg:.4f}"
-    final_results_formatted["F1-Score (Agg/Micro)"] = f"{f1_agg:.4f}"
-    final_results_formatted["F1-Score (Macro)"] = f"{f1_macro:.4f}"
+    formatted["--- Aggregate Results ---"] = "---"
+    formatted["IoU Threshold"] = (
+        DEFAULT_IOU_THRESHOLD if iou_threshold is None else iou_threshold
+    )
+    formatted["True Positives (Agg)"] = total_tp
+    formatted["False Positives (Agg)"] = total_fp
+    formatted["False Negatives (Agg)"] = total_fn
+    formatted["Precision (Agg)"] = f"{p_agg:.4f}"
+    formatted["Recall (Agg)"] = f"{r_agg:.4f}"
+    formatted["F1-Score (Agg/Micro)"] = f"{f1_agg:.4f}"
+    formatted["F1-Score (Macro)"] = f"{f1_macro:.4f}"
 
-    return final_results, final_results_formatted
+    return final_results, formatted
 
 
 def save_scores_to_codabench(results, output_file):
     """
-    Saves the final scores to a JSON file in the format expected by Codabench.
+    Save scores in a Codabench-friendly JSON.
     """
     scores = dict()
+    scores["F1_Aggregate_Token"] = results.get("F1 (Agg)", 0.0)
+    scores["Precision_Aggregate_Token"] = results.get("P (Agg)", 0.0)
+    scores["Recall_Aggregate_Token"] = results.get("R (Agg)", 0.0)
+    scores["F1_Macro_Token"] = results.get("F1 (Macro)", 0.0)
 
-    # Save Aggregate (Micro) Scores
-    scores["F1_Aggregate_Token"] = results["F1 (Agg)"]
-    scores["Precision_Aggregate_Token"] = results["P (Agg)"]
-    scores["Recall_Aggregate_Token"] = results["R (Agg)"]
-
-    # Save Macro Score
-    scores["F1_Macro_Token"] = results["F1 (Macro)"]
-
-    # Save Per-Type Scores
     for m_type in sorted(MARKER_TYPES):
-        scores[f"F1_{m_type}_Token"] = results[f"F1 ({m_type})"]
-        scores[f"Precision_{m_type}_Token"] = results[f"P ({m_type})"]
-        scores[f"Recall_{m_type}_Token"] = results[f"R ({m_type})"]
+        scores[f"F1_{m_type}_Token"] = results.get(f"F1 ({m_type})", 0.0)
+        scores[f"Precision_{m_type}_Token"] = results.get(f"P ({m_type})", 0.0)
+        scores[f"Recall_{m_type}_Token"] = results.get(f"R ({m_type})", 0.0)
 
-    with open(output_file, "w") as f:
-        json.dump(scores, f, indent=4)
-
-    print(f"Token-based scores saved to {output_file} for Codabench compatibility.")
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(scores, f, indent=2)
+    logging.info(f"Token-based scores saved to {output_file} (Codabench-compatible).")
 
 
 if __name__ == "__main__":
-
-    # 1. Parse Command-Line Arguments
     args = parse_args()
 
     TEST_FILE = args.ground_truth_file
-    SUBMISSION_FILE = args.prediction_file
+    SUB_FILE = args.prediction_file
     SCORES_FILE = args.scores_output_file
-    IOU_THRESHOLD_RUNTIME = args.iou_threshold
+    IOU = args.iou_threshold
+    STRICT = args.strict_extra_preds
 
     print(
-        f"Starting TOKEN-BASED evaluation (Overlap Match F1 with IoU >= {IOU_THRESHOLD_RUNTIME})."
+        f"Starting TOKEN-BASED evaluation (IoU >= {IOU}).\n"
+        f"Ground Truth (must contain text): {TEST_FILE}\n"
+        f"Predictions (char offsets):       {SUB_FILE}\n"
+        f"Strict extra preds counted as FP: {STRICT}"
     )
-    print(f"Ground Truth (must contain text): {TEST_FILE}")
-    print(f"Predictions (character offsets): {SUBMISSION_FILE}")
 
-    # 2. Load Data
-    true_data = load_jsonl(TEST_FILE)
-    pred_data = load_jsonl(SUBMISSION_FILE)
+    gt = load_jsonl(TEST_FILE)
+    pr = load_jsonl(SUB_FILE)
 
-    if true_data is None or pred_data is None:
+    if gt is None or pr is None:
         print("Evaluation terminated due to file loading errors.")
-        default_results = {
+        default = {
             "F1 (Agg)": 0.0,
             "P (Agg)": 0.0,
             "R (Agg)": 0.0,
             "F1 (Macro)": 0.0,
         }
-        for m_type in MARKER_TYPES:
-            default_results[f"F1 ({m_type})"] = 0.0
-            default_results[f"P ({m_type})"] = 0.0
-            default_results[f"R ({m_type})"] = 0.0
+        for t in MARKER_TYPES:
+            default[f"F1 ({t})"] = 0.0
+            default[f"P ({t})"] = 0.0
+            default[f"R ({t})"] = 0.0
+        save_scores_to_codabench(default, SCORES_FILE)
+        sys.exit(1)
 
-        save_scores_to_codabench(default_results, SCORES_FILE)
-    else:
-        raw_results, formatted_results = evaluate(
-            true_data, pred_data, iou_threshold=IOU_THRESHOLD_RUNTIME
-        )
+    raw, pretty = evaluate(gt, pr, iou_threshold=IOU, strict_extra_preds=STRICT)
+    save_scores_to_codabench(raw, SCORES_FILE)
 
-        save_scores_to_codabench(raw_results, SCORES_FILE)
-
-        print("\n--- Token-Based Evaluation Results ---")
-        for key, value in formatted_results.items():
-            if key.startswith("---"):
-                print(key)
-            else:
-                print(f"{key:<30}: {value}")
-        print("--------------------------------------")
+    print("\n--- Token-Based Evaluation Results ---")
+    for k, v in pretty.items():
+        if k.startswith("---"):
+            print(k)
+        else:
+            print(f"{k:<30}: {v}")
+    print("--------------------------------------")

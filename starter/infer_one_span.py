@@ -302,6 +302,8 @@ if __name__ == "__main__":
 
     # 3) Write original submission JSONL (unchanged schema)
     print(f"\nSaving submission to {args.submission_file} ...")
+    # If directory doesn't exist, create it
+    os.makedirs(os.path.dirname(args.submission_file) or ".", exist_ok=True)
     with open(args.submission_file, "w", encoding="utf-8") as f:
         for i in range(len(raw_data)):
             f.write(
