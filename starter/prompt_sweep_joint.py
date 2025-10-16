@@ -98,6 +98,216 @@ def shorten(txt: str, n=1600):
     return txt if len(txt) <= n else txt[:n] + "..."
 
 
+# ---------- S1 post-processing (token-snap + cleanup + conflict NMS) ----------
+
+_EVAL_TOKEN_RE = re.compile(r"(\w+|[^\w\s])")
+
+CONFLICT_PAIRS = {("Action", "Effect"), ("Actor", "Victim")}
+
+
+def _tokenize_eval(text: str):
+    return [(m.start(), m.end()) for m in _EVAL_TOKEN_RE.finditer(text or "")]
+
+
+def _char_to_token_set(s: int, e: int, toks):
+    covered = set()
+    for i, (ts, te) in enumerate(toks):
+        if s < te and e > ts:
+            covered.add(i)
+    return covered
+
+
+def _snap_to_tokens(span, toks):
+    """Snap [start,end) to min/max boundaries of covered tokens. If none, snap to nearest token."""
+    s, e = int(span["start"]), int(span["end"])
+    if e <= s or not toks:
+        return None
+    covered = _char_to_token_set(s, e, toks)
+    if covered:
+        ns = min(toks[i][0] for i in covered)
+        ne = max(toks[i][1] for i in covered)
+        return {**span, "start": ns, "end": ne}
+    # no overlap -> snap to nearest token
+    # pick token whose center is closest to span center
+    c = (s + e) / 2.0
+    best = min(range(len(toks)), key=lambda i: abs((toks[i][0] + toks[i][1]) / 2.0 - c))
+    ts, te = toks[best]
+    return {**span, "start": ts, "end": te}
+
+
+def _iou(a, b):
+    inter = max(0, min(a["end"], b["end"]) - max(a["start"], b["start"]))
+    if inter <= 0:
+        return 0.0
+    union = (a["end"] - a["start"]) + (b["end"] - b["start"]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _prior_dist(priors: dict, label: str, s: int, e: int, text_len: int):
+    """Lower is better: combine |z_len| + start_pos distance to Beta mode (robust to missing)."""
+    span_len = max(1, e - s)
+    start_pos = s / max(1, text_len)
+    p = priors.get(label, {})
+    # length z ~ log-normal
+    mu = p.get("length_lognorm", {}).get("mu", 0.0)
+    sig = max(1e-6, p.get("length_lognorm", {}).get("sigma", 1.0))
+    z_len = abs((math.log(max(1, span_len)) - mu) / sig)
+    # position distance to Beta mode
+    if "start_beta" in p:
+        a = p["start_beta"].get("alpha", 1.0)
+        b = p["start_beta"].get("beta", 1.0)
+        mode = (
+            ((a - 1) / (a + b - 2))
+            if (a > 1 and b > 1)
+            else (a / (a + b) if (a > 0 and b > 0) else 0.5)
+        )
+    else:
+        mode = 0.5
+    pos_dist = abs(start_pos - mode)
+    return 1.5 * z_len + 1.0 * pos_dist
+
+
+def _merge_tiny_gaps(spans, gap=1):
+    """Merge same-label neighbors if next.start - prev.end <= gap."""
+    if not spans:
+        return spans
+    out = []
+    spans = sorted(spans, key=lambda x: (x["label"], x["start"], x["end"]))
+    i = 0
+    while i < len(spans):
+        cur = dict(spans[i])
+        j = i + 1
+        while (
+            j < len(spans)
+            and spans[j]["label"] == cur["label"]
+            and spans[j]["start"] - cur["end"] <= gap
+        ):
+            cur["end"] = max(cur["end"], spans[j]["end"])
+            j += 1
+        out.append(cur)
+        i = j
+    return out
+
+
+def _dedup_same_label(spans, iou_thr=0.90, text_len=1, priors=None):
+    """Remove near-duplicates per label using IoU; keep span closer to priors, else longer."""
+    priors = priors or {}
+    out = []
+    for lab in {"Actor", "Action", "Effect", "Victim", "Evidence"}:
+        S = [s for s in spans if s["label"] == lab]
+        S = sorted(S, key=lambda x: (x["start"], x["end"]))
+        keep = []
+        used = [False] * len(S)
+        for i, a in enumerate(S):
+            if used[i]:
+                continue
+            best = a
+            used[i] = True
+            for j in range(i + 1, len(S)):
+                if used[j]:
+                    continue
+                b = S[j]
+                if _iou(a, b) >= iou_thr:
+                    # choose prior-closer
+                    da = _prior_dist(priors, lab, a["start"], a["end"], text_len)
+                    db = _prior_dist(priors, lab, b["start"], b["end"], text_len)
+                    cand = a if da <= db else b
+                    best = (
+                        cand
+                        if (cand["end"] - cand["start"])
+                        >= (best["end"] - best["start"])
+                        else best
+                    )
+                    used[j] = True
+            keep.append(best)
+        out.extend(keep)
+    return sorted(out, key=lambda x: (x["start"], x["end"]))
+
+
+def _conflict_nms(spans, iou_thr=0.50, text_len=1, priors=None):
+    """Suppress overlaps across conflict pairs using priors (lower prior_dist wins)."""
+    priors = priors or {}
+    if not spans:
+        return spans
+    spans = sorted(spans, key=lambda x: (x["start"], x["end"]))
+    keep = [True] * len(spans)
+    for i in range(len(spans)):
+        if not keep[i]:
+            continue
+        a = spans[i]
+        for j in range(i + 1, len(spans)):
+            if not keep[j]:
+                continue
+            b = spans[j]
+            pair = tuple(sorted((a["label"], b["label"])))
+            if pair not in CONFLICT_PAIRS:
+                continue
+            if _iou(a, b) >= iou_thr:
+                da = _prior_dist(priors, a["label"], a["start"], a["end"], text_len)
+                db = _prior_dist(priors, b["label"], b["start"], b["end"], text_len)
+                # keep prior-closer; if tie, keep longer; if still tie, keep earlier
+                score_a = (da, -(a["end"] - a["start"]), a["start"])
+                score_b = (db, -(b["end"] - b["start"]), b["start"])
+                if score_a <= score_b:
+                    keep[j] = False
+                else:
+                    keep[i] = False
+                    break
+    return [s for k, s in zip(keep, spans) if k]
+
+
+def postprocess_s1_spans(
+    text: str,
+    spans: List[dict],
+    priors: dict = None,
+    merge_gap: int = 1,
+    dedup_iou: float = 0.90,
+    conflict_iou: float = 0.50,
+):
+    """Main post-proc: snap -> drop zero -> merge tiny gaps -> dedup -> conflict NMS."""
+    if not text or not spans:
+        return []
+    toks = _tokenize_eval(text)
+    L = len(text)
+    # 1) normalize schema + snap
+    canon = []
+    for m in spans:
+        lab = (m.get("label") or m.get("type") or "").strip()
+        s = m.get("start", m.get("startIndex"))
+        e = m.get("end", m.get("endIndex"))
+        try:
+            s, e = int(s), int(e)
+        except Exception:
+            continue
+        s = max(0, min(L, s))
+        e = max(0, min(L, e))
+        if e <= s:
+            continue
+        snapped = _snap_to_tokens({"label": lab, "start": s, "end": e}, toks)
+        if snapped and snapped["end"] > snapped["start"]:
+            canon.append(snapped)
+    if not canon:
+        return []
+    # 2) merge tiny gaps (same label)
+    canon = _merge_tiny_gaps(canon, gap=merge_gap)
+    # 3) de-dup near duplicates (same label)
+    canon = _dedup_same_label(canon, iou_thr=dedup_iou, text_len=L, priors=priors)
+    # 4) conflict-aware NMS (Action/Effect, Actor/Victim)
+    canon = _conflict_nms(canon, iou_thr=conflict_iou, text_len=L, priors=priors)
+    # back to submission schema + attach text slice
+    out = []
+    for m in canon:
+        out.append(
+            {
+                "type": m["label"],
+                "startIndex": m["start"],
+                "endIndex": m["end"],
+                "text": text[m["start"] : m["end"]],
+            }
+        )
+    return out
+
+
 # ---------- default prompts ----------
 S1_BASE = """You are a careful annotator for PsyCoMark (SemEval-2026 Task 10, Subtask 1).
 Task: extract character spans that best reflect the following labels: Actor, Action, Effect, Victim, Evidence.
@@ -132,10 +342,10 @@ Label decision rubric:
 Avoid using subreddit as a proxy; rely on text content and framing.
 
 Probability rubric (p_conspiracy, p_non should sum to 1.0):
-- 0.90–1.00: Explicit assertion/endorsement of a conspiracy.
-- 0.60–0.80: Strong implication or supportive framing without explicit claim.
+- 0.90-1.00: Explicit assertion/endorsement of a conspiracy.
+- 0.60-0.80: Strong implication or supportive framing without explicit claim.
 - ~0.50: Ambiguous/uncertain.
-- 0.00–0.20: Clearly non-conspiratorial (neutral/debunking/irrelevant).
+- 0.00-0.20: Clearly non-conspiratorial (neutral/debunking/irrelevant).
 
 Return strict JSON ONLY:
 {"label":"conspiracy|non","p_conspiracy":0.xx,"p_non":0.xx,"rationale":"<=2 sentences"}
@@ -161,6 +371,32 @@ RETURN JSON:
 {{"label":"conspiracy|non","p_conspiracy":0.xx,"p_non":0.xx,"rationale":"..."}}"""
 
 
+def _save_text(path, text):
+    p = pathlib.Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text if isinstance(text, str) else json.dumps(text, ensure_ascii=False))
+
+
+def _save_prompt_bundle(
+    out_dir: pathlib.Path,
+    task: str,
+    doc_id: str,
+    sys_blocks: List[str],
+    user_block: str,
+):
+    base = out_dir / "prompts" / task
+    _save_text(base / f"{doc_id}.system.txt", "\n\n---\n\n".join(sys_blocks))
+    _save_text(base / f"{doc_id}.user.txt", user_block)
+
+
+def _save_prompt_meta(out_dir: pathlib.Path, meta: dict):
+    _save_text(
+        out_dir / "prompts" / "metadata.json",
+        json.dumps(meta, ensure_ascii=False, indent=2),
+    )
+
+
 # ---------- fewshots rendering ----------
 def render_fewshots_block(examples: List[Dict[str, Any]], is_s2: bool) -> str:
     if not examples:
@@ -168,17 +404,45 @@ def render_fewshots_block(examples: List[Dict[str, Any]], is_s2: bool) -> str:
     blocks = []
     for ex in examples:
         txt = ex.get("text") or ex.get("doc_text") or ""
+
         if is_s2:
             gold = (
                 ex.get("gold")
                 or ex.get("json")
                 or {"label": "non", "rationale": "baseline", "confidence": 0.7}
             )
+
+            # --- NEW (≈10 lines): include markers if present, coercing schema ---
+            mk = ex.get("markers") or []
+            mk_norm = []
+            for m in mk:
+                lab = (m.get("type") or m.get("label") or "").strip()
+                s = m.get("startIndex", m.get("start"))
+                e = m.get("endIndex", m.get("end"))
+                try:
+                    s, e = int(s), int(e)
+                except Exception:
+                    continue
+                if lab and e > s:
+                    mk_norm.append({"type": lab, "startIndex": s, "endIndex": e})
+            # -------------------------------------------------------------------
+
+            block = f"EXAMPLE:\nTEXT:\n{shorten(txt, 800)}\n"
+            if mk_norm:  # insert just before the gold JSON
+                block += (
+                    "DETECTED_MARKERS_JSON:\n"
+                    + json.dumps(mk_norm, ensure_ascii=False)
+                    + "\n"
+                )
+            block += "JSON:\n" + json.dumps(gold, ensure_ascii=False)
+
         else:
             gold = ex.get("gold") or ex.get("json") or []
-        blocks.append(
-            f"EXAMPLE:\nTEXT:\n{shorten(txt, 800)}\nJSON:\n{json.dumps(gold, ensure_ascii=False)}"
-        )
+            block = f"EXAMPLE:\nTEXT:\n{shorten(txt, 800)}\nJSON:\n" + json.dumps(
+                gold, ensure_ascii=False
+            )
+
+        blocks.append(block)
     return "\n\n".join(blocks)
 
 
@@ -200,6 +464,39 @@ def _file_has_markers(jsonl_path: str, sample: int = 200) -> bool:
         return y > 0
     except Exception:
         return False
+
+
+def tune_threshold_dev(rows_s2, prob_rows):
+    """Return (best_thr, best_f1, stats)."""
+    # build gold
+    y_true = []
+    id_order = []
+    for r in rows_s2:
+        lab = (r.get("doc_label") or "").strip().lower()
+        if lab not in ("conspiracy", "non"):  # skip cant_tell
+            continue
+        y_true.append(1 if lab == "conspiracy" else 0)
+        id_order.append(r.get("_id") or r.get("doc_id"))
+    # align probs
+    p_map = {r["_id"]: float(r["p_conspiracy"]) for r in prob_rows}
+    y_prob = [p_map.get(i, 0.5) for i in id_order]
+    # sweep thresholds
+    import numpy as np
+    from sklearn.metrics import f1_score
+
+    best_f1, best_t = -1.0, 0.50
+    for t in np.linspace(0.10, 0.90, 33):
+        y_pred = [1 if p >= t else 0 for p in y_prob]
+        f1 = f1_score(y_true, y_pred, average="binary", zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_t = f1, float(t)
+    mean_p = float(sum(y_prob) / len(y_prob)) if y_prob else 0.5
+    if mean_p < 0.15:
+        logging.warning(
+            "[S2] mean_p extremely low; likely 'all-No' drift. Check few-shots and markers."
+        )
+
+    return best_t, best_f1, {"mean_p": mean_p, "n": len(y_prob)}
 
 
 # ---------- S1 helpers ----------
@@ -609,6 +906,17 @@ def main():
         default="fs_boundary_policy,sc5",
         help="Comma list applied jointly. Examples: zs,fs_boundary_policy,sc5,sc10",
     )
+    ap.add_argument(
+        "--save-prompts",
+        choices=["none", "sample", "all"],
+        default="sample",
+        help="Save prompts to runs/<out>/prompts. 'sample' saves first 3 docs per task+tech.",
+    )
+    ap.add_argument(
+        "--print-prompts-preview",
+        action="store_true",
+        help="Print a short preview (first 500 chars) of the final system+user prompts once per technique.",
+    )
     ap.add_argument("--model-id", default=None)
     ap.add_argument("--region", default=None)
     ap.add_argument("--max-tokens-s1", type=int, default=1200)
@@ -617,6 +925,24 @@ def main():
     ap.add_argument("--sc-temperature", type=float, default=0.7)
     ap.add_argument("--s1-iou", type=float, default=0.5)
     ap.add_argument("--out-root", default="runs/joint_llm")
+    ap.add_argument(
+        "--pp-merge-gap",
+        type=int,
+        default=1,
+        help="Merge same-label spans separated by <= gap chars.",
+    )
+    ap.add_argument(
+        "--pp-dedup-iou",
+        type=float,
+        default=0.90,
+        help="De-dup same-label spans with IoU>=thr (keep prior-closer).",
+    )
+    ap.add_argument(
+        "--pp-conflict-iou",
+        type=float,
+        default=0.50,
+        help="NMS IoU for conflict pairs (Actor/Victim, Action/Effect).",
+    )
     ap.add_argument(
         "--max-markers-per-label",
         type=int,
@@ -671,6 +997,7 @@ def main():
         tech_dir = pathlib.Path(args.out_root) / tech
         (tech_dir / "s1").mkdir(parents=True, exist_ok=True)
         (tech_dir / "s2").mkdir(parents=True, exist_ok=True)
+        (tech_dir / "prompts").mkdir(parents=True, exist_ok=True)
         s1_sub = tech_dir / "s1" / "submission.jsonl"
         s1_pruned_sub = tech_dir / "s1" / "submission_pruned.jsonl"
         s2_sub = tech_dir / "s2" / "submission.jsonl"
@@ -680,11 +1007,37 @@ def main():
             gt_subset_path = tech_dir / "s1" / "gt_subset.jsonl"
             write_jsonl(gt_subset_path, rows_s1)  # rows_s1 already limited
 
+        # Save prompt metadata once per technique
+        _save_prompt_meta(
+            tech_dir,
+            {
+                "tech": tech,
+                "model_id": args.model_id,
+                "region": args.region,
+                "max_tokens_s1": args.max_tokens_s1,
+                "max_tokens_s2": args.max_tokens_s2,
+                "temperature": args.temperature,
+                "sc_temperature": args.sc_temperature,
+                "s1_policy_used": bool(s1_policy),
+                "s2_policy_used": bool(s2_policy),
+                "boundary_note_used": bool(boundary) and ("boundary" in tech),
+                "fewshots_s1_count": len(s1_shots),
+                "fewshots_s2_count": len(s2_shots),
+                "eda_root": str(args.eda_root) if args.eda_root else None,
+                "s1_iou_threshold": args.s1_iou,
+            },
+        )
+
+        # For console preview, show the first built prompts once per technique
+        printed_s1_preview = False
+        printed_s2_preview = False
+
         # ------ S1 inference ------
         s1_out_rows = []
         s1_pruned_rows = []
         id2markers = {}  # for S2 conditioning
         total_raw, total_valid, total_pruned = 0, 0, 0
+        saved_s1 = 0
         for rec in rows_s1:
             _id = rec.get("_id") or rec.get("doc_id")
             txt = rec.get("text", "")
@@ -693,6 +1046,23 @@ def main():
                 txt, s1_policy, s1_shots, boundary, tech
             )
             temp = args.sc_temperature if n_samples > 1 else args.temperature
+            # Save/print prompts per policy
+            if args.save_prompts == "all" or (
+                args.save_prompts == "sample" and saved_s1 < 3
+            ):
+                _save_prompt_bundle(tech_dir, "s1", str(_id), sys_blocks, user_block)
+                saved_s1 += 1
+            if args.print_prompts_preview and not printed_s1_preview:
+                sys_preview = ("\\n\\n---\\n\\n".join(sys_blocks))[:500]
+                user_preview = user_block[:500]
+                print(
+                    "[S1 prompt preview]\nSYSTEM:\n"
+                    + sys_preview
+                    + "\n\nUSER:\n"
+                    + user_preview
+                )
+                printed_s1_preview = True
+
             spans = run_s1(
                 rec,
                 sys_blocks,
@@ -711,15 +1081,23 @@ def main():
                 s1_pruned_rows.append({"_id": _id, "markers": empty_markers})
                 continue
 
-            markers = [
-                {
-                    "type": m["label"],
-                    "startIndex": m["start"],
-                    "endIndex": m["end"],
-                    "text": txt[m["start"] : m["end"]],
-                }
-                for m in spans
-            ]
+            # Post-process with evaluator-aligned token snap + cleanup + conflict NMS
+            markers = postprocess_s1_spans(
+                text=txt,
+                spans=spans,  # raw model output (label/start/end)
+                priors=(
+                    json.loads(
+                        (eda / "length_position_priors.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    if args.eda_root and (eda / "length_position_priors.json").exists()
+                    else {}
+                ),
+                merge_gap=args.pp_merge_gap,
+                dedup_iou=args.pp_dedup_iou,
+                conflict_iou=args.pp_conflict_iou,
+            )
             s1_out_rows.append({"_id": _id, "markers": markers})
 
             # limit per label for S2 prompt brevity
@@ -786,9 +1164,11 @@ def main():
             )
             # Save artifacts
             save_s1_metrics_artifacts(s1_scores, tech_dir / "s1", tech)
+
         # ------ S2 inference (conditioned on S1) ------
         s2_out_rows = []
         s2_prob_rows = []
+        saved_s2 = 0
         for _id, doc2 in id2doc_s2.items():
             txt = doc2.get("text", "")
             # use S1 markers if present for the same doc_id
@@ -799,6 +1179,22 @@ def main():
                 txt, s2_policy, s2_shots, tech, markers_json
             )
             temp = args.sc_temperature if n_samples > 1 else args.temperature
+            if args.save_prompts == "all" or (
+                args.save_prompts == "sample" and saved_s2 < 3
+            ):
+                _save_prompt_bundle(tech_dir, "s2", str(_id), sys_blocks, user_block)
+                saved_s2 += 1
+            if args.print_prompts_preview and not printed_s2_preview:
+                sys_preview = ("\\n\\n---\\n\\n".join(sys_blocks))[:500]
+                user_preview = user_block[:500]
+                print(
+                    "[S2 prompt preview]\nSYSTEM:\n"
+                    + sys_preview
+                    + "\n\nUSER:\n"
+                    + user_preview
+                )
+                printed_s2_preview = True
+
             lbl, p_con, p_non = run_s2(
                 doc2,
                 sys_blocks,
@@ -829,6 +1225,35 @@ def main():
                 s2_prob_rows
             )
             print(f"S2 prob stats: mean_p={mean_p:.3f} frac_p>=0.5={frac_pos:.3f}")
+
+        # --- NEW: threshold from dev probs (auto) ---
+        thr = None
+        if isinstance(args.s2_thresh, str) and args.s2_thresh.lower() == "auto":
+            best_t, best_f1, stats = tune_threshold_dev(rows_s2, s2_prob_rows)
+            thr = best_t
+            print(
+                f"[S2] auto threshold tuned on dev: t={best_t:.2f} (dev f1={best_f1:.3f}, mean_p={stats['mean_p']:.3f}, n={stats['n']})"
+            )
+        else:
+            try:
+                thr = float(args.s2_thresh)
+            except Exception:
+                thr = 0.50
+        # Re-write submission.jsonl using the chosen threshold
+        pred2 = [
+            {
+                "_id": r["_id"],
+                "conspiracy": ("Yes" if r["p_conspiracy"] >= thr else "No"),
+            }
+            for r in s2_prob_rows
+        ]
+        write_jsonl(s2_sub, pred2)
+
+        if mean_p < 0.15:
+            logging.warning(
+                "[S2] mean_p extremely low; likely 'all-No' drift. Check few-shots and markers."
+            )
+
         s2_scores = eval_s2(args.test_file_s2, str(s2_sub))
         print(f"S2 done -> {s2_sub}")
         print(

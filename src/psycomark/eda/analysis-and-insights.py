@@ -770,6 +770,12 @@ def main():
     # ---- Span position plot ----
     span_position_plot(spans_all, df_all, out_dir / "span_position_analysis.png")
 
+    (out_dir / "lexicons.json").write_text(
+        json.dumps({"ABSOLUTIST": ABSOLUTIST, "HEDGES": HEDGES}, indent=2),
+        encoding="utf-8",
+    )
+    print("[analysis_and_insights] Wrote lexicons.json")
+
     print(
         "\n[analysis_and_insights] Finished. Artifacts written to:", out_dir.resolve()
     )

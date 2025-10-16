@@ -46,6 +46,108 @@ CANT_TELL_RATIONALE_DEFAULT = "Insufficient evidence for a concrete conspiracy c
 # -----------------------------
 # Helpers
 # -----------------------------
+
+
+def load_lexicons(out_dir: Path):
+    # defaults if file missing
+    abs_default = [
+        "always",
+        "never",
+        "everyone",
+        "no one",
+        "impossible",
+        "undeniable",
+        "without a doubt",
+        "completely",
+        "totally",
+        "entirely",
+        "absolutely",
+        "certainly",
+        "no doubt",
+        "no doubts",
+    ]
+    hed_default = [
+        "maybe",
+        "perhaps",
+        "possibly",
+        "likely",
+        "unlikely",
+        "appears",
+        "seems",
+        "suggests",
+        "might",
+        "could",
+        "may",
+        "arguably",
+    ]
+    path = out_dir / "lexicons.json"
+    if path.exists():
+        try:
+            js = json.loads(path.read_text(encoding="utf-8"))
+            A = js.get("ABSOLUTIST") or abs_default
+            H = js.get("HEDGES") or hed_default
+            return A, H
+        except Exception:
+            pass
+    return abs_default, hed_default
+
+
+# --- NEW: Prior- & boundary-aware pickers for S1 ---
+def _dist_to_priors(priors: dict, label: str, s: int, e: int, tlen: int) -> float:
+    span_len = max(1, e - s)
+    start_pos = s / max(1, tlen)
+    # lower is better
+    dz = prior_len_z(priors, label, span_len)  # ~|z|
+    dp = prior_pos_dist(priors, label, start_pos)  # ~distance in [0,1]
+    return 1.5 * dz + 1.0 * dp
+
+
+def pick_s1_prior_examples(df_lab: pd.DataFrame, priors: dict, k_near=1, k_outlier=1):
+    if df_lab.empty:
+        return []
+    df = df_lab.copy()
+    df["tlen"] = df["text"].str.len().fillna(1).astype(int)
+    df["prior_dist"] = df.apply(
+        lambda r: _dist_to_priors(priors, r["label"], r["start"], r["end"], r["tlen"]),
+        axis=1,
+    )
+    # near-prior: lowest distance
+    near = (
+        df.sort_values("prior_dist", ascending=True)
+        .head(k_near)
+        .to_dict(orient="records")
+    )
+    # outlier: highest distance
+    out = (
+        df.sort_values("prior_dist", ascending=False)
+        .head(k_outlier)
+        .to_dict(orient="records")
+    )
+    return near + out
+
+
+def _has_boundary_cue(ctx: dict, label: str, text: str, s: int, e: int) -> bool:
+    cues = []
+    for key in ("before_1w", "after_1w", "before_2w", "after_2w"):
+        cues.extend(ctx.get(label, {}).get(key, [])[:5])  # top-5 per side
+    window = text[max(0, s - 40) : min(len(text), e + 40)].lower()
+    return any(c and c.lower() in window for c in cues if isinstance(c, str))
+
+
+def pick_s1_boundary_examples(df_lab: pd.DataFrame, boundary_ctx: dict, k=1):
+    if df_lab.empty:
+        return []
+    rows = []
+    for _, r in df_lab.iterrows():
+        if _has_boundary_cue(
+            boundary_ctx, r["label"], r["text"] or "", int(r["start"]), int(r["end"])
+        ):
+            rows.append(r.to_dict())
+    rng = np.random.default_rng(42)
+    rng.shuffle(rows)
+    return rows[:k]
+
+
 def find_latest_dir(pointer: Path) -> Path:
     if not pointer.exists():
         raise FileNotFoundError(
@@ -212,6 +314,69 @@ def coerce_s2_item(r, label_override=None, rationale=None, tag=None):
     return item
 
 
+# --- add near other helpers ---
+def pick_negative_s1_snippet(dev_df, min_len=120, max_len=320, seed=42):
+    """Return a dict with text and empty spans to teach 'no markers'."""
+    pool = dev_df[
+        dev_df["markers"].apply(lambda m: not isinstance(m, list) or len(m) == 0)
+    ]
+    if pool.empty:
+        return None
+    rows = pool.sample(n=min(50, len(pool)), random_state=seed, replace=False)
+    for _, r in rows.iterrows():
+        t = (r.get("text") or "").strip()
+        if min_len <= len(t) <= max_len:
+            return {
+                "doc_id": r.get("doc_id"),
+                "text": t,
+                "spans": [],  # empty JSON to demonstrate valid 'no markers'
+                "meta": {"reason": "negative_no_markers"},
+            }
+    return None
+
+
+def _shorten_rationale(r: str, max_chars=160) -> str:
+    r = (r or "").strip().split("\n")[0]
+    return (r[:max_chars] + "…") if len(r) > max_chars else r
+
+
+def enforce_min_yes_fewshots(s2_list, min_yes=4, df_all=None, seed=42):
+    yes = [x for x in s2_list if (x.get("label") or "").lower() == "conspiracy"]
+    if len(yes) >= min_yes:
+        # clean rationales
+        for x in s2_list:
+            if "rationale" in x:
+                x["rationale"] = _shorten_rationale(x["rationale"])
+        return s2_list
+
+    # sample additional 'conspiracy' rows from data
+    needed = min_yes - len(yes)
+    if df_all is not None:
+        pool = df_all[df_all["doc_label"] == "conspiracy"].copy()
+        if not pool.empty:
+            pool = pool.sample(n=min(needed * 3, len(pool)), random_state=seed)
+            added = 0
+            for _, r in pool.iterrows():
+                if any(x["doc_id"] == r["doc_id"] for x in s2_list):
+                    continue
+                s2_list.append(
+                    {
+                        "doc_id": r["doc_id"],
+                        "text": r.get("text", ""),
+                        "label": "conspiracy",
+                        "rationale": "Text clearly alleges a covert plan with actors and evidence.",
+                    }
+                )
+                added += 1
+                if added >= needed:
+                    break
+    # clean rationales for all
+    for x in s2_list:
+        if "rationale" in x:
+            x["rationale"] = _shorten_rationale(x["rationale"])
+    return s2_list
+
+
 # -----------------------------
 # S1 scoring / selection
 # -----------------------------
@@ -321,6 +486,132 @@ def make_snippet(item: dict, pad=120) -> dict:
     }
 
 
+def compute_prior_features(priors, label, start, end, text_len):
+    length = max(1, int(end) - int(start))
+    start_pos = int(start) / max(1, int(text_len))
+    return {
+        "len": int(length),
+        "start_pos": float(start_pos),
+        "z_len": float(prior_len_z(priors, label, length)),
+        "pos_dist": float(prior_pos_dist(priors, label, start_pos)),
+    }
+
+
+def detect_boundary_hit(boundary_ctx, label, text, start, end):
+    if not boundary_ctx:
+        return {"hit": False, "cues": []}
+    window = (text or "").lower()[max(0, start - 50) : min(len(text), end + 50)]
+    cues = []
+    for key in ("before_1w", "after_1w", "before_2w", "after_2w"):
+        for c in (boundary_ctx.get(label, {}).get(key, []) or [])[:5]:
+            if isinstance(c, str) and c.lower() in window:
+                cues.append(c)
+    return {"hit": len(cues) > 0, "cues": list(dict.fromkeys(cues))}
+
+
+# --- S2 heuristic pickers ---
+def _marker_density(mks):  # compact proxy: more markers -> more conspiratorial framing
+    return 0 if not isinstance(mks, list) else min(10, len(mks))
+
+
+def is_hedged_no(row_text: str, hedges) -> bool:
+    s = (row_text or "").lower()
+    return any(h in s for h in hedges)
+
+
+def is_speculative_yes(row_text: str, absolutist) -> bool:
+    s = (row_text or "").lower()
+    return any(a in s for a in absolutist) and (
+        "they" in s or "agenda" in s or "cover up" in s
+    )
+
+
+def pick_s2_buckets(
+    df_all,
+    ABSOLUTIST,
+    HEDGES,
+    k_yes=3,
+    k_no=3,
+    k_hedged_no=2,
+    k_spec_yes=2,
+    seed=42,
+):
+    # clear YES/NO by label
+    yy = df_all[df_all["doc_label"] == "conspiracy"].copy()
+    nn = df_all[df_all["doc_label"] == "non"].copy()
+    # enrich with markers if available
+    if "markers" in df_all.columns:
+        yy["_md"] = yy["markers"].apply(_marker_density)
+        nn["_md"] = nn["markers"].apply(_marker_density)
+        yy = yy.sort_values("_md", ascending=False)
+        nn = nn.sort_values("_md", ascending=True)
+
+    clear_yes = yy.head(k_yes).to_dict(orient="records")
+    clear_no = nn.head(k_no).to_dict(orient="records")
+
+    # hedged NO (non + hedges)
+    hed_pool = nn[nn["text"].apply(lambda t: is_hedged_no(t, HEDGES))]
+    hedged_no = (
+        hed_pool.sample(n=min(k_hedged_no, len(hed_pool)), random_state=seed).to_dict(
+            orient="records"
+        )
+        if not hed_pool.empty
+        else []
+    )
+
+    # speculative YES (conspiracy + absolutist language)
+    spec_pool = yy[yy["text"].apply(lambda t: is_speculative_yes(t, ABSOLUTIST))]
+    spec_yes = (
+        spec_pool.sample(n=min(k_spec_yes, len(spec_pool)), random_state=seed).to_dict(
+            orient="records"
+        )
+        if not spec_pool.empty
+        else []
+    )
+
+    return clear_yes, clear_no, hedged_no, spec_yes
+
+
+def pick_hard_S2(hard_df, df_all, max_borderline=3, max_misleading=3):
+    if hard_df is None or hard_df.empty:
+        return []
+    J = hard_df.copy()
+    J["doc_id"] = J["doc_id"].astype(str)
+    right = df_all.set_index("doc_id")[["text", "doc_label", "subreddit"]]
+    J = J.set_index("doc_id").join(right, how="left").reset_index()
+    J = J[J["doc_label"].isin(["conspiracy", "non"])]
+
+    borderline = J[
+        J["reasons"].apply(lambda rs: any("High" in r or "Entropy" in r for r in rs))
+    ].head(max_borderline)
+    misleading = J[
+        J["reasons"].apply(lambda rs: any("Baseline Confident Error" in r for r in rs))
+    ].head(max_misleading)
+
+    out = []
+    for _, r in borderline.iterrows():
+        out.append(
+            {
+                "doc_id": r["doc_id"],
+                "text": r["text"],
+                "label": r["doc_label"],
+                "rationale": "Borderline framing; avoid over-reading ambiguity.",
+            }
+        )
+    for _, r in misleading.iterrows():
+        # keep the gold label but make rationale explicit
+        lab = r["doc_label"]
+        rat = (
+            "Speculative framing asserted as fact."
+            if lab == "conspiracy"
+            else "Non-conspiratorial despite suggestive phrasing."
+        )
+        out.append(
+            {"doc_id": r["doc_id"], "text": r["text"], "label": lab, "rationale": rat}
+        )
+    return out
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -340,8 +631,15 @@ def main():
     ap.add_argument("--cant-tell-rationale", default=CANT_TELL_RATIONALE_DEFAULT)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
+        "--s2-thresh",
+        default="auto",
+        help="Probability threshold for 'Yes'. Float in [0,1] or 'auto' to tune on dev.",
+    )
+
+    ap.add_argument(
         "--preserve-existing-s1",
         action="store_true",
+        default=False,
         help="If set, keep existing S1 exemplars and only update S2.",
     )
     args = ap.parse_args()
@@ -350,6 +648,7 @@ def main():
     np.random.seed(args.seed)
 
     out_dir = find_latest_dir(Path(args.latest_pointer))
+    ABSOLUTIST, HEDGES = load_lexicons(out_dir)
     print(f"--- Using latest derived run: {out_dir.name} ---")
 
     # Load data
@@ -407,17 +706,50 @@ def main():
 
     print(f"[S2] candidate pool (binary): {len(pool_for_pick)}")
 
-    s2_raw = pick_balanced_by_label(
-        pool_for_pick,
-        k_per_label=args.shots_s2_per_class,
-        label_col="doc_label",
-        text_col="text",
-        diversity_col="subreddit",
+    # Balanced buckets: clear Yes/No + hedged No + speculative Yes
+    cy, cn, hed_no, spec_yes = pick_s2_buckets(
+        df_all,
+        k_yes=3,
+        k_no=3,
+        k_hedged_no=2,
+        k_spec_yes=2,
         seed=args.seed,
-        len_min=160,
-        len_max=1000,
+        ABSOLUTIST=ABSOLUTIST,
+        HEDGES=HEDGES,
     )
-    s2_main = [coerce_s2_item(r) for r in s2_raw]
+
+    def _mk(item, label_override=None, rationale=""):
+        return coerce_s2_item(item, label_override=label_override, rationale=rationale)
+
+    s2_main = []
+    s2_main += [
+        _mk(
+            r, rationale="Explicit claim of covert actors/actions with supporting cues."
+        )
+        for r in cy
+    ]
+    s2_main += [
+        _mk(r, rationale="Statement is non-conspiratorial and descriptive.") for r in cn
+    ]
+    s2_main += [
+        _mk(
+            r,
+            label_override="non",
+            rationale="Hedged/uncertain language without endorsement.",
+        )
+        for r in hed_no
+    ]
+    s2_main += [
+        _mk(
+            r,
+            label_override="conspiracy",
+            rationale="Speculative assertion framed as fact with absolutist cues.",
+        )
+        for r in spec_yes
+    ]
+
+    s2_hard = pick_hard_S2(hard_df, df_all, max_borderline=2, max_misleading=2)
+    s2_main += s2_hard
 
     # Optional: inject cant_tell as negative with rationale
     s2_ct = []
@@ -449,6 +781,23 @@ def main():
 
     s2_fewshots = s2_main + s2_ct
 
+    # attach compact markers to S2 fewshots so the S2 prompt examples mirror runtime conditioning
+    def attach_markers(ex):
+        did = ex["doc_id"]
+        row = df_all[df_all["doc_id"] == did].head(1)
+        mks = (
+            markers_compact(row.iloc[0].get("markers", []), max_per_label=2)
+            if not row.empty
+            else []
+        )
+        ex["markers"] = mks
+        return ex
+
+    s2_fewshots = [attach_markers(x) for x in (s2_main + s2_ct)]
+    s2_fewshots = enforce_min_yes_fewshots(
+        s2_fewshots, min_yes=6, df_all=df_all, seed=args.seed
+    )
+
     # ----------------- S1 selection (spans) -----------------
     if args.preserve_existing_s1 and existing.get("s1"):
         s1_examples = existing["s1"]
@@ -463,16 +812,128 @@ def main():
         s1_examples = []
         for L in sorted(ALLOWED_S1):
             df_lab = cands[cands["label"] == L].copy()
-            picks = pick_s1_for_label(
-                df_lab,
-                k=args.shots_s1_per_label,
-                outlier_k=args.shots_s1_outliers,
-                priors=priors,
-                subreddit_diversity=True,
+            # keep one diversity-aware top example
+            base = pick_s1_for_label(
+                df_lab, k=1, outlier_k=0, priors=priors, subreddit_diversity=True
             )
+            # add near-prior + outlier (1+1)
+            prior_set = pick_s1_prior_examples(df_lab, priors, k_near=1, k_outlier=1)
+            # add one boundary-cue exemplar if available
+            bset = pick_s1_boundary_examples(df_lab, boundary, k=1)
+            picks = (base + prior_set + bset)[
+                : (args.shots_s1_per_label + args.shots_s1_outliers)
+            ]
             for p in picks:
                 s1_examples.append(make_snippet(p, pad=120))
 
+    # Add overlap exemplars for top ambiguous pairs (Action/Effect, Actor/Victim)
+    if pairs:
+        for pair in pairs:
+            a, b = pair
+            df_ab = cands[(cands["label"].isin([a, b]))].copy()
+            # keep docs that contain BOTH labels with IoU >= 0.3 within a 240-char window
+            seen = set()
+            for doc_id, g in df_ab.groupby("doc_id"):
+                if doc_id in seen:
+                    continue
+                g = g.sort_values(["start", "end"])
+                spans = g.to_dict(orient="records")
+                ok = False
+                for i in range(len(spans)):
+                    for j in range(i + 1, len(spans)):
+                        if spans[i]["label"] == spans[j]["label"]:
+                            continue
+                        s1, e1 = int(spans[i]["start"]), int(spans[i]["end"])
+                        s2, e2 = int(spans[j]["start"]), int(spans[j]["end"])
+                        inter = max(0, min(e1, e2) - max(s1, s2))
+                        union = (e1 - s1) + (e2 - s2) - inter
+                        iou = (inter / union) if union > 0 else 0.0
+                        if iou >= 0.30 and abs(max(e1, e2) - min(s1, s2)) <= 240:
+                            # add a snippet covering both spans; include both spans in JSON
+                            left = max(0, min(s1, s2) - 120)
+                            right = min(len(spans[i]["text"]), max(e1, e2) + 120)
+                            t = spans[i]["text"]
+                            snippet = (t[left:right]).strip()
+                            off1s, off1e = s1 - left, e1 - left
+                            off2s, off2e = s2 - left, e2 - left
+                            s1_examples.append(
+                                {
+                                    "doc_id": doc_id,
+                                    "text": snippet,
+                                    "spans": [
+                                        {
+                                            "label": spans[i]["label"],
+                                            "start": off1s,
+                                            "end": off1e,
+                                        },
+                                        {
+                                            "label": spans[j]["label"],
+                                            "start": off2s,
+                                            "end": off2e,
+                                        },
+                                    ],
+                                    "meta": {"reason": f"ambiguous_pair_{a}_{b}"},
+                                }
+                            )
+                            seen.add(doc_id)
+                            ok = True
+                            break
+                    if ok:
+                        break
+
+    # ---- Build audit log for reproducibility ----
+    audit = {
+        "seed": args.seed,
+        "shots": {
+            "s1_per_label": args.shots_s1_per_label,
+            "s1_outliers_per_label": args.shots_s1_outliers,
+            "s2_per_class": args.shots_s2_per_class,
+        },
+        "s1_examples": [],
+        "s2_examples": [],
+    }
+
+    # S1 audit
+    for ex in s1_examples:
+        rec = {
+            "doc_id": ex.get("doc_id"),
+            "reason": ex.get("meta", {}).get("reason", ""),
+            "text_len": len(ex.get("text", "")),
+        }
+        rec["spans"] = []
+        for sp in ex.get("spans", []):
+            L = sp.get("label")
+            s = int(sp.get("start", 0))
+            e = int(sp.get("end", 0))
+            pf = compute_prior_features(priors, L, s, e, rec["text_len"])
+            b = detect_boundary_hit(boundary, L, ex.get("text", ""), s, e)
+            rec["spans"].append(
+                {
+                    "label": L,
+                    "start": s,
+                    "end": e,
+                    **pf,
+                    "boundary_hit": b["hit"],
+                    "boundary_cues": b["cues"],
+                }
+            )
+        audit["s1_examples"].append(rec)
+
+    # S2 audit
+    for ex in s2_fewshots:
+        audit["s2_examples"].append(
+            {
+                "doc_id": ex.get("doc_id"),
+                "label": ex.get("label"),
+                "markers_count": len(ex.get("markers", [])),
+                "source_label": ex.get("source_label", ""),
+            }
+        )
+
+    # Negative S1 exemplar (teaches: empty JSON is valid)
+    neg_s1 = pick_negative_s1_snippet(dev_df, seed=args.seed)
+    if neg_s1:
+        s1_examples.append(neg_s1)
     # ----------------- Write outputs -----------------
     out_fs = {"s1": s1_examples, "s2": s2_fewshots}
     fs_path.write_text(
@@ -501,7 +962,7 @@ def main():
         json.dumps(policy_meta, indent=2), encoding="utf-8"
     )
 
-    print(f"\n[select_fewshot_examples] Wrote:")
+    print("\n[select_fewshot_examples] Wrote:")
     print(f"  - {fs_path}")
     print(f"  - {out_dir / 'fewshot_policy.json'}")
     print(f"  S1 count: {len(s1_examples)}  | S2 count: {len(s2_fewshots)}")
