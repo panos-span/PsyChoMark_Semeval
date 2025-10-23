@@ -4,17 +4,12 @@ import json
 import pathlib
 import random
 import re
-import subprocess
+import math  # <-- add this
 import sys
 import os
 from collections import defaultdict
 from typing import Any, Dict, List
 import logging
-from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
-    confusion_matrix,
-)
 
 try:
     import matplotlib
@@ -33,6 +28,21 @@ from src.psycomark.llm.eda_support import (
     build_s2_policy,
     load_fewshots,
 )
+
+ALL_TECHNIQUES = "fs_policy_boundary_sc5,fs_policy_boundary_cot_sc5,fs_policy_boundary_neg_cot_sc5,fs_cot_sc10,zs_policy_cot_sc5,zs_cot_sc5,fs_neg_cot_sc10"
+
+"""
+Each of these covers a distinct behavior:
+
+Technique	Purpose
+fs_policy_boundary_sc5	Classic few-shot + rubric + boundary + ensemble
+fs_policy_boundary_cot_sc5	Same but with short reasoning
+fs_policy_boundary_neg_cot_sc5	Adds negative shot to boost recall calibration
+fs_cot_sc10	Heavy reasoning ensemble without rubric cues
+zs_policy_cot_sc5	Zero-shot, rubric-driven, with CoT + ensemble
+zs_cot_sc5	Pure zero-shot CoT with self-consistency
+fs_neg_cot_sc10	Few-shot with neg. CoT examples + high variance
+"""
 
 
 # ---------- .env loader (no deps) ----------
@@ -55,6 +65,97 @@ def _load_dotenv_into_environ():
 
 _load_dotenv_into_environ()
 # ------------------------------------------
+
+# ---------- prompt artifacts (load + render) ----------
+ARTIFACT_FILES = {
+    "lexicons": "lexicons.json",
+    "conflicts": "conflicts.json",
+    "boundary_prompts": "boundary_prompts.json",
+    "priors_prompt": "priors_prompt.json",
+    "fewshot_bank": "fewshot_bank.json",
+}
+
+
+def _load_prompt_artifacts(eda_root: pathlib.Path) -> Dict[str, Any]:
+    """Load prompt artifacts with ultra-robust defaults."""
+    arts, paths = {}, {}
+    for k, fname in ARTIFACT_FILES.items():
+        p = eda_root / fname
+        try:
+            if p.exists():
+                arts[k] = json.loads(p.read_text(encoding="utf-8"))
+                paths[k] = str(p)
+            else:
+                arts[k] = {} if k != "fewshot_bank" else {"s1": [], "s2": []}
+                paths[k] = None
+        except Exception:
+            arts[k] = {} if k != "fewshot_bank" else {"s1": [], "s2": []}
+            paths[k] = None
+    arts["_paths"] = paths
+    return arts
+
+
+def _render_boundary_block(arts: Dict[str, Any]) -> str:
+    """Render <=2 short boundary cues per label."""
+    bp = arts.get("boundary_prompts") or {}
+    if not isinstance(bp, dict) or not bp:
+        return ""
+    lines = []
+    for lab in ["Actor", "Action", "Effect", "Victim", "Evidence"]:
+        v = bp.get(lab) or {}
+        befo = (v.get("before") or [])[:2]
+        aftr = (v.get("after") or [])[:2]
+        parts = []
+        if befo:
+            parts.append("before=" + "; ".join(befo))
+        if aftr:
+            parts.append("after=" + "; ".join(aftr))
+        if parts:
+            lines.append(f"- {lab}: " + " | ".join(parts))
+    return "Boundary cues (keep spans tight):\n" + "\n".join(lines) if lines else ""
+
+
+def _render_conflicts_block(arts: Dict[str, Any]) -> str:
+    cf = arts.get("conflicts") or {}
+    pairs = cf.get("pairs") or []
+    if not pairs:
+        return ""
+    pairs_txt = ", ".join([f"{a}–{b}" for a, b in pairs[:4]])
+    return (
+        "Conflict reminders (overlap resolution): "
+        f"{pairs_txt}. Prefer prior-closer span; keep both only if semantically distinct."
+    )
+
+
+def _render_priors_block(arts: Dict[str, Any]) -> str:
+    pr = arts.get("priors_prompt") or {}
+    if not isinstance(pr, dict) or not pr:
+        return ""
+    lines = []
+    for lab in ["Actor", "Action", "Effect", "Victim", "Evidence"]:
+        d = pr.get(lab) or {}
+        q50 = d.get("q50_len")
+        q90 = d.get("q90_len")
+        mode = d.get("start_mode")
+        bits = []
+        if isinstance(q50, (int, float)):
+            bits.append(f"q50≈{int(q50)}")
+        if isinstance(q90, (int, float)):
+            bits.append(f"q90≈{int(q90)}")
+        if isinstance(mode, (int, float)):
+            bits.append(f"start≈{mode:.2f}")
+        if bits:
+            lines.append(f"- {lab}: " + ", ".join(bits))
+    return "Span priors (length & position):\n" + "\n".join(lines) if lines else ""
+
+
+def _snapshot_artifacts(arts: Dict[str, Any], out_dir: pathlib.Path):
+    d = out_dir / "prompts" / "_artifacts"
+    d.mkdir(parents=True, exist_ok=True)
+    for k in ARTIFACT_FILES.keys():
+        # write the loaded dicts (even if repaired) to snapshot
+        with open(d / f"{k}.json", "w", encoding="utf-8") as f:
+            json.dump(arts.get(k, {}), f, ensure_ascii=False, indent=2)
 
 
 # ---------- utils ----------
@@ -99,6 +200,49 @@ def shorten(txt: str, n=1600):
 
 
 # ---------- S1 post-processing (token-snap + cleanup + conflict NMS) ----------
+
+STOPWORDS = set("to of in on at for with by a an the and or".split())
+
+
+def _valid_span(text, s, e):
+    if e - s < 3:
+        return False
+    span = text[s:e].strip()
+    if not span:
+        return False
+    toks = re.findall(r"\w+|[^\w\s]", span)
+    if toks and toks[0].lower() in STOPWORDS:
+        return False
+    if span in (".", ",", ";", ":", "’", "”"):
+        return False
+    return True
+
+
+def _salience(m, txt, lexicons):
+    s = m.get("startIndex", m.get("start", 0))
+    e = m.get("endIndex", m.get("end", s))
+    s, e = int(s), int(e)
+    span = txt[s:e].lower()
+    cues = [
+        "cover up",
+        "secret",
+        "rigged",
+        "agenda",
+        "plot",
+        "blame",
+        "evidence",
+        "collude",
+        "fraud",
+        "hoax",
+    ]
+    score = 0.0
+    score += 1.0 if len(span) >= 8 else 0.0
+    score += sum(0.3 for c in cues if c in span)
+    for w in lexicons.get("absolutist", []) or []:
+        if w in span:
+            score += 0.1
+    return -score  # lower is better in sort
+
 
 _EVAL_TOKEN_RE = re.compile(r"(\w+|[^\w\s])")
 
@@ -312,6 +456,8 @@ def postprocess_s1_spans(
 S1_BASE = """You are a careful annotator for PsyCoMark (SemEval-2026 Task 10, Subtask 1).
 Task: extract character spans that best reflect the following labels: Actor, Action, Effect, Victim, Evidence.
 
+**These markers reflect evolutionary psychology principles: agency detection, in-group/out-group threats, coalitional behavior, moral violations, and threat sensitivity.**
+
 Output format (strict JSON list, no extra text):
 [{"label":"Actor|Action|Effect|Victim|Evidence","start":int,"end":int}]
 
@@ -397,6 +543,28 @@ def _save_prompt_meta(out_dir: pathlib.Path, meta: dict):
     )
 
 
+# --- NEW: helpers to emit Codabench-style files ---
+def _to_codabench_s1(markers):
+    """Drop 'text' field; keep keys: startIndex, endIndex, type."""
+    out = []
+    for m in markers or []:
+        if not all(k in m for k in ("startIndex", "endIndex", "type")):
+            # tolerate your internal schema: {type,startIndex,endIndex,text}
+            t = m.get("type") or m.get("label")
+            s = m.get("startIndex", m.get("start"))
+            e = m.get("endIndex", m.get("end"))
+        else:
+            t, s, e = m["type"], m["startIndex"], m["endIndex"]
+        try:
+            s, e = int(s), int(e)
+        except Exception:
+            continue
+        if e <= s:
+            continue
+        out.append({"startIndex": s, "endIndex": e, "type": str(t)})
+    return out
+
+
 # ---------- fewshots rendering ----------
 def render_fewshots_block(examples: List[Dict[str, Any]], is_s2: bool) -> str:
     if not examples:
@@ -406,13 +574,27 @@ def render_fewshots_block(examples: List[Dict[str, Any]], is_s2: bool) -> str:
         txt = ex.get("text") or ex.get("doc_text") or ""
 
         if is_s2:
-            gold = (
-                ex.get("gold")
-                or ex.get("json")
-                or {"label": "non", "rationale": "baseline", "confidence": 0.7}
-            )
+            lbl = (
+                ex.get("label") or (ex.get("gold") or {}).get("label") or "non"
+            ).lower()
+            if lbl not in ("conspiracy", "non"):
+                lbl = "non"
+            # assign sensible example probabilities
+            if lbl == "conspiracy":
+                gold = {
+                    "label": "conspiracy",
+                    "p_conspiracy": 0.8,
+                    "p_non": 0.2,
+                    "rationale": "asserts conspiracy.",
+                }
+            else:
+                gold = {
+                    "label": "non",
+                    "p_conspiracy": 0.2,
+                    "p_non": 0.8,
+                    "rationale": "neutral/debunking.",
+                }
 
-            # --- NEW (≈10 lines): include markers if present, coercing schema ---
             mk = ex.get("markers") or []
             mk_norm = []
             for m in mk:
@@ -421,14 +603,13 @@ def render_fewshots_block(examples: List[Dict[str, Any]], is_s2: bool) -> str:
                 e = m.get("endIndex", m.get("end"))
                 try:
                     s, e = int(s), int(e)
-                except Exception:
+                except:
                     continue
                 if lab and e > s:
                     mk_norm.append({"type": lab, "startIndex": s, "endIndex": e})
-            # -------------------------------------------------------------------
 
             block = f"EXAMPLE:\nTEXT:\n{shorten(txt, 800)}\n"
-            if mk_norm:  # insert just before the gold JSON
+            if mk_norm:
                 block += (
                     "DETECTED_MARKERS_JSON:\n"
                     + json.dumps(mk_norm, ensure_ascii=False)
@@ -437,9 +618,30 @@ def render_fewshots_block(examples: List[Dict[str, Any]], is_s2: bool) -> str:
             block += "JSON:\n" + json.dumps(gold, ensure_ascii=False)
 
         else:
-            gold = ex.get("gold") or ex.get("json") or []
+            # NEW: coerce S1 spans from ex["spans"] or ex["markers"]
+            spans = (
+                ex.get("spans")
+                or ex.get("markers")
+                or ex.get("gold")
+                or ex.get("json")
+                or []
+            )
+            norm = []
+            for m in spans:
+                lab = (m.get("label") or m.get("type") or "").strip()
+                s = m.get("start", m.get("startIndex"))
+                e = m.get("end", m.get("endIndex"))
+                try:
+                    s, e = int(s), int(e)
+                except Exception:
+                    continue
+                if lab and e is not None and s is not None and e > s:
+                    norm.append({"label": lab, "start": s, "end": e})
+
+            MAX_EX_SPAN = 90
+            norm = [m for m in norm if (m["end"] - m["start"]) <= MAX_EX_SPAN]
             block = f"EXAMPLE:\nTEXT:\n{shorten(txt, 800)}\nJSON:\n" + json.dumps(
-                gold, ensure_ascii=False
+                norm, ensure_ascii=False
             )
 
         blocks.append(block)
@@ -560,15 +762,44 @@ def merge_by_freq(all_runs: List[List[Dict[str, int]]], min_votes=2, iou_thr=0.8
 
 
 # ---------- prompt builders (tech-agnostic) ----------
-def s1_prompt(doc_text, policy, fewshots, boundary_note: str, tech: str):
+def s1_prompt(
+    doc_text,
+    policy,
+    fewshots,
+    boundary_note: str,
+    tech: str,
+    prompt_arts: Dict[str, Any] = None,
+):
     fs_block = render_fewshots_block(fewshots, is_s2=False)
     system = [S1_BASE]
     if policy:
         system.insert(0, policy)
     if "boundary" in tech and boundary_note:
         system.append("Boundary guidance:\n" + boundary_note)
+
+    # NEW: CoT checklist
+    if "cot" in tech:
+        system.append(
+            "Checklist before labeling:\n"
+            "- Identify agents (Actor), what they do (Action), consequences (Effect), victims, and any evidence.\n"
+            "- Keep spans token-tight; exclude trailing punctuation/stopwords.\n"
+            "- If Action and Effect overlap, choose the minimal span that best fits each role.\n"
+            "- For Actor vs Victim overlaps, prefer the smaller specific mention for each role."
+        )
     n_samples = 1
     temp = 0.0
+    # --- NEW: append artifact-driven blocks (compact) ---
+    if prompt_arts:
+        if "boundary" in tech:
+            b = _render_boundary_block(prompt_arts)
+            if b:
+                system.append(b)
+        c = _render_conflicts_block(prompt_arts)
+        if c:
+            system.append(c)
+        p = _render_priors_block(prompt_arts)
+        if p:
+            system.append(p)
     if tech.startswith("sc"):  # self-consistency
         n = re.search(r"sc(\d+)", tech)
         n_samples = int(n.group(1)) if n else 5
@@ -580,21 +811,110 @@ def s1_prompt(doc_text, policy, fewshots, boundary_note: str, tech: str):
     return system, user, n_samples, temp
 
 
-def s2_prompt_with_markers(doc_text, policy, fewshots, tech: str, markers_json: str):
+def _pick_balanced_s1_fewshots(pool, k=6, seed=42):
+    labs = ["Actor", "Action", "Effect", "Victim", "Evidence"]
+    rng = random.Random(seed)
+
+    def ex_has_lab(ex, lab):
+        spans = ex.get("spans") or ex.get("markers") or []
+        for m in spans:
+            lab_m = (m.get("label") or m.get("type") or "").strip()
+            if lab_m == lab:
+                return True
+        return False
+
+    # 1) ensure one per label if available
+    chosen, used = [], set()
+    for lab in labs:
+        cand = [e for e in (pool or []) if ex_has_lab(e, lab)]
+        if cand:
+            e = rng.choice(cand)
+            if id(e) not in used:
+                chosen.append(e)
+                used.add(id(e))
+
+    # 2) fill by salience
+    def salience(ex):
+        txt = (ex.get("text") or "").lower()
+        cues = [
+            "control",
+            "cover up",
+            "agenda",
+            "rigged",
+            "evidence",
+            "plot",
+            "blame",
+            "secret",
+        ]
+        score = sum(1 for c in cues if c in txt)
+        score += 1 if len(txt) >= 160 else 0
+        return -score
+
+    rest = [e for e in (pool or []) if id(e) not in used]
+    rest.sort(key=salience)
+    for e in rest:
+        if len(chosen) >= k:
+            break
+        chosen.append(e)
+        used.add(id(e))
+    return chosen[:k]
+
+
+def _pick_balanced_s2_fewshots(pool, k=8):
+    ys = [e for e in (pool or []) if (e.get("label") or "").lower() == "conspiracy"]
+    ns = [e for e in (pool or []) if (e.get("label") or "").lower() == "non"]
+    t = min(k // 2, len(ys), len(ns))
+    out = ys[:t] + ns[:t]
+    out += [e for e in (pool or []) if e not in out][: max(0, k - len(out))]
+    return out[:k]
+
+
+def s2_prompt_with_markers(
+    doc_text,
+    policy,
+    fewshots,
+    tech: str,
+    markers_json: str,
+    prompt_arts: Dict[str, Any] = None,
+):
     fs_block = render_fewshots_block(fewshots, is_s2=True)
     system = [S2_SYS]
     if "policy" in tech and policy:
         system.insert(0, policy)
-    n_samples = 1
-    temp = 0.0
-    if tech.startswith("sc"):
-        n = re.search(r"sc(\d+)", tech)
-        n_samples = int(n.group(1)) if n else 5
-        temp = 0.7
+
+    # NEW: CoT checklist
+    if "cot" in tech:
+        system.append(
+            "Checklist before labeling:\n"
+            "- Read the comment carefully. Are there psycholinguistic markers suggesting conspiratorial framing?\n"
+            "- Are Actor/Action/Effect/Victim/Evidence markers present or strongly implied?\n"
+            "- Is the framing endorsing a conspiracy, or is it neutral/joking/critical?\n"
+            "- If uncertain or neutral, choose 'non'."
+        )
+
+    if prompt_arts:
+        if "boundary" in tech:
+            b = _render_boundary_block(prompt_arts)
+            if b:
+                system.append(b)
+        c = _render_conflicts_block(prompt_arts)
+        if c:
+            system.append(c)
+        p = _render_priors_block(prompt_arts)
+        if p:
+            system.append(p)
+
+    # SC detection
+    sc_match = re.search(r"sc(\d+)", tech)
+    n_samples = int(sc_match.group(1)) if sc_match else 1
+    temp = 0.7 if n_samples > 1 else 0.0
+
     user_prefix = ""
-    if "fs" in tech or tech.startswith("sc"):
+    if "fs" in tech or n_samples > 1:
         user_prefix = (fs_block + "\n\n") if fs_block else ""
+
     user = user_prefix + S2_USER.format(doc_text=doc_text, markers_json=markers_json)
+
     return system, user, n_samples, temp
 
 
@@ -730,180 +1050,16 @@ def run_s2(
     return final_label, avg_p_con, avg_p_non
 
 
-# ---------- evaluation ----------
-def eval_s1(gt_file, sub_file, iou=0.5) -> Dict[str, Any]:
-    if not _file_has_markers(gt_file):
-        logging.warning(
-            f"S1 eval skipped or unreliable: no ground-truth 'markers' found in {gt_file}. "
-            f"Use a labeled file (e.g., train with markers) for S1 evaluation."
-        )
-        return {}
-    try:
-        subprocess.check_output(
-            [
-                sys.executable,
-                "starter/eval_token.py",
-                "--ground_truth_file",
-                gt_file,
-                "--prediction_file",
-                sub_file,
-                "--scores_output_file",
-                "scores_s1.json",
-                "--iou_threshold",
-                str(iou),
-            ],
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-    except subprocess.CalledProcessError as e:
-        print(e.output)
-    p = pathlib.Path("scores_s1.json")
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-
-
-def save_s1_metrics_artifacts(scores: Dict[str, Any], out_dir: pathlib.Path, tech: str):
-    """Save per-label precision/recall/F1 CSV and bar plot for S1 if matplotlib available."""
-    if not scores:
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # Build row per label
-    labels = sorted(
-        [
-            lab_name
-            for lab_name in ["Actor", "Action", "Effect", "Victim", "Evidence"]
-            if f"F1_{lab_name}_Token" in scores
-        ]
-    )
-    rows = []
-    for lab in labels:
-        rows.append(
-            {
-                "label": lab,
-                "precision": scores.get(f"Precision_{lab}_Token", 0.0),
-                "recall": scores.get(f"Recall_{lab}_Token", 0.0),
-                "f1": scores.get(f"F1_{lab}_Token", 0.0),
-            }
-        )
-    # Add aggregate
-    rows.append(
-        {
-            "label": "_AGG_",
-            "precision": scores.get("Precision_Aggregate_Token", 0.0),
-            "recall": scores.get("Recall_Aggregate_Token", 0.0),
-            "f1": scores.get("F1_Aggregate_Token", 0.0),
-        }
-    )
-    # Write CSV
-    import csv
-
-    csv_path = out_dir / f"s1_metrics_{tech}.csv"
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["label", "precision", "recall", "f1"])
-        w.writeheader()
-        w.writerows(rows)
-    logging.info(f"S1 metrics CSV saved -> {csv_path}")
-    # Plot
-    if plt is None:
-        logging.warning("matplotlib not installed; skipping S1 metrics plot")
-        return
-    fig, ax = plt.subplots(figsize=(6, 4))
-    labs_plot = [r["label"] for r in rows if r["label"] != "_AGG_"]
-    f1_vals = [r["f1"] for r in rows if r["label"] != "_AGG_"]
-    ax.bar(labs_plot, f1_vals, color="#4c72b0")
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("F1 (Token IoU>=threshold)")
-    ax.set_title(f"S1 Per-Label F1 :: {tech}")
-    for i, v in enumerate(f1_vals):
-        ax.text(
-            i,
-            v + 0.01 if v < 0.95 else v - 0.05,
-            f"{v:.2f}",
-            ha="center",
-            va="bottom" if v < 0.95 else "top",
-            fontsize=9,
-        )
-    fig.tight_layout()
-    plot_path = out_dir / f"s1_f1_{tech}.png"
-    fig.savefig(plot_path, dpi=150)
-    plt.close(fig)
-    logging.info(f"S1 F1 plot saved -> {plot_path}")
-
-
-def eval_s2(gold_file, sub_file) -> Dict[str, Any]:
-    """
-    Evaluate S2 predictions locally using the updated eval_binary.py
-    which expects flagged arguments.
-    """
-    # Instead of shelling out, compute metrics inline so sweep prints per-technique results.
-    gold_ids, y_true = [], []
-    with open(gold_file, "r", encoding="utf-8") as f:
-        for ln in f:
-            if not ln.strip():
-                continue
-            r = json.loads(ln)
-            lab = (r.get("doc_label") or r.get("conspiracy") or "").strip().lower()
-            if lab not in ("conspiracy", "non", "yes", "no"):
-                continue
-            y_true.append(1 if lab in ("conspiracy", "yes") else 0)
-            gold_ids.append(r.get("_id") or r.get("doc_id"))
-    pred_map = {}
-    with open(sub_file, "r", encoding="utf-8") as f:
-        for ln in f:
-            if not ln.strip():
-                continue
-            r = json.loads(ln)
-            pred_map[r.get("_id")] = 1 if r.get("conspiracy") == "Yes" else 0
-    y_pred = [pred_map.get(i, 0) for i in gold_ids]
-    # Binary metrics
-    acc = accuracy_score(y_true, y_pred)
-    p_bin, r_bin, f1_bin, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="binary", zero_division=0
-    )
-    p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="macro", zero_division=0
-    )
-    p_weighted, r_weighted, f1_weighted, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="weighted", zero_division=0
-    )
-    # Confusion matrix (ensure both classes exist)
-    try:
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    except ValueError:
-        tn = fp = fn = tp = 0
-    # AUC cannot be computed without probabilities; leave NaN
-    auc = float("nan")
-    return {
-        "Accuracy": acc,
-        "Precision_binary": p_bin,
-        "Recall_binary": r_bin,
-        "F1_binary": f1_bin,
-        "F1_macro": f1_macro,
-        "F1_weighted": f1_weighted,
-        "AUC": auc,
-        "TN": int(tn),
-        "FP": int(fp),
-        "FN": int(fn),
-        "TP": int(tp),
-    }
-
-
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--test-file-s1",
-        required=True,
-        help="Labeled file with text for S1 scoring (e.g., $latest/train.jsonl or a CV fold subset).",
-    )
-    ap.add_argument(
-        "--test-file-s2",
-        required=True,
-        help="Labeled file for S2 scoring (e.g., $latest/train_docclf.jsonl or a CV fold subset).",
-    )
+    # Use dev_rehydrated.jsonl for both S1 and S2 by default
+    ap.add_argument("--test-file-s1", required=False, default="dev_rehydrated.jsonl")
+    ap.add_argument("--test-file-s2", required=False, default="dev_rehydrated.jsonl")
     ap.add_argument("--eda-root", required=False, default=None)
     ap.add_argument(
         "--techniques",
-        default="fs_boundary_policy,sc5",
+        default=ALL_TECHNIQUES,
         help="Comma list applied jointly. Examples: zs,fs_boundary_policy,sc5,sc10",
     )
     ap.add_argument(
@@ -915,6 +1071,7 @@ def main():
     ap.add_argument(
         "--print-prompts-preview",
         action="store_true",
+        default=True,
         help="Print a short preview (first 500 chars) of the final system+user prompts once per technique.",
     )
     ap.add_argument("--model-id", default=None)
@@ -955,17 +1112,28 @@ def main():
         default=None,
         help="Process only the first N documents for each of S1/S2 (for quicker prompt sweeps).",
     )
+    ap.add_argument(
+        "--s2-thresh",
+        default="auto",
+        help='Decision threshold for S2. Use "auto" to tune on dev probs, or a float like 0.45.',
+    )
     args = ap.parse_args()
+
+    print("=== JOINT PROMPT SWEEP START ===")
+    # Print model info
+    print(f"Model ID: {args.model_id}, Region: {args.region}")
 
     random.seed(42)
 
     # EDA
+    prompt_arts = {}
     s1_policy = s2_policy = ""
     s1_shots = []
     s2_shots = []
     boundary = ""
     if args.eda_root:
         eda = pathlib.Path(args.eda_root)
+        print(f"Loading EDA artifacts from: {eda}")
         s1_policy = build_s1_policy(eda) or ""
         s2_policy = build_s2_policy(eda) or ""
         s1_shots = load_fewshots(eda, "s1", max_n=6) or []
@@ -976,6 +1144,12 @@ def main():
                 boundary = json.loads(bctx.read_text(encoding="utf-8")).get("note", "")
             except Exception:
                 boundary = ""
+        # --- NEW: load prompt artifacts & provide few-shot fallback ---
+        prompt_arts = _load_prompt_artifacts(eda)
+        if not s1_shots:
+            s1_shots = (prompt_arts.get("fewshot_bank") or {}).get("s1", [])[:6]
+        if not s2_shots:
+            s2_shots = (prompt_arts.get("fewshot_bank") or {}).get("s2", [])[:8]
 
     # Data
     rows_s1 = list(read_jsonl(args.test_file_s1))
@@ -989,8 +1163,32 @@ def main():
     id2doc_s2 = {(r.get("_id") or r.get("doc_id")): r for r in rows_s2}
 
     techniques = [t.strip() for t in args.techniques.split(",") if t.strip()]
+    for tech in techniques:
+        has_fs = "fs" in tech
+        has_neg = "neg" in tech
+        use_cot = "cot" in tech
+        use_boundary = "boundary" in tech
+        use_policy = "policy" in tech
+        sc_match = re.search(r"sc(\d+)", tech)
+        sc_n = int(sc_match.group(1)) if sc_match else 1
 
-    summary_rows = []
+    if has_fs:
+        s1_shots = load_fewshots(eda, "s1", max_n=6)
+        s2_shots = load_fewshots(eda, "s2", max_n=8)
+        if has_neg:
+            s1_neg = [
+                ex
+                for ex in prompt_arts.get("fewshot_bank", {}).get("s1", [])
+                if ex.get("markers") == []
+            ][:1]
+            s2_neg = [
+                ex
+                for ex in prompt_arts.get("fewshot_bank", {}).get("s2", [])
+                if ex.get("gold", {}).get("label") == "non"
+            ][:1]
+            s1_shots += s1_neg
+            s2_shots += s2_neg
+
     for tech in techniques:
         print(f"\n=== JOINT S1→S2 :: {tech} ===")
 
@@ -998,6 +1196,9 @@ def main():
         (tech_dir / "s1").mkdir(parents=True, exist_ok=True)
         (tech_dir / "s2").mkdir(parents=True, exist_ok=True)
         (tech_dir / "prompts").mkdir(parents=True, exist_ok=True)
+        # --- NEW: snapshot artifacts into the run folder ---
+        if prompt_arts:
+            _snapshot_artifacts(prompt_arts, tech_dir)
         s1_sub = tech_dir / "s1" / "submission.jsonl"
         s1_pruned_sub = tech_dir / "s1" / "submission_pruned.jsonl"
         s2_sub = tech_dir / "s2" / "submission.jsonl"
@@ -1025,6 +1226,23 @@ def main():
                 "fewshots_s2_count": len(s2_shots),
                 "eda_root": str(args.eda_root) if args.eda_root else None,
                 "s1_iou_threshold": args.s1_iou,
+                # --- NEW: one-line summary of artifacts loaded ---
+                "artifact_summary": (
+                    "arts: boundary={b} conflicts={c} priors={p} lexicons={x} fewshot_bank(s1={s1},s2={s2})"
+                ).format(
+                    b=int(bool((prompt_arts or {}).get("boundary_prompts"))),
+                    c=len(
+                        ((prompt_arts or {}).get("conflicts") or {}).get("pairs", [])
+                    ),
+                    p=len((prompt_arts or {}).get("priors_prompt") or {}),
+                    x=int(bool((prompt_arts or {}).get("lexicons"))),
+                    s1=len(
+                        ((prompt_arts or {}).get("fewshot_bank") or {}).get("s1", [])
+                    ),
+                    s2=len(
+                        ((prompt_arts or {}).get("fewshot_bank") or {}).get("s2", [])
+                    ),
+                ),
             },
         )
 
@@ -1042,8 +1260,31 @@ def main():
             _id = rec.get("_id") or rec.get("doc_id")
             txt = rec.get("text", "")
 
+            # ensure fs and zs are mutually exclusive
+            use_fs = "fs" in tech
+            use_zs = "zs" in tech
+            if use_fs and not use_zs and s1_shots:
+                # pick a balanced subset per prompt, e.g., 6
+                fewshots_s1 = _pick_balanced_s1_fewshots(
+                    s1_shots, k=min(6, len(s1_shots))
+                )
+            else:
+                fewshots_s1 = []
+
+            use_fs = "fs" in tech and "zs" not in tech
+            fewshots_s1 = s1_shots if (use_fs and s1_shots) else []
+            if use_fs and not s1_shots:
+                logging.warning(
+                    "[S1] fs requested but no fewshots loaded; falling back to zero-shot."
+                )
+
             sys_blocks, user_block, n_samples, temp = s1_prompt(
-                txt, s1_policy, s1_shots, boundary, tech
+                txt,
+                policy=s1_policy if use_policy else "",
+                fewshots=fewshots_s1,
+                boundary_note=boundary if use_boundary else "",
+                tech=tech,
+                prompt_arts=prompt_arts if prompt_arts else None,
             )
             temp = args.sc_temperature if n_samples > 1 else args.temperature
             # Save/print prompts per policy
@@ -1053,8 +1294,8 @@ def main():
                 _save_prompt_bundle(tech_dir, "s1", str(_id), sys_blocks, user_block)
                 saved_s1 += 1
             if args.print_prompts_preview and not printed_s1_preview:
-                sys_preview = ("\\n\\n---\\n\\n".join(sys_blocks))[:500]
-                user_preview = user_block[:500]
+                sys_preview = "\\n\\n---\\n\\n".join(sys_blocks)
+                user_preview = user_block
                 print(
                     "[S1 prompt preview]\nSYSTEM:\n"
                     + sys_preview
@@ -1115,16 +1356,11 @@ def main():
                 e = m.get("end", m.get("endIndex", s))
                 return int(s), int(e)
 
+            lex = (prompt_arts or {}).get("lexicons", {})
             for lab, arr in by_lab.items():
                 # sort by (start, end) and prefer longer spans first within same start
-                arr_sorted = sorted(
-                    arr,
-                    key=lambda x: (
-                        _start_end(x)[0],
-                        -(_start_end(x)[1] - _start_end(x)[0]),
-                    ),
-                )
-                # take top-k
+                arr = [m for m in arr if _valid_span(txt, *_start_end(m))]
+                arr_sorted = sorted(arr, key=lambda m: _salience(m, txt, lex))
                 pruned.extend(arr_sorted[:k])
 
             # store pruned markers using the *Bedrock/S2 prompt* schema (startIndex/endIndex)
@@ -1143,27 +1379,11 @@ def main():
 
         write_jsonl(s1_sub, s1_out_rows)
         write_jsonl(s1_pruned_sub, s1_pruned_rows)
-        s1_scores = eval_s1(
-            str(gt_subset_path) if gt_subset_path else args.test_file_s1,
-            str(s1_sub),
-            iou=args.s1_iou,
-        )
         print(f"S1 done -> {s1_sub}")
         print(f"S1 pruned-for-S2 -> {s1_pruned_sub}")
         print(
             f"S1 debug: spans raw/valid/pruned = {total_raw}/{total_valid}/{total_pruned}"
         )
-        if s1_scores:
-            # Print a concise S1 summary
-            agg = s1_scores.get("F1_Aggregate_Token") or s1_scores.get("F1_Aggregate")
-            macro = s1_scores.get("F1_Macro_Token") or s1_scores.get("F1_Macro")
-            print(
-                f"S1 metrics: F1_aggregate={agg:.3f} F1_macro={macro:.3f}"
-                if agg and macro
-                else f"S1 metrics: {s1_scores}"
-            )
-            # Save artifacts
-            save_s1_metrics_artifacts(s1_scores, tech_dir / "s1", tech)
 
         # ------ S2 inference (conditioned on S1) ------
         s2_out_rows = []
@@ -1175,8 +1395,20 @@ def main():
             mks = id2markers.get(_id, [])
             markers_json = json.dumps(mks, ensure_ascii=False)
 
+            if use_fs and not use_zs and s2_shots:
+                fewshots_s2 = _pick_balanced_s2_fewshots(
+                    s2_shots, k=min(8, len(s2_shots))
+                )
+            else:
+                fewshots_s2 = []
+
             sys_blocks, user_block, n_samples, temp = s2_prompt_with_markers(
-                txt, s2_policy, s2_shots, tech, markers_json
+                txt,
+                policy=s2_policy if use_policy else "",
+                fewshots=fewshots_s2,
+                tech=tech,
+                markers_json=markers_json,
+                prompt_arts=prompt_arts if prompt_arts else None,
             )
             temp = args.sc_temperature if n_samples > 1 else args.temperature
             if args.save_prompts == "all" or (
@@ -1185,8 +1417,8 @@ def main():
                 _save_prompt_bundle(tech_dir, "s2", str(_id), sys_blocks, user_block)
                 saved_s2 += 1
             if args.print_prompts_preview and not printed_s2_preview:
-                sys_preview = ("\\n\\n---\\n\\n".join(sys_blocks))[:500]
-                user_preview = user_block[:500]
+                sys_preview = "\\n\\n---\\n\\n".join(sys_blocks)
+                user_preview = user_block
                 print(
                     "[S2 prompt preview]\nSYSTEM:\n"
                     + sys_preview
@@ -1219,6 +1451,7 @@ def main():
         write_jsonl(s2_sub, s2_out_rows)
         probs_path = tech_dir / "s2" / "probs.jsonl"
         write_jsonl(probs_path, s2_prob_rows)
+        mean_p = None
         if s2_prob_rows:
             mean_p = sum(r["p_conspiracy"] for r in s2_prob_rows) / len(s2_prob_rows)
             frac_pos = sum(1 for r in s2_prob_rows if r["p_conspiracy"] >= 0.5) / len(
@@ -1227,19 +1460,27 @@ def main():
             print(f"S2 prob stats: mean_p={mean_p:.3f} frac_p>=0.5={frac_pos:.3f}")
 
         # --- NEW: threshold from dev probs (auto) ---
-        thr = None
+        # --- threshold selection ---
+        thr = 0.50
         if isinstance(args.s2_thresh, str) and args.s2_thresh.lower() == "auto":
-            best_t, best_f1, stats = tune_threshold_dev(rows_s2, s2_prob_rows)
-            thr = best_t
-            print(
-                f"[S2] auto threshold tuned on dev: t={best_t:.2f} (dev f1={best_f1:.3f}, mean_p={stats['mean_p']:.3f}, n={stats['n']})"
-            )
+            if s2_prob_rows:  # only tune if we actually have probs
+                best_t, best_f1, stats = tune_threshold_dev(rows_s2, s2_prob_rows)
+                thr = best_t
+                print(
+                    f"[S2] auto threshold tuned on dev: t={best_t:.2f} (dev f1={best_f1:.3f}, mean_p={stats['mean_p']:.3f}, n={stats['n']})"
+                )
+            else:
+                logging.warning("[S2] no probability rows; falling back to 0.50")
         else:
             try:
                 thr = float(args.s2_thresh)
             except Exception:
+                logging.warning(
+                    f"[S2] invalid --s2-thresh={args.s2_thresh}; using 0.50"
+                )
                 thr = 0.50
-        # Re-write submission.jsonl using the chosen threshold
+
+        # Rebuild submission using chosen threshold
         pred2 = [
             {
                 "_id": r["_id"],
@@ -1249,66 +1490,23 @@ def main():
         ]
         write_jsonl(s2_sub, pred2)
 
-        if mean_p < 0.15:
+        if mean_p is not None and mean_p < 0.15:
             logging.warning(
                 "[S2] mean_p extremely low; likely 'all-No' drift. Check few-shots and markers."
             )
 
-        s2_scores = eval_s2(args.test_file_s2, str(s2_sub))
         print(f"S2 done -> {s2_sub}")
-        print(
-            "S2 metrics: acc={acc:.3f} f1_bin={f1b:.3f} f1_macro={f1m:.3f} f1_weighted={f1w:.3f} tn={tn} fp={fp} fn={fn} tp={tp}".format(
-                acc=s2_scores.get("Accuracy", float("nan")),
-                f1b=s2_scores.get("F1_binary", float("nan")),
-                f1m=s2_scores.get("F1_macro", float("nan")),
-                f1w=s2_scores.get("F1_weighted", float("nan")),
-                tn=s2_scores.get("TN"),
-                fp=s2_scores.get("FP"),
-                fn=s2_scores.get("FN"),
-                tp=s2_scores.get("TP"),
-            )
-        )
 
-        # record summary
-        summary_rows.append(
-            {
-                "tech": tech,
-                **{f"S1_{k}": v for k, v in s1_scores.items()},
-                **{f"S2_{k}": v for k, v in s2_scores.items()},
-            }
-        )
-
-    # save summary
-    summ_path = pathlib.Path(args.out_root) / "joint_prompt_sweep_summary.csv"
-    all_keys = sorted({k for r in summary_rows for k in r.keys()})
-    import csv
-
-    with open(summ_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=all_keys)
-        w.writeheader()
-        w.writerows(summary_rows)
-    print(f"\nSummary saved -> {summ_path}")
-
-    # pretty print
-    def fmt(x):
-        if isinstance(x, float):
-            return f"{x:.4f}"
-        return str(x)
-
-    cols = [
-        "tech",
-        "S1_F1_Aggregate_Token",
-        "S1_F1_Macro_Token",
-        "S2_F1_weighted",
-        "S2_F1_macro",
-        "S2_Accuracy",
-    ]
-    cols = [c for c in cols if c in all_keys]
-    if cols:
-        print("\n" + " | ".join(cols))
-        print("-" * (len(" | ".join(cols)) + 5))
-        for r in summary_rows:
-            print(" | ".join(fmt(r.get(c, "")) for c in cols))
+        # ---- NEW: also emit top-level Codabench files from this technique ----
+        # S1 top-level file (strip 'text' from markers)
+        codabench_s1 = [
+            {"_id": r["_id"], "markers": _to_codabench_s1(r.get("markers", []))}
+            for r in s1_out_rows
+        ]
+        write_jsonl("submission_s1.jsonl", codabench_s1)
+        # S2 top-level file (final thresholded labels)
+        write_jsonl("submission_s2.jsonl", pred2)
+        print("Wrote top-level submissions: submission_s1.jsonl, submission_s2.jsonl")
 
 
 if __name__ == "__main__":

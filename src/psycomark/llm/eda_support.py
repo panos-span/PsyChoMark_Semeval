@@ -102,6 +102,7 @@ def load_fewshots(
     eda_root: pathlib.Path, for_task: str, max_n: int = 8
 ) -> List[Dict[str, Any]]:
     # best_fewshot_examples.json format assumed: {"s1":[...], "s2":[...]}
+    print(f"Loading few-shot examples for task '{for_task}' from EDA root: {eda_root}")
     p = eda_root / "best_fewshot_examples.json"
     data = load_json(p, {})
     arr = (data or {}).get(for_task, [])

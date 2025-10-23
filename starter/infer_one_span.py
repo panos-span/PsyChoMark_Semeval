@@ -1,42 +1,51 @@
-import argparse
-import glob
 import json
-import os
 import sys
-from collections import defaultdict
 
 import numpy as np
+import os
+import glob
 from datasets import Dataset
 from transformers import (
-    DistilBertForTokenClassification,
     DistilBertTokenizerFast,
-    DataCollatorForTokenClassification,
+    DistilBertForTokenClassification,
     Trainer,
+    DataCollatorForTokenClassification,
     TrainingArguments,
 )
+from collections import defaultdict
 
-# --------------------
-# Helpers
-# --------------------
+MODEL_PATH_BASE = "distilbert-single-type-simplified"
+MARKER_TYPES_TO_INFER = ["Action", "Actor", "Effect", "Evidence", "Victim"]
+TEST_FILE = "dev_rehydrated.jsonl"
+SUBMISSION_FILE = "submission.jsonl"
+MODEL_NAME = "distilbert-base-uncased"
+BATCH_SIZE = 64
 
 
 def find_latest_checkpoint(base_path, marker_type):
-    """Return the latest checkpoint folder for a given single-type model."""
+    """
+    Scans the type-specific base_path directory for the latest numbered 'checkpoint-*' subfolder.
+    """
     full_path = f"{base_path}-{marker_type}"
     checkpoint_dirs = glob.glob(os.path.join(full_path, "checkpoint-*"))
+
     if not checkpoint_dirs:
-        print(f"Warning: no 'checkpoint-*' found. Using: {full_path}")
+        print(
+            f"Warning: No 'checkpoint-*' folder found. Assuming model files are in: {full_path}"
+        )
         return full_path
+
     checkpoint_dirs.sort(key=lambda x: int(os.path.basename(x).split("-")[-1]))
+
     latest_checkpoint = checkpoint_dirs[-1]
     print(f"Found latest checkpoint: {latest_checkpoint}")
     return latest_checkpoint
 
 
 def load_data(file_path):
-    """Load JSONL keeping order and an _id."""
+    """Loads all data from a JSONL file, preserving order, and retaining the unique ID."""
     data = []
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, "r") as f:
         for i, line in enumerate(f):
             try:
                 item = json.loads(line.strip())
@@ -44,15 +53,18 @@ def load_data(file_path):
                 item["text"] = item.get("text", "")
                 item["markers"] = item.get("markers", [])
                 item["conspiracy"] = item.get("conspiracy", "No")
+
                 data.append(item)
             except json.JSONDecodeError:
-                print(f"Skipping invalid JSON at line {i}: {line[:120]}...")
-    print(f"Loaded {len(data)} samples for inference from {file_path}.")
+                print(
+                    f"Skipping invalid JSON line at index {i} in {file_path}: {line.strip()}"
+                )
+    print(f"Loaded {len(data)} samples for inference.")
     return data
 
 
-def tokenize_and_align_labels(examples, tokenizer):
-    """Tokenize text and keep offset mapping for span reconstruction."""
+def tokenize_and_align_labels(examples, tokenizer, label_to_id):
+    """Tokenizes the text and returns inputs with offset mapping for post-processing."""
     tokenized_inputs = tokenizer(
         examples["text"],
         truncation=True,
@@ -60,129 +72,133 @@ def tokenize_and_align_labels(examples, tokenizer):
         max_length=128,
         return_offsets_mapping=True,
     )
-    # Dummy labels for the Trainer API
+
+    # We generate dummy labels as the Trainer expects a 'labels' key in the dataset,
+    # but the actual values (-100) are ignored during prediction.
     tokenized_inputs["labels"] = [
         [-100] * len(offset_map) for offset_map in tokenized_inputs["offset_mapping"]
     ]
+
     return tokenized_inputs
 
 
-def reconstruct_spans(pred_ids, tokenized_dataset, id_to_label, pos_probs=None):
+def reconstruct_spans(predictions, tokenized_dataset, id_to_label):
     """
-    Convert token id predictions (0='O', 1='TYPE') into character spans.
+    Converts token-level predictions (O vs TYPE) back into a list of character spans,
+    designed for the simplified binary classification model (O or TYPE, no IOB tags).
 
-    Returns TWO dicts indexed by sample idx:
-      - submission_fmt[i] -> [{startIndex,endIndex,type,text}]
-      - scored_fmt[i]     -> [{start,end,label,text,score}]
+    Args:
+        predictions (np.array): Model output array of predicted label IDs (shape: N samples x M tokens).
+        tokenized_dataset (Dataset): The Hugging Face dataset containing 'offset_mapping' and 'text'.
+        id_to_label (dict): Mapping from numerical ID to simplified label string (e.g., 1 -> 'EVIDENCE').
+
+    Returns:
+        dict: A dictionary mapping sample index to a list of reconstructed marker dictionaries
+              for the single marker type inferred.
     """
-    sub_markers = defaultdict(list)
-    scored_markers = defaultdict(list)
+    reconstructed_markers = defaultdict(list)
 
+    # Determine the positive label type (the one that is not 'O').
+    # Assuming ID 0 is 'O' and ID 1 is the marker type.
     positive_label_type = id_to_label.get(1)
     if not positive_label_type or positive_label_type == "O":
-        print("Error: id_to_label[1] must be the marker type for the binary model.")
-        return sub_markers, scored_markers
+        print(
+            "Error: Model configuration does not match simplified binary training (ID 1 is not the marker type)."
+        )
+        return reconstructed_markers
 
-    for i, ids in enumerate(pred_ids):
+    for i, pred_ids in enumerate(predictions):
         offsets = tokenized_dataset[i]["offset_mapping"]
         original_text = tokenized_dataset[i]["text"]
-        current_span_start_char = None
-        token_scores = []  # collect per-token probs inside the current span
 
-        for tok_idx, label_id in enumerate(ids):
-            offset = offsets[tok_idx]
+        current_span_start_char = None
+
+        # Iterate over tokens
+        for token_idx, label_id in enumerate(pred_ids):
+            offset_tuple = offsets[token_idx]
+
+            # Check for special tokens, padding, or tokens outside the text range
             is_special = (
-                offset is None
-                or offset[0] is None
-                or offset[1] is None
-                or (offset[0] == 0 and offset[1] == 0)
+                offset_tuple is None
+                or offset_tuple[0] is None
+                or offset_tuple[1] is None
+                or (offset_tuple[0] == 0 and offset_tuple[1] == 0)
             )
 
             if is_special:
-                # close any running span at previous token end
+                # If we were tracking a span, close it using the end of the *previous* non-special token
                 if current_span_start_char is not None:
-                    prev_end = None
-                    if tok_idx > 0 and offsets[tok_idx - 1][1] is not None:
-                        prev_end = offsets[tok_idx - 1][1]
-                    if prev_end is not None and prev_end > current_span_start_char:
-                        span_text = original_text[current_span_start_char:prev_end]
-                        score = float(np.mean(token_scores)) if token_scores else 0.5
-                        sub_markers[i].append(
+                    prev_end_char = None
+                    # Find the end of the last valid token
+                    if token_idx > 0 and offsets[token_idx - 1][1] is not None:
+                        prev_end_char = offsets[token_idx - 1][1]
+
+                    if prev_end_char is not None:
+                        span_text = original_text[current_span_start_char:prev_end_char]
+                        reconstructed_markers[i].append(
                             {
                                 "startIndex": current_span_start_char,
-                                "endIndex": prev_end,
+                                "endIndex": prev_end_char,
                                 "type": positive_label_type,
                                 "text": span_text,
                             }
                         )
-                        scored_markers[i].append(
-                            {
-                                "start": current_span_start_char,
-                                "end": prev_end,
-                                "label": positive_label_type,
-                                "text": span_text,
-                                "score": score,
-                            }
-                        )
+
                     current_span_start_char = None
-                    token_scores = []
                 continue
 
             label = id_to_label[label_id]
-            start_char = offset[0]
+            start_char = offset_tuple[0]
 
             if label == positive_label_type:
+                # Start or continue a span
                 if current_span_start_char is None:
+                    # Start new span
                     current_span_start_char = start_char
-                    token_scores = []
-                if pos_probs is not None:
-                    # collect this token's positive-class prob
-                    try:
-                        token_scores.append(float(pos_probs[i, tok_idx]))
-                    except Exception:
-                        pass
+
             elif label == "O":
+                # End the span if one was active
                 if current_span_start_char is not None:
-                    prev_end = (
-                        offsets[tok_idx - 1][1]
-                        if tok_idx > 0 and offsets[tok_idx - 1][1] is not None
+                    # End is the end of the PREVIOUS token. The token at current_idx is 'O'.
+                    # We need the end of the token at token_idx - 1.
+                    prev_end_char = (
+                        offsets[token_idx - 1][1]
+                        if token_idx > 0 and offsets[token_idx - 1][1] is not None
                         else start_char
                     )
-                    if prev_end > current_span_start_char:
-                        span_text = original_text[current_span_start_char:prev_end]
-                        score = float(np.mean(token_scores)) if token_scores else 0.5
-                        sub_markers[i].append(
-                            {
-                                "startIndex": current_span_start_char,
-                                "endIndex": prev_end,
-                                "type": positive_label_type,
-                                "text": span_text,
-                            }
-                        )
-                        scored_markers[i].append(
-                            {
-                                "start": current_span_start_char,
-                                "end": prev_end,
-                                "label": positive_label_type,
-                                "text": span_text,
-                                "score": score,
-                            }
-                        )
-                    current_span_start_char = None
-                    token_scores = []
 
-        # close if span is still open
+                    span_text = original_text[current_span_start_char:prev_end_char]
+                    reconstructed_markers[i].append(
+                        {
+                            "startIndex": current_span_start_char,
+                            "endIndex": prev_end_char,
+                            "type": positive_label_type,
+                            "text": span_text,
+                        }
+                    )
+                    current_span_start_char = None
+
+        # After loop: Finalize any span that was still open at the end of the sequence
         if current_span_start_char is not None:
+            # The end of the span is the end of the last non-special token in the sequence
             last_valid_end = None
-            for back in range(len(ids) - 1, -1, -1):
-                off = offsets[back]
-                if off and off[1] and off[1] != 0:
-                    last_valid_end = off[1]
+            last_token_idx = len(pred_ids) - 1
+            # Search backwards from the end of the sequence for the last non-special token's end index
+            while last_token_idx >= 0:
+                offset_tuple_end = offsets[last_token_idx]
+                # Check if the token at this index is not a special token
+                if (
+                    offset_tuple_end is not None
+                    and offset_tuple_end[1] is not None
+                    and offset_tuple_end[1] != 0
+                ):
+                    last_valid_end = offset_tuple_end[1]
                     break
-            if last_valid_end and last_valid_end > current_span_start_char:
+                last_token_idx -= 1
+
+            if last_valid_end is not None:
                 span_text = original_text[current_span_start_char:last_valid_end]
-                score = float(np.mean(token_scores)) if token_scores else 0.5
-                sub_markers[i].append(
+                reconstructed_markers[i].append(
                     {
                         "startIndex": current_span_start_char,
                         "endIndex": last_valid_end,
@@ -190,145 +206,114 @@ def reconstruct_spans(pred_ids, tokenized_dataset, id_to_label, pos_probs=None):
                         "text": span_text,
                     }
                 )
-                scored_markers[i].append(
-                    {
-                        "start": current_span_start_char,
-                        "end": last_valid_end,
-                        "label": positive_label_type,
-                        "text": span_text,
-                        "score": score,
-                    }
-                )
 
-    return sub_markers, scored_markers
+    return reconstructed_markers
 
 
-# --------------------
-# Main
-# --------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--models-base", default="distilbert-single-type-simplified")
-    parser.add_argument(
-        "--markers",
-        nargs="+",
-        default=["Action", "Actor", "Effect", "Evidence", "Victim"],
-    )
-    parser.add_argument("--test-file", default="dev_rehydrated.jsonl")
-    parser.add_argument("--submission-file", default="submission.jsonl")
-    parser.add_argument(
-        "--scored-file",
-        default=None,
-        help="Unified spans for ensembling; default is predictions_s1_single.jsonl next to submission.",
-    )
-    parser.add_argument("--model-name", default="distilbert-base-uncased")
-    parser.add_argument("--batch-size", type=int, default=64)
-    args = parser.parse_args()
 
-    # Resolve derived scored path
-    if args.scored_file is None:
-        out_dir = os.path.dirname(args.submission_file) or "."
-        args.scored_file = os.path.join(out_dir, "predictions_s1_single.jsonl")
-
-    # 1) Load data
-    raw_data = load_data(args.test_file)
+    # 1. Load Data
+    raw_data = load_data(TEST_FILE)
     if not raw_data:
-        print("Error: no data loaded. Aborting.")
-        sys.exit(1)
+        print("Error: No data loaded. Cannot perform inference.")
+        sys.exit(-1)
 
     unique_ids = [d["_id"] for d in raw_data]
     conspiracy_keys = [d["conspiracy"] for d in raw_data]
+
     test_dataset = Dataset.from_list(raw_data)
 
-    tokenizer = DistilBertTokenizerFast.from_pretrained(args.model_name)
+    tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_NAME)
+
+    dummy_label_to_id = {"O": 0}
 
     tokenized_test_dataset = test_dataset.map(
         tokenize_and_align_labels,
         batched=True,
         remove_columns=[
-            c
-            for c in test_dataset.column_names
-            if c not in ["text", "offset_mapping", "_id", "conspiracy"]
+            col
+            for col in test_dataset.column_names
+            if col not in ["text", "offset_mapping", "_id", "conspiracy"]
         ],
-        fn_kwargs={"tokenizer": tokenizer},
+        fn_kwargs={"tokenizer": tokenizer, "label_to_id": dummy_label_to_id},
     )
 
-    # holders for submissions and scored unified spans
-    sub_agg = defaultdict(list)
-    scored_agg = defaultdict(list)
+    # Dictionary to aggregate all predicted markers across all types
+    # Map index (0 to len(raw_data) - 1) to a list of markers
+    all_predicted_markers = defaultdict(list)
 
-    # 2) Per-marker inference
-    for marker_type in args.markers:
-        model_dir = find_latest_checkpoint(args.models_base, marker_type)
-        print(f"\n--- Inference for: {marker_type} ---\nModel: {model_dir}")
+    # 2. Iterate and Infer for Each Marker Type
+    for marker_type in MARKER_TYPES_TO_INFER:
+
+        # The new find_latest_checkpoint uses the marker_type to build the full path
+        model_directory = find_latest_checkpoint(MODEL_PATH_BASE, marker_type)
+
+        print(f"\n--- Running inference for type: {marker_type} ---")
+        print(f"Loading model from: {model_directory}")
 
         try:
-            model = DistilBertForTokenClassification.from_pretrained(model_dir)
+            # Load the model.
+            model = DistilBertForTokenClassification.from_pretrained(model_directory)
+
+            # Manually define the id_to_label mapping for the binary model (0=O, 1=TYPE)
+            # This ensures the correct marker type name is used instead of generic 'LABEL_1'.
             id_to_label = {0: "O", 1: marker_type}
+            print(f"Using defined labels for reconstruction: {id_to_label}")
+
         except Exception as e:
-            print(f"Error loading {marker_type} from '{model_dir}': {e}")
+            print(
+                f"Error loading model for {marker_type} from '{model_directory}'. Details: {e}"
+            )
             continue
 
+        # 3. Prepare for Inference using Trainer
         data_collator = DataCollatorForTokenClassification(tokenizer)
-        trainer = Trainer(
+
+        prediction_args = Trainer(
             model=model,
             args=TrainingArguments(
                 output_dir=f"./tmp_inference_span_{marker_type}",
-                per_device_eval_batch_size=args.batch_size,
+                per_device_eval_batch_size=BATCH_SIZE,
                 report_to="none",
             ),
             data_collator=data_collator,
             tokenizer=tokenizer,
         )
 
-        pred_out = trainer.predict(tokenized_test_dataset)
-        logits = pred_out.predictions  # [N, T, 2]
-        # softmax to probs
-        exps = np.exp(logits - logits.max(axis=2, keepdims=True))
-        probs = exps / exps.sum(axis=2, keepdims=True)
-        pos_probs = probs[:, :, 1]  # P(label=1) per token
+        # 4. Perform Inference
+        predictions_output = prediction_args.predict(tokenized_test_dataset)
 
-        pred_ids = np.argmax(logits, axis=2)
+        logits = predictions_output.predictions
+        predicted_class_ids = np.argmax(logits, axis=2)
 
-        sub_map, scored_map = reconstruct_spans(
-            pred_ids, tokenized_test_dataset, id_to_label, pos_probs=pos_probs
+        # 5. Reconstruct Spans for this specific marker type using simplified logic
+        print(f"Reconstructing character spans for {marker_type}...")
+        current_marker_map = reconstruct_spans(
+            predicted_class_ids, tokenized_test_dataset, id_to_label
         )
 
-        # aggregate
-        for i, lst in sub_map.items():
-            sub_agg[i].extend(lst)
-        for i, lst in scored_map.items():
-            scored_agg[i].extend(lst)
+        # 6. Aggregate results (index i corresponds to the sample index)
+        for i, markers in current_marker_map.items():
+            all_predicted_markers[i].extend(markers)
 
-    # 3) Write original submission JSONL (unchanged schema)
-    print(f"\nSaving submission to {args.submission_file} ...")
-    # If directory doesn't exist, create it
-    os.makedirs(os.path.dirname(args.submission_file) or ".", exist_ok=True)
-    with open(args.submission_file, "w", encoding="utf-8") as f:
-        for i in range(len(raw_data)):
-            f.write(
-                json.dumps(
-                    {
-                        "_id": unique_ids[i],
-                        "conspiracy": conspiracy_keys[i],
-                        "markers": sub_agg.get(i, []),
-                    }
-                )
-                + "\n"
-            )
-    print("Submission file written.")
+    print(
+        f"\nSaving final aggregated predictions ({len(raw_data)} samples) to {SUBMISSION_FILE} (JSONL format)..."
+    )
 
-    # 4) Write scored unified spans for ensembling/merging
-    print(f"Saving scored unified spans to {args.scored_file} ...")
-    with open(args.scored_file, "w", encoding="utf-8") as f:
-        for i in range(len(raw_data)):
-            f.write(
-                json.dumps(
-                    {
-                        "_id": unique_ids[i],
-                        "markers": scored_agg.get(i, []),
-                    }
-                )
-                + "\n"
-            )
-    print("Scored span file written.")
+    jsonl_lines = []
+    for i in range(len(raw_data)):
+        # Get the predicted markers (aggregated from all models)
+        predicted_markers = all_predicted_markers.get(i, [])
+
+        # Create the submission object
+        jsonl_obj = {
+            "_id": unique_ids[i],
+            "conspiracy": conspiracy_keys[i],
+            "markers": predicted_markers,
+        }
+        jsonl_lines.append(json.dumps(jsonl_obj))
+
+    with open(SUBMISSION_FILE, "w") as f:
+        f.write("\n".join(jsonl_lines) + "\n")
+
+    print(f"Submission file '{SUBMISSION_FILE}' generated successfully.")

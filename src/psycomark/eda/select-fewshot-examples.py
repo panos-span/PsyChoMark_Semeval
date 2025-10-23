@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+from string import punctuation
 import math
 import random
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -37,6 +39,39 @@ import pandas as pd
 # Defaults / Policy
 # -----------------------------
 ALLOWED_S1 = {"Actor", "Action", "Effect", "Victim", "Evidence"}
+_STOP = {
+    "the",
+    "a",
+    "an",
+    "to",
+    "of",
+    "and",
+    "in",
+    "on",
+    "for",
+    "with",
+    "at",
+    "by",
+    "from",
+    "that",
+    "this",
+    "it",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "as",
+    "or",
+    "if",
+    "but",
+    "so",
+    "do",
+    "did",
+    "does",
+}
+_PUNCT_RE = re.compile(rf"^[{re.escape(punctuation)}\s]+$")
 
 # Policy (FROZEN unless overridden with flags)
 CANT_TELL_IN_S2 = False
@@ -46,6 +81,41 @@ CANT_TELL_RATIONALE_DEFAULT = "Insufficient evidence for a concrete conspiracy c
 # -----------------------------
 # Helpers
 # -----------------------------
+
+
+def _is_all_stopwords(txt: str) -> bool:
+    toks = [t for t in re.split(r"\s+", txt.strip()) if t]
+    if not toks:
+        return True
+    return all(t.lower() in _STOP for t in toks)
+
+
+def _valid_span(sp, text: str, min_len: int = 3, max_len: int = 150) -> bool:
+    try:
+        s = int(sp.get("start", -1))
+        e = int(sp.get("end", -1))
+        lbl = sp.get("label")
+    except Exception:
+        return False
+    if lbl not in ALLOWED_S1 or e <= s:
+        return False
+    if (e - s) < min_len or (e - s) > max_len:
+        return False
+    # extract raw span safely
+    if not (0 <= s < len(text)) or not (0 < e <= len(text)):
+        return False
+    snip = text[s:e]
+    if not snip or _PUNCT_RE.match(snip):
+        return False
+    if _is_all_stopwords(snip):
+        return False
+    return True
+
+
+def _example_has_valid_span(ex) -> bool:
+    text = ex.get("text", "") or ""
+    spans = ex.get("spans", []) or []
+    return any(_valid_span(sp, text) for sp in spans)
 
 
 def load_lexicons(out_dir: Path):
@@ -380,6 +450,74 @@ def enforce_min_yes_fewshots(s2_list, min_yes=4, df_all=None, seed=42):
 # -----------------------------
 # S1 scoring / selection
 # -----------------------------
+MIN_PER_LABEL = 2
+ALL_LABS = {"Actor", "Action", "Effect", "Victim", "Evidence"}
+
+
+def _label_counts(exs):
+    c = Counter()
+    for ex in exs:
+        for m in ex.get("spans", []):
+            lab = m.get("label")
+            if lab in ALL_LABS:
+                c[lab] += 1
+    return c
+
+
+def backfill_missing_labels(train_df, s1_examples, max_per_label=MIN_PER_LABEL):
+    """
+    Relaxed backfill: if any label has < max_per_label examples, sample additional
+    (sanity-filtered) spans from train_df to guarantee coverage.
+    """
+    have = _label_counts(s1_examples)
+    need = [lab for lab in ALL_LABS if have[lab] < max_per_label]
+    if not need:
+        return []
+
+    added = []
+    seen_texts = {ex.get("text", "") for ex in s1_examples}
+
+    for _, r in train_df.iterrows():
+        if not need:
+            break
+        text = r.get("text") or ""
+        tlen = len(text)
+        for m in r.get("markers") or []:
+            L = m.get("label")
+            if L not in need:
+                continue
+            s, e = int(m.get("start", 0)), int(m.get("end", 0))
+            span_len = max(1, e - s)
+
+            # relaxed but sane filters
+            if span_len < 3:
+                continue
+            if s == 0 and e >= (tlen - 3):
+                continue
+            if text in seen_texts:
+                continue
+
+            left = max(0, s - 120)
+            right = min(tlen, e + 120)
+            snippet = text[left:right].strip()
+            off_s, off_e = s - left, e - left
+
+            ex = {
+                "doc_id": r.get("doc_id"),
+                "text": snippet,
+                "spans": [{"label": L, "start": off_s, "end": off_e}],
+                "meta": {"reason": "backfill_relaxed"},
+            }
+            added.append(ex)
+            seen_texts.add(text)
+            have[L] += 1
+            if have[L] >= max_per_label:
+                need.remove(L)
+                if not need:
+                    break
+    return added
+
+
 def build_s1_candidates(
     train_df: pd.DataFrame, priors: dict, target_pairs: List[Tuple[str, str]]
 ) -> pd.DataFrame:
@@ -394,19 +532,33 @@ def build_s1_candidates(
                 continue
             s, e = int(m["start"]), int(m["end"])
             span_len = max(1, e - s)
+
+            # --- QUALITY FILTERS ---
+            if span_len < 4:
+                continue
+            if s == 0 and e >= (tlen - 5):
+                continue
+            span_txt = t[s:e].strip().lower()
+            if span_txt.endswith((".", ",", ";", "’", "”")) or span_txt.startswith(
+                ("the ", "a ", "an ")
+            ):
+                continue
+            # -----------------------
+
             start_pos = s / tlen
             score = 0.0
-            # priors (closer is better) -> convert to [0,1]
+            # priors (closer is better)
             score += 1.5 * (1.0 - min(3.0, prior_len_z(priors, L, span_len)) / 3.0)
             score += 1.5 * (1.0 - min(1.0, prior_pos_dist(priors, L, start_pos)))
             # overlap bonus for docs with target pair conflict
             score += 1.0 * has_tpair
-            # compact-length bonus vs q90 (if provided)
+            # compact-length bonus vs q90
             q90 = priors.get(L, {}).get("q90_len") or priors.get(L, {}).get(
                 "q90_per_label", {}
             ).get(L)
             if q90 is not None:
                 score += 0.25 * (span_len <= float(q90))
+
             cand.append(
                 {
                     "doc_id": r["doc_id"],
@@ -578,7 +730,10 @@ def pick_hard_S2(hard_df, df_all, max_borderline=3, max_misleading=3):
     J = hard_df.copy()
     J["doc_id"] = J["doc_id"].astype(str)
     right = df_all.set_index("doc_id")[["text", "doc_label", "subreddit"]]
-    J = J.set_index("doc_id").join(right, how="left").reset_index()
+    common = (set(J.columns) & set(right.columns)) - {"doc_id"}
+    if common:
+        right = right.drop(columns=list(common))
+    J = J.merge(right, on="doc_id", how="left")
     J = J[J["doc_label"].isin(["conspiracy", "non"])]
 
     borderline = J[
@@ -623,6 +778,12 @@ def main():
     ap.add_argument("--shots-s1-per-label", type=int, default=2)
     ap.add_argument("--shots-s1-outliers", type=int, default=1)
     ap.add_argument(
+        "--max-n-fewshot",
+        type=int,
+        default=6,
+        help="Max number of S1 fewshot examples to include (after balancing)",
+    )
+    ap.add_argument(
         "--cant-tell-negs",
         type=int,
         default=2,
@@ -643,6 +804,7 @@ def main():
         help="If set, keep existing S1 exemplars and only update S2.",
     )
     args = ap.parse_args()
+    max_n = args.max_n_fewshot
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -659,6 +821,9 @@ def main():
 
     # Pools / convenience views
     df_all = pd.concat([train_df, dev_df], ignore_index=True).copy()
+    # print df_all columns
+    print(f"Data loaded: train={len(train_df)}, dev={len(dev_df)}, total={len(df_all)}")
+    print(f"Data columns: {df_all.columns.tolist()}")
 
     # Load optional stats
     priors = load_json(out_dir / "length_position_priors.json", default={})
@@ -881,6 +1046,13 @@ def main():
                     if ok:
                         break
 
+    # --- NEW: drop S1 few-shots that have no valid spans (or junk spans) ---
+    _before = len(s1_examples)
+    s1_examples = [ex for ex in s1_examples if _example_has_valid_span(ex)]
+    print(
+        f"[S1] filtered few-shots: kept={len(s1_examples)} dropped={_before - len(s1_examples)} (invalid/empty)"
+    )
+
     # ---- Build audit log for reproducibility ----
     audit = {
         "seed": args.seed,
@@ -931,9 +1103,75 @@ def main():
         )
 
     # Negative S1 exemplar (teaches: empty JSON is valid)
-    neg_s1 = pick_negative_s1_snippet(dev_df, seed=args.seed)
-    if neg_s1:
-        s1_examples.append(neg_s1)
+    # neg_s1 = pick_negative_s1_snippet(dev_df, seed=args.seed)
+    # if neg_s1:
+    #    s1_examples.append(neg_s1)
+
+    # --- NEW: guarantee per-label coverage via relaxed backfill (Actor/Action gaps etc.) ---
+    extras = backfill_missing_labels(
+        train_df=train_df,
+        s1_examples=s1_examples,
+        max_per_label=args.shots_s1_per_label,  # usually 2
+    )
+    if extras:
+        s1_examples.extend(extras)
+        print(f"[S1] Backfill added {len(extras)} examples to meet per-label coverage.")
+
+    # --- Ensure all 5 S1 markers are covered at least 2x ---
+    min_per_label = 2
+    label_counter = Counter()
+    for ex in s1_examples:
+        for m in ex.get("spans", []):
+            label = m.get("label")
+            if label:
+                label_counter[label] += 1
+
+    # Log current status
+    print("🔍 Fewshot label counts before trimming:", dict(label_counter))
+
+    # Filter to balance if needed
+    final_s1_examples = []
+    used = set()
+    per_label_buffer = {lab: [] for lab in ALLOWED_S1}
+
+    for ex in s1_examples:
+        added = False
+        for m in ex.get("spans", []):
+            lab = m.get("label")
+            if lab in ALLOWED_S1 and ex["text"] not in used:
+                per_label_buffer[lab].append(ex)
+                used.add(ex["text"])
+                added = True
+        if not added:
+            final_s1_examples.append(ex)
+
+    # Now collect balanced
+    balanced = []
+    for lab in ALLOWED_S1:
+        balanced.extend(per_label_buffer[lab][:min_per_label])
+
+    # Add remainder until max_n
+    seen_texts = set(e["text"] for e in balanced)
+    for ex in s1_examples:
+        if len(balanced) >= max_n:
+            break
+        if ex["text"] not in seen_texts:
+            balanced.append(ex)
+            seen_texts.add(ex["text"])
+
+    # Overwrite
+    s1_examples = balanced[:max_n]
+    print(
+        "✅ Final S1 fewshot label counts:",
+        dict(
+            Counter(
+                l
+                for ex in s1_examples
+                for l in [m["label"] for m in ex.get("spans", [])]
+            )
+        ),
+    )
+
     # ----------------- Write outputs -----------------
     out_fs = {"s1": s1_examples, "s2": s2_fewshots}
     fs_path.write_text(
