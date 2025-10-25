@@ -5,6 +5,7 @@ import pathlib
 import random
 import re
 import math  # <-- add this
+import zipfile
 import sys
 import os
 from collections import defaultdict
@@ -454,20 +455,35 @@ def postprocess_s1_spans(
 
 # ---------- default prompts ----------
 S1_BASE = """You are a careful annotator for PsyCoMark (SemEval-2026 Task 10, Subtask 1).
-Task: extract character spans that best reflect the following labels: Actor, Action, Effect, Victim, Evidence.
+Task: extract character spans for the labels: Actor, Action, Effect, Victim, Evidence.
 
-**These markers reflect evolutionary psychology principles: agency detection, in-group/out-group threats, coalitional behavior, moral violations, and threat sensitivity.**
+DEFINITIONS (disambiguation-first):
+- Actor = the agent (person/group/institution) portrayed as initiating, planning, or controlling events. Includes plural/collectives (e.g., "the deep state", "they").
+- Action = the deliberate action expressed as a VERB PHRASE (head verb + essential arguments), e.g., "air dropping billions", "directing Iran". Exclude outcomes/goals/purposes.
+- Effect = the consequence, intended goal, or alleged hidden intent (often a NOUN PHRASE: “agenda”, “population control”) or a purpose clause (e.g., “to set up their deep state agenda”). If a clause signals purpose (to/so that/in order to), label that clause as Effect.
+- Victim = the harmed/targeted entity (people/groups/institutions/public).
+- Evidence = explicit cited support: links/quotes/numbers/named sources, or evidential attributions (“according to”, “leaked emails”, “the report shows…”). Exclude bare allegations or opinions.
 
-Output format (strict JSON list, no extra text):
+OUTPUT (strict JSON list, no extra text):
 [{"label":"Actor|Action|Effect|Victim|Evidence","start":int,"end":int}]
 
-Rules and rubric:
-- Offsets are 0-indexed; end is exclusive. Spans must lie within the provided TEXT.
-- Keep spans tight and semantically meaningful. Exclude leading/trailing whitespace and punctuation.
-- Prefer minimal spans that uniquely identify the entity/event (e.g., "agency" not "the agency" unless needed to disambiguate).
-- Do not invent text not present in the input. Omit a label if not evidenced in the text.
-- Overlaps are allowed when justified (e.g., an Action containing a sub-phrase), but avoid redundant duplicates.
-- Boundary hints: include core content words; exclude trailing stopwords unless essential (e.g., prepositions integral to meaning).
+BOUNDARY RULES:
+- Character offsets are 0-indexed; end is exclusive; spans must lie within TEXT.
+- Keep spans tight: include core content words; EXCLUDE leading/trailing whitespace, quotes, and trailing punctuation.
+- Determiners (“the”, “a”, “an”) only if required for disambiguation of a named group.
+- Prepositions only if integral to the meaning (“set up” ≠ “set”; “in charge of”, “cover up”).
+
+OVERLAP/CONFLICT POLICY:
+- Action vs Effect: If an Action contains a purpose/result, split: label the verb phrase as Action and the purpose/result as Effect; allow overlap if unavoidable. Prefer minimal, non-redundant spans.
+- Actor vs Victim: When the same entity appears in different roles, select the smallest mention specific to each role.
+- Evidence can overlap any span if it is part of a quotation or citation.
+
+SHORT REASONING (keep private): First identify Actors → Actions → Effects → Victims → Evidence. Then resolve overlaps with the policy above. Finally output only the JSON.
+
+QUALITY PRIOR (span lengths):
+- Actor: typically short NP; Action: compact VP; Effect: may be longer NP/clause; Victim: short NP; Evidence: quoted/cited fragments.
+
+Return ONLY the JSON list; no prose, no keys other than label/start/end.
 """
 
 S1_USER = """TASK: Extract spans for labels: Actor, Action, Effect, Victim, Evidence.
@@ -479,25 +495,24 @@ TEXT:
 """
 
 S2_SYS = """You are a careful annotator for PsyCoMark (SemEval-2026 Task 10, Subtask 2).
-Goal: decide whether the REDDIT COMMENT promotes a conspiracy narrative.
-Use brief private reasoning, but return ONLY the final JSON below.
+Goal: decide whether the REDDIT COMMENT promotes a conspiracy narrative. You may use brief hidden reasoning, but return ONLY the final JSON.
 
-Label decision rubric:
-- "conspiracy": The author asserts or clearly endorses a conspiratorial claim.
-- "non": Neutral reporting, critique/debunking, jokes/irony, or unrelated content.
-Avoid using subreddit as a proxy; rely on text content and framing.
+CLASS DEFINITIONS (recall-aware, precise):
+- "conspiracy": The comment asserts or clearly endorses a hidden-plot narrative: a small/elite/malevolent Actor secretly coordinating Actions toward a goal/Effect (e.g., “agenda”, “cover-up”, “population control”), often with unnamed “they”, coalition cues, or purposeful intent. Explicit or strongly implied counts.
+- "non": Neutral reporting, jokes/irony, ordinary critique/debunking, or unrelated content. Fact-based questioning without hidden-agent framing is "non".
 
-Probability rubric (p_conspiracy, p_non should sum to 1.0):
-- 0.90-1.00: Explicit assertion/endorsement of a conspiracy.
-- 0.60-0.80: Strong implication or supportive framing without explicit claim.
-- ~0.50: Ambiguous/uncertain.
-- 0.00-0.20: Clearly non-conspiratorial (neutral/debunking/irrelevant).
+CALIBRATION (p_conspiracy + p_non = 1.0):
+- Strong hidden-plot cues (secret coordination, agenda/cover-up, blaming a cabal/“they”) → p_conspiracy ≥ 0.6; explicit assertion → ≥ 0.9.
+- Clear neutral/debunking or mundane content → p_non ≥ 0.8.
+- Ambiguous phrasing without hidden-agent framing → lean non but avoid 0 or 1 extremes.
+
+Use any provided DETECTED_MARKERS_JSON (Actor/Action/Effect/Victim/Evidence) as signals; absence does not force "non".
 
 Return strict JSON ONLY:
 {"label":"conspiracy|non","p_conspiracy":0.xx,"p_non":0.xx,"rationale":"<=2 sentences"}
 Constraints:
-- Ensure p_conspiracy + p_non = 1.0 (within rounding). Set label to the higher of the two.
-- Keep rationale concise and non-revealing of chain-of-thought.
+- Ensure probabilities sum to 1.0 (within rounding) and label = argmax.
+- Rationale: concise; DO NOT reveal chain-of-thought; mention key cues (e.g., “hidden agenda”, “secret coordination”) or “neutral critique”.
 """
 
 S2_USER = """TASK: Document-level classification (conspiracy vs non). Return JSON only.
@@ -572,29 +587,26 @@ def render_fewshots_block(examples: List[Dict[str, Any]], is_s2: bool) -> str:
     blocks = []
     for ex in examples:
         txt = ex.get("text") or ex.get("doc_text") or ""
-
         if is_s2:
             lbl = (
                 ex.get("label") or (ex.get("gold") or {}).get("label") or "non"
             ).lower()
-            if lbl not in ("conspiracy", "non"):
-                lbl = "non"
-            # assign sensible example probabilities
-            if lbl == "conspiracy":
-                gold = {
+            lbl = "conspiracy" if lbl == "conspiracy" else "non"
+            gold = (
+                {
                     "label": "conspiracy",
                     "p_conspiracy": 0.8,
                     "p_non": 0.2,
                     "rationale": "asserts conspiracy.",
                 }
-            else:
-                gold = {
+                if lbl == "conspiracy"
+                else {
                     "label": "non",
                     "p_conspiracy": 0.2,
                     "p_non": 0.8,
                     "rationale": "neutral/debunking.",
                 }
-
+            )
             mk = ex.get("markers") or []
             mk_norm = []
             for m in mk:
@@ -607,8 +619,7 @@ def render_fewshots_block(examples: List[Dict[str, Any]], is_s2: bool) -> str:
                     continue
                 if lab and e > s:
                     mk_norm.append({"type": lab, "startIndex": s, "endIndex": e})
-
-            block = f"EXAMPLE:\nTEXT:\n{shorten(txt, 800)}\n"
+            block = "EXAMPLE:\nTEXT:\n" + shorten(txt, 800) + "\n"
             if mk_norm:
                 block += (
                     "DETECTED_MARKERS_JSON:\n"
@@ -616,34 +627,27 @@ def render_fewshots_block(examples: List[Dict[str, Any]], is_s2: bool) -> str:
                     + "\n"
                 )
             block += "JSON:\n" + json.dumps(gold, ensure_ascii=False)
-
         else:
-            # NEW: coerce S1 spans from ex["spans"] or ex["markers"]
-            spans = (
-                ex.get("spans")
-                or ex.get("markers")
-                or ex.get("gold")
-                or ex.get("json")
-                or []
-            )
+            # Use pre-cropped, pre-remapped spans from _prepare_s1_fewshots
+            spans = ex.get("spans") or []
+            # keep spans compact and valid
             norm = []
             for m in spans:
-                lab = (m.get("label") or m.get("type") or "").strip()
-                s = m.get("start", m.get("startIndex"))
-                e = m.get("end", m.get("endIndex"))
+                lab = (m.get("label") or "").strip()
+                s = m.get("start")
+                e = m.get("end")
                 try:
                     s, e = int(s), int(e)
                 except Exception:
                     continue
-                if lab and e is not None and s is not None and e > s:
+                if lab in _S1_ALLOWED and e > s and (e - s) <= 120:
                     norm.append({"label": lab, "start": s, "end": e})
-
-            MAX_EX_SPAN = 90
-            norm = [m for m in norm if (m["end"] - m["start"]) <= MAX_EX_SPAN]
-            block = f"EXAMPLE:\nTEXT:\n{shorten(txt, 800)}\nJSON:\n" + json.dumps(
-                norm, ensure_ascii=False
+            block = (
+                "EXAMPLE:\nTEXT:\n"
+                + shorten(txt, 800)
+                + "\nJSON:\n"
+                + json.dumps(norm, ensure_ascii=False)
             )
-
         blocks.append(block)
     return "\n\n".join(blocks)
 
@@ -761,6 +765,240 @@ def merge_by_freq(all_runs: List[List[Dict[str, int]]], min_votes=2, iou_thr=0.8
     return kept
 
 
+# --- S1 few-shot guards (drop empties, dedupe, balance) ---
+
+_S1_ALLOWED = {"Actor", "Action", "Effect", "Victim", "Evidence"}
+
+
+def _ex_has_valid_spans_s1(ex, min_span_len=3, max_span_len=150):
+    txt = (ex.get("text") or "").strip()
+    if not txt:
+        return False
+    spans = ex.get("spans") or ex.get("markers") or []
+    ok = False
+    for sp in spans:
+        lab = (sp.get("label") or sp.get("type") or "").strip()
+        try:
+            s = int(sp.get("start", sp.get("startIndex")))
+            e = int(sp.get("end", sp.get("endIndex")))
+        except Exception:
+            continue
+        if (
+            lab in _S1_ALLOWED
+            and e > s
+            and (e - s) >= min_span_len
+            and (e - s) <= max_span_len
+        ):
+            ok = True
+            break
+    return ok
+
+
+def _dedup_by_text(examples):
+    seen = set()
+    out = []
+    for ex in examples:
+        t = (ex.get("text") or "").strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(ex)
+    return out
+
+
+_S1_ALLOWED = {"Actor", "Action", "Effect", "Victim", "Evidence"}
+_CONSP_CUES = [
+    "deep state",
+    "hidden agenda",
+    "agenda",
+    "cover up",
+    "cover-up",
+    "plot",
+    "cabal",
+    "secret",
+    "they",
+    "rigged",
+    "collude",
+    "weaponiz",
+    "false flag",
+    "globalist",
+    "conspiracy",
+]
+
+
+def _norm_text_key(t: str) -> str:
+    # normalize for dedup: lowercase, collapse whitespace/punctuation spacing
+    t = (t or "").lower()
+    t = _re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _ex_has_valid_spans_s1(ex, min_span_len=3, max_span_len=150):
+    txt = (ex.get("text") or "").strip()
+    if not txt:
+        return False
+    spans = ex.get("spans") or ex.get("markers") or []
+    for sp in spans:
+        lab = (sp.get("label") or sp.get("type") or "").strip()
+        s = sp.get("start", sp.get("startIndex"))
+        e = sp.get("end", sp.get("endIndex"))
+        try:
+            s, e = int(s), int(e)
+        except Exception:
+            continue
+        if lab in _S1_ALLOWED and (e > s) and (min_span_len <= (e - s) <= max_span_len):
+            return True
+    return False
+
+
+def _looks_conspiratorial(txt: str) -> bool:
+    s = (txt or "").lower()
+    # soft filter: keep if we hit any cue OR text mentions 2+ labels words
+    if any(c in s for c in _CONSP_CUES):
+        return True
+    # allow “neutral” examples if they are short and clearly labeled
+    return len(s) <= 220
+
+
+def _dedup_by_text_and_id(examples):
+    seen_keys = set()
+    out = []
+    for ex in examples:
+        did = str(ex.get("doc_id") or ex.get("_id") or "")
+        key = (did, _norm_text_key(ex.get("text") or ""))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out.append(ex)
+    # also dedup by normalized text alone in case doc_id missing/reused
+    seen_texts = set()
+    final = []
+    for ex in out:
+        tk = _norm_text_key(ex.get("text") or "")
+        if tk in seen_texts:
+            continue
+        seen_texts.add(tk)
+        final.append(ex)
+    return final
+
+
+def _crop_example_text(ex, pad=120, max_spans_per_ex=4):
+    """
+    Create a cropped snippet around the MOST informative span (first one that passes checks),
+    and remap all retained spans into the new [start,end) space.
+    """
+    txt = ex.get("text") or ""
+    spans = ex.get("spans") or ex.get("markers") or []
+    # keep only allowed labels and reasonable lengths; prefer diverse labels
+    keep = []
+    per_lab = {lab: 0 for lab in _S1_ALLOWED}
+    for sp in spans:
+        lab = (sp.get("label") or sp.get("type") or "").strip()
+        s = sp.get("start", sp.get("startIndex"))
+        e = sp.get("end", sp.get("endIndex"))
+        try:
+            s, e = int(s), int(e)
+        except Exception:
+            continue
+        if lab in _S1_ALLOWED and e > s and (e - s) <= 120:
+            if per_lab[lab] < 1:
+                keep.append({"label": lab, "start": s, "end": e})
+                per_lab[lab] += 1
+        if len(keep) >= max_spans_per_ex:
+            break
+    if not keep:
+        return None
+
+    # choose a center span heuristically: prefer Action/Effect > Actor/Victim > Evidence
+    order = {"Action": 0, "Effect": 1, "Actor": 2, "Victim": 3, "Evidence": 4}
+    keep.sort(key=lambda m: (order.get(m["label"], 9), m["start"]))
+    center = keep[0]
+    L = len(txt)
+    left = max(0, center["start"] - pad)
+    right = min(L, center["end"] + pad)
+    snippet = txt[left:right].strip()
+
+    # remap offsets to snippet space; discard spans that fall completely outside
+    remapped = []
+    for m in keep:
+        s, e = m["start"], m["end"]
+        if e <= left or s >= right:
+            continue
+        ns = max(0, s - left)
+        ne = max(0, e - left)
+        if ne > ns:
+            remapped.append({"label": m["label"], "start": ns, "end": ne})
+
+    if not remapped or not _looks_conspiratorial(snippet):
+        return None
+
+    return {"doc_id": ex.get("doc_id"), "text": snippet, "spans": remapped}
+
+
+def _balance_per_label_s1(examples, max_per_label=1, max_total=6):
+    labs = ["Actor", "Action", "Effect", "Victim", "Evidence"]
+    chosen, per_lab = [], {lab: 0 for lab in labs}
+
+    def supports(ex, lab):
+        for sp in ex.get("spans") or []:
+            if sp.get("label") == lab:
+                return True
+        return False
+
+    # ensure one per label when available
+    for lab in labs:
+        for ex in examples:
+            if per_lab[lab] < max_per_label and supports(ex, lab):
+                chosen.append(ex)
+                per_lab[lab] += 1
+                break
+
+    # fill remaining by a light salience heuristic (cues + brevity)
+    def salience(ex):
+        t = (ex.get("text") or "").lower()
+        cue_score = sum(1 for c in _CONSP_CUES if c in t)
+        short_bonus = 1 if len(t) <= 220 else 0
+        return -(cue_score + short_bonus)
+
+    rest = [e for e in examples if e not in chosen]
+    rest.sort(key=salience)
+    for ex in rest:
+        if len(chosen) >= max_total:
+            break
+        chosen.append(ex)
+    return chosen[:max_total]
+
+
+def _prepare_s1_fewshots(fewshots, max_per_label=1, max_total=6):
+    if not fewshots:
+        return []
+    # keep examples with at least one valid span
+    filt = [ex for ex in fewshots if _ex_has_valid_spans_s1(ex)]
+    # dedup by doc_id and normalized text
+    filt = _dedup_by_text_and_id(filt)
+    # crop and remap offsets into short, focused snippets
+    cropped = []
+    for ex in filt:
+        c = _crop_example_text(ex, pad=120, max_spans_per_ex=4)
+        if c:
+            cropped.append(c)
+    # final dedup after crop (by normalized text)
+    cropped = _dedup_by_text_and_id(cropped)
+    if not cropped:
+        return []
+    # require on-domain or short neutral
+    cropped = [ex for ex in cropped if _looks_conspiratorial(ex.get("text", ""))]
+    if not cropped:
+        return []
+    # balance: one per label when possible, then fill
+    return _balance_per_label_s1(
+        cropped, max_per_label=max_per_label, max_total=max_total
+    )
+
+
+import re as _re
+
+
 # ---------- prompt builders (tech-agnostic) ----------
 def s1_prompt(
     doc_text,
@@ -770,14 +1008,12 @@ def s1_prompt(
     tech: str,
     prompt_arts: Dict[str, Any] = None,
 ):
-    fs_block = render_fewshots_block(fewshots, is_s2=False)
     system = [S1_BASE]
     if policy:
         system.insert(0, policy)
     if "boundary" in tech and boundary_note:
         system.append("Boundary guidance:\n" + boundary_note)
 
-    # NEW: CoT checklist
     if "cot" in tech:
         system.append(
             "Checklist before labeling:\n"
@@ -786,9 +1022,7 @@ def s1_prompt(
             "- If Action and Effect overlap, choose the minimal span that best fits each role.\n"
             "- For Actor vs Victim overlaps, prefer the smaller specific mention for each role."
         )
-    n_samples = 1
-    temp = 0.0
-    # --- NEW: append artifact-driven blocks (compact) ---
+
     if prompt_arts:
         if "boundary" in tech:
             b = _render_boundary_block(prompt_arts)
@@ -800,13 +1034,22 @@ def s1_prompt(
         p = _render_priors_block(prompt_arts)
         if p:
             system.append(p)
-    if tech.startswith("sc"):  # self-consistency
-        n = re.search(r"sc(\d+)", tech)
+
+    n_samples, temp = (1, 0.0)
+    if tech.startswith("sc"):
+        n = _re.search(r"sc(\d+)", tech)
         n_samples = int(n.group(1)) if n else 5
         temp = 0.7
-    user = ""
-    if "fs" in tech or tech.startswith("sc"):
-        user += (fs_block + "\n\n") if fs_block else ""
+
+    prepend_examples = ("fs" in tech) or tech.startswith("sc")
+    clean_fs = (
+        _prepare_s1_fewshots(fewshots, max_per_label=1, max_total=6)
+        if prepend_examples
+        else []
+    )
+    fs_block = render_fewshots_block(clean_fs, is_s2=False) if clean_fs else ""
+
+    user = (fs_block + "\n\n") if fs_block else ""
     user += S1_USER.format(doc_text=doc_text)
     return system, user, n_samples, temp
 
@@ -877,7 +1120,8 @@ def s2_prompt_with_markers(
     markers_json: str,
     prompt_arts: Dict[str, Any] = None,
 ):
-    fs_block = render_fewshots_block(fewshots, is_s2=True)
+    # --- NEW: render; if nothing valid remains, drop to zero-shot gracefully ---
+    fs_block = render_fewshots_block(fewshots, is_s2=True) if fewshots else ""
     system = [S2_SYS]
     if "policy" in tech and policy:
         system.insert(0, policy)
@@ -910,8 +1154,8 @@ def s2_prompt_with_markers(
     temp = 0.7 if n_samples > 1 else 0.0
 
     user_prefix = ""
-    if "fs" in tech or n_samples > 1:
-        user_prefix = (fs_block + "\n\n") if fs_block else ""
+    if fs_block and ("fs" in tech or n_samples > 1):
+        user_prefix = fs_block + "\n\n"
 
     user = user_prefix + S2_USER.format(doc_text=doc_text, markers_json=markers_json)
 
@@ -1358,8 +1602,36 @@ def main():
 
             lex = (prompt_arts or {}).get("lexicons", {})
             for lab, arr in by_lab.items():
-                # sort by (start, end) and prefer longer spans first within same start
-                arr = [m for m in arr if _valid_span(txt, *_start_end(m))]
+                # --- NEW: filter bad Victim spans (money/objects/etc.) before salience sort ---
+                def _is_bad_victim(text_slice: str) -> bool:
+                    s = (text_slice or "").strip().lower()
+                    # numeric/money tokens or abstract objects are not victims
+                    if re.fullmatch(
+                        r"\$?\d[\d,]*(\.\d+)?(\s*(k|m|b|million|billion))?", s
+                    ):
+                        return True
+                    if s in {
+                        "bribe money",
+                        "taxes",
+                        "cash",
+                        "evidence",
+                        "agenda",
+                        "plan",
+                        "policy",
+                    }:
+                        return True
+                    return False
+
+                def _text_of(m):
+                    s, e = _start_end(m)
+                    return txt[s:e]
+
+                arr = [
+                    m
+                    for m in arr
+                    if _valid_span(txt, *_start_end(m))
+                    and not ((lab == "Victim") and _is_bad_victim(_text_of(m)))
+                ]
                 arr_sorted = sorted(arr, key=lambda m: _salience(m, txt, lex))
                 pruned.extend(arr_sorted[:k])
 
@@ -1465,10 +1737,16 @@ def main():
         if isinstance(args.s2_thresh, str) and args.s2_thresh.lower() == "auto":
             if s2_prob_rows:  # only tune if we actually have probs
                 best_t, best_f1, stats = tune_threshold_dev(rows_s2, s2_prob_rows)
-                thr = best_t
-                print(
-                    f"[S2] auto threshold tuned on dev: t={best_t:.2f} (dev f1={best_f1:.3f}, mean_p={stats['mean_p']:.3f}, n={stats['n']})"
-                )
+                if stats.get("n", 0) <= 0:
+                    print(
+                        "[S2] No gold labels available for threshold tuning; keeping default 0.50."
+                    )
+                    thr = 0.50
+                else:
+                    thr = best_t
+                    print(
+                        f"[S2] auto threshold tuned on dev: t={best_t:.2f} (dev f1={best_f1:.3f}, mean_p={stats['mean_p']:.3f}, n={stats['n']})"
+                    )
             else:
                 logging.warning("[S2] no probability rows; falling back to 0.50")
         else:
@@ -1507,6 +1785,31 @@ def main():
         # S2 top-level file (final thresholded labels)
         write_jsonl("submission_s2.jsonl", pred2)
         print("Wrote top-level submissions: submission_s1.jsonl, submission_s2.jsonl")
+        # --- NEW: zip each technique's submissions into ./submissions/submission_{tech}.zip ---
+        try:
+            submissions_dir = pathlib.Path("submissions")
+            submissions_dir.mkdir(parents=True, exist_ok=True)
+            zip_path = submissions_dir / f"submission_{tech}.zip"
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                # include top-level files as required by Codabench
+                if pathlib.Path("submission_s1.jsonl").exists():
+                    zf.write("submission_s1.jsonl", arcname="submission_s1.jsonl")
+                if pathlib.Path("submission_s2.jsonl").exists():
+                    zf.write("submission_s2.jsonl", arcname="submission_s2.jsonl")
+                # also include per-tech originals for traceability
+                if s1_sub.exists():
+                    zf.write(s1_sub, arcname=f"{tech}/s1/submission.jsonl")
+                if s1_pruned_sub.exists():
+                    zf.write(
+                        s1_pruned_sub, arcname=f"{tech}/s1/submission_pruned.jsonl"
+                    )
+                if s2_sub.exists():
+                    zf.write(s2_sub, arcname=f"{tech}/s2/submission.jsonl")
+                if probs_path.exists():
+                    zf.write(probs_path, arcname=f"{tech}/s2/probs.jsonl")
+            print(f"Packaged ZIP -> {zip_path}")
+        except Exception as e:
+            logging.warning(f"[ZIP] Failed to create technique ZIP: {e}")
 
 
 if __name__ == "__main__":
