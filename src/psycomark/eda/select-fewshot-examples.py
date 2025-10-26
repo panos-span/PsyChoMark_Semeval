@@ -123,9 +123,200 @@ MIN_SPAN = 3
 MAX_SPAN = 90
 MIN_LABELS_PER_EXAMPLE = 2  # teach multi-label windows (esp. conflict pairs)
 
+# --- E) Negative few-shots (no markers) ---
+S1_NEG_MIN = 1
+S1_NEG_MAX = 2
+NEG_PAD = 90  # context around a gap center
+NEG_MAX_LEN = 220  # hard length cap
+NEG_MIN_LEN = 120  # aim for enough context
+NEG_IDF_MIN_PCTL = 35  # slightly laxer than Evidence (D)
+
+
+def _snippet_quality_negative(snippet: str, idf: dict, idf_cutoff: float) -> float:
+    """Higher is better; penalize fluff/links/quotes; reward salience."""
+    txt = snippet.strip()
+    if not txt:
+        return -1e6
+    L = len(txt)
+    if L < 40:
+        return -1e6
+    if _URL_RE.search(txt) or _QUOTE_RE.match(txt):
+        return -1e3
+    # salience via avg-idf (stopwords removed)
+    sal = _avg_idf(txt, idf)
+    if sal < idf_cutoff:
+        return -5.0
+    # lighter stopword penalty than Evidence
+    toks = re.findall(r"\w+", txt)
+    sw = sum(1 for t in toks if t.lower() in _STOP)
+    sw_pen = (sw / max(1, len(toks))) * 0.8
+    # reward medium length
+    len_bonus = 1.0 if NEG_MIN_LEN <= L <= NEG_MAX_LEN else 0.0
+    return sal + len_bonus - sw_pen
+
+
+def _window_from_center(
+    text: str, c: int, pad: int = NEG_PAD, hard_cap: int = NEG_MAX_LEN
+) -> tuple[int, int]:
+    left = max(0, c - pad)
+    right = min(len(text), c + pad)
+    if (right - left) > hard_cap:
+        overflow = (right - left) - hard_cap
+        trim_l = overflow // 2
+        trim_r = overflow - trim_l
+        left = min(max(0, left + trim_l), len(text))
+        right = max(min(len(text), right - trim_r), 0)
+    return left, right
+
+
+def _gen_negative_snippets_from_gaps(
+    text: str, forbid: list[tuple[int, int]], want: int = 4
+) -> list[tuple[int, int]]:
+    """
+    Create negative windows from the largest unlabeled gaps in `text`.
+    `forbid` contains (start, end) spans to avoid.
+    """
+    if not text:
+        return []
+    # merge/normalize forbid spans
+    forbid = sorted(
+        [(max(0, s), max(s, e)) for s, e in forbid if e > s], key=lambda x: x[0]
+    )
+    merged = []
+    for s, e in forbid:
+        if not merged or s > merged[-1][1]:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+    forbid = [(s, e) for s, e in merged]
+    # compute gaps
+    gaps = []
+    last = 0
+    for s, e in forbid:
+        if s > last:
+            gaps.append((last, s))
+        last = max(last, e)
+    if last < len(text):
+        gaps.append((last, len(text)))
+    # choose centers from largest gaps
+    gaps.sort(key=lambda x: (x[1] - x[0]), reverse=True)
+    picks = []
+    for gL, gR in gaps[: max(6, want * 2)]:
+        if (gR - gL) < 40:  # too tiny
+            continue
+        c = (gL + gR) // 2
+        L, R = _window_from_center(text, c)
+        picks.append((L, R))
+        if len(picks) >= want:
+            break
+    return picks
+
+
+def _window_overlaps_any(L: int, R: int, spans: list[tuple[int, int]]) -> bool:
+    for s, e in spans:
+        if max(0, min(R, e) - max(L, s)) > 0:
+            return True
+    return False
+
 
 def _tokenize_simple(s: str) -> list[str]:
     return re.findall(r"[a-zA-Z]+", s.lower())
+
+
+# --- F) Word-boundary tightening & G) crisp windows ---
+CLEAN_PAD = 90  # default pad for clean/prototype/per-label windows
+CLEAN_CAP = 240  # hard cap on clean windows
+CONFLICT_CAP = 220  # hard cap on ambiguous windows (already used in B)
+
+_BOUNDARY_PUNCT = set(punctuation) | {"“", "”", "‘", "’", "—", "–"}
+_WHITES = {" ", "\t", "\n", "\r"}
+
+
+def _is_boundary_char(ch: str) -> bool:
+    return (ch in _WHITES) or (not ch.isalnum())
+
+
+def _trim_span_punct(text: str, s: int, e: int) -> tuple[int, int]:
+    """Trim leading/trailing punctuation/quotes; keep within [0,len]."""
+    s0, e0 = s, e
+    while s < e and text[s] in _BOUNDARY_PUNCT:
+        s += 1
+    while e > s and text[e - 1] in _BOUNDARY_PUNCT:
+        e -= 1
+    return (s, e) if (e > s) else (s0, e0)
+
+
+def _snap_to_word_boundaries(text: str, s: int, e: int) -> tuple[int, int] | None:
+    """
+    Snap [s,e) to loose word boundaries to avoid mid-token edges.
+    Returns None if snapping collapses the span.
+    """
+    if s < 0 or e <= s or e > len(text):
+        return None
+    # move left until boundary (or start)
+    while s > 0 and not _is_boundary_char(text[s - 1]) and text[s - 1].isalnum():
+        s -= 1
+    # move right until boundary (or end)
+    while e < len(text) and not _is_boundary_char(text[e]) and text[e].isalnum():
+        e += 1
+    if e <= s:
+        return None
+    return (s, e)
+
+
+def _span_boundary_ok(text: str, s: int, e: int) -> bool:
+    """
+    Stronger boundary check: discourage mid-token edges and trailing punct.
+    """
+    if s < 0 or e <= s or e > len(text):
+        return False
+    if text[s:e].strip() == "":
+        return False
+    # no trailing punctuation
+    if text[e - 1] in _BOUNDARY_PUNCT:
+        return False
+    # left/right "looks like" boundaries
+    left_ok = (s == 0) or _is_boundary_char(text[s - 1])
+    right_ok = (e == len(text)) or _is_boundary_char(text[e])
+    return left_ok and right_ok
+
+
+def _clamp_window(left: int, right: int, cap: int, n: int) -> tuple[int, int]:
+    """Clamp [left,right) to <= cap length by trimming both sides."""
+    left = max(0, left)
+    right = min(n, right)
+    if right - left <= cap:
+        return left, right
+    overflow = (right - left) - cap
+    trim_l = overflow // 2
+    trim_r = overflow - trim_l
+    left = min(max(0, left + trim_l), n)
+    right = max(min(n, right - trim_r), 0)
+    if right <= left:  # degenerate, fallback to left..left+cap
+        right = min(n, left + cap)
+    return left, right
+
+
+def _make_snippet(
+    text: str, s: int, e: int, pad: int = CLEAN_PAD, cap: int = CLEAN_CAP
+) -> tuple[str, int, int, int, int]:
+    """
+    Build a crisp snippet around [s,e):
+      1) trim boundary punctuation
+      2) snap to word boundaries (loose)
+      3) pad symmetrically by `pad`, then clamp to `cap`
+    Returns: (snippet, left, right, new_s, new_e) where new_s/new_e are offsets within snippet.
+    """
+    n = len(text)
+    s, e = _trim_span_punct(text, s, e)
+    snapped = _snap_to_word_boundaries(text, s, e)
+    if snapped is not None:
+        s, e = snapped
+    left = max(0, s - pad)
+    right = min(n, e + pad)
+    left, right = _clamp_window(left, right, cap, n)
+    snippet = text[left:right]
+    return snippet, left, right, s - left, e - left
 
 
 def _build_idf_stats(texts: list[str]) -> dict:
@@ -1171,7 +1362,7 @@ def build_s1_fewshots(
     policy: dict | None = None,
     max_per_label: int = 4,
     max_per_pair: int = 1,
-    pad: int = 120,
+    pad: int = CLEAN_PAD,
 ) -> List[dict]:
     """
     Selector over pre-scored candidates (from build_s1_candidates):
@@ -1199,6 +1390,7 @@ def build_s1_fewshots(
         return vals[k]
 
     _idf_cutoff = _pctl(_idf_vals, EVIDENCE_IDF_MIN_PCTL)
+    _neg_idf_cutoff = _pctl(_idf_vals, NEG_IDF_MIN_PCTL)
 
     if cands_df is None or cands_df.empty:
         return []
@@ -1247,12 +1439,14 @@ def build_s1_fewshots(
                 text, s, e, _idf, _idf_cutoff
             ):
                 continue
-            # short, crisp snippet
-            local_pad = min(pad, 90)
-            ls = max(0, s - local_pad)
-            rs = min(len(text), e + local_pad)
-            snippet = text[ls:rs]
-            span = {"label": lab, "start": s - ls, "end": e - ls}
+            # short, crisp snippet (F+G)
+            snippet, ls, rs, ns, ne = _make_snippet(
+                text, s, e, pad=min(pad, CLEAN_PAD), cap=CLEAN_CAP
+            )
+            # boundary sanity
+            if not _span_boundary_ok(snippet, ns, ne):
+                continue
+            span = {"label": lab, "start": ns, "end": ne}
             ex = {
                 "doc_id": doc_id,
                 "text": snippet,
@@ -1296,8 +1490,12 @@ def build_s1_fewshots(
                 continue
             ls = max(0, s - pad)
             rs = min(len(text), e + pad)
-            snippet = text[ls:rs]
-            spans = [{"label": lab, "start": s - ls, "end": e - ls}]
+            snippet, ls, rs, ns, ne = _make_snippet(
+                text, s, e, pad=min(pad, CLEAN_PAD), cap=CLEAN_CAP
+            )
+            if not _span_boundary_ok(snippet, ns, ne):
+                continue
+            spans = [{"label": lab, "start": ns, "end": ne}]
             ex = {
                 "doc_id": doc_id,
                 "text": snippet,
@@ -1311,6 +1509,100 @@ def build_s1_fewshots(
             if len(per_lab) >= need:
                 break
         picked.extend(per_lab)
+
+    # -- E) Build negatives (no markers)
+    neg_candidates: list[dict] = []
+    # 1) If a negatives source (full docs with markers) is provided in policy/meta, use it
+    # You can thread this via `policy.get("neg_source_docs")` if you parsed --neg-source earlier.
+    neg_docs = None
+    if isinstance(policy, dict):
+        neg_docs = policy.get(
+            "neg_source_docs"
+        )  # list of dicts: {"doc_id","text","markers":[],"subreddit":...}
+    if neg_docs:
+        for d in neg_docs:
+            if d is None:
+                continue
+            if d.get("markers"):  # must be empty or falsy
+                continue
+            text = (d.get("text") or "").strip()
+            if not text:
+                continue
+            # take a centered window over the whole doc if it's long
+            c = len(text) // 2
+            L, R = _window_from_center(text, c)
+            snippet = text[L:R].strip()
+            if not (NEG_MIN_LEN <= len(snippet) <= NEG_MAX_LEN):
+                continue
+            q = _snippet_quality_negative(snippet, _idf, _neg_idf_cutoff)
+            if q < 0.0:
+                continue
+            neg_candidates.append(
+                {
+                    "doc_id": d.get("doc_id"),
+                    "text": snippet,
+                    "spans": [],
+                    "meta": {
+                        "reason": "negative_no_markers",
+                        "subreddit": d.get("subreddit"),
+                    },
+                }
+            )
+    else:
+        # 2) Fallback: synthesize from gaps within docs that do have labeled spans
+        by_doc_spans: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        doc_text: dict[str, str] = {}
+        doc_sub: dict[str, str] = {}
+        for _, r in cands_df.iterrows():
+            did = r["doc_id"]
+            s, e = int(r["start"]), int(r["end"])
+            by_doc_spans[did].append((s, e))
+            doc_text[did] = r["text"]
+            if "subreddit" in r:
+                doc_sub[did] = r["subreddit"]
+        for did, spans in by_doc_spans.items():
+            text = (doc_text.get(did) or "").strip()
+            if not text:
+                continue
+            # derive a few windows from the largest gaps
+            windows = _gen_negative_snippets_from_gaps(text, spans, want=4)
+            for L, R in windows:
+                if (R - L) < NEG_MIN_LEN:
+                    continue
+                if _window_overlaps_any(L, R, spans):
+                    continue
+                snippet = text[L:R].strip()
+                if len(snippet) > NEG_MAX_LEN:
+                    snippet = snippet[:NEG_MAX_LEN].rstrip()
+                q = _snippet_quality_negative(snippet, _idf, _neg_idf_cutoff)
+                if q < 0.0:
+                    continue
+                neg_candidates.append(
+                    {
+                        "doc_id": did,
+                        "text": snippet,
+                        "spans": [],
+                        "meta": {
+                            "reason": "negative_no_markers",
+                            "subreddit": doc_sub.get(did),
+                        },
+                    }
+                )
+
+    # keep top few negatives by quality & uniqueness
+    # (quality is embedded via _snippet_quality_negative; re-score here quickly)
+    scored_neg = []
+    seen_neg = set()
+    for n in neg_candidates:
+        t = n.get("text", "")
+        h = _snippet_hash(t)
+        if h in seen_neg:
+            continue
+        seen_neg.add(h)
+        q = _snippet_quality_negative(t, _idf, _neg_idf_cutoff)
+        scored_neg.append((q, n))
+    scored_neg.sort(key=lambda x: x[0], reverse=True)
+    neg_top = [n for _, n in scored_neg[: max(4, S1_NEG_MAX * 3)]]
 
     # 3) Conflict exemplars (ambiguous pairs, sanitized)
     target_pairs = []
@@ -1341,7 +1633,7 @@ def build_s1_fewshots(
 
         IOU_MIN, IOU_MAX = 0.10, 0.35  # tighter range
         PAD_CONFLICT = min(pad, 90)  # shorter windows
-        MAX_PER_PAIR = 1  # global cap per pair
+        EFF_MAX_PER_PAIR = int(max(0, max_per_pair))
 
         per_pair_added = Counter()
         seen_docs_for_pair = set()  # avoid many from the same doc/pair
@@ -1356,7 +1648,7 @@ def build_s1_fewshots(
             for a, b in target_pairs:
                 # normalize tuple order to match per_pair_added keys
                 key_pair = tuple(sorted((a, b)))
-                if per_pair_added[key_pair] >= MAX_PER_PAIR:
+                if per_pair_added[key_pair] >= EFF_MAX_PER_PAIR:
                     continue
                 if a not in by_lab or b not in by_lab:
                     continue
@@ -1382,18 +1674,12 @@ def build_s1_fewshots(
                         if _identical_substring(ma["text"], s1, e1, s2, e2):
                             continue
 
-                        # tight union window + short pad
-                        left = max(0, min(s1, s2) - PAD_CONFLICT)
-                        right = min(len(ma["text"]), max(e1, e2) + PAD_CONFLICT)
-
-                        # hard-cap snippet to ≤ 220 by trimming both sides
-                        if (right - left) > 220:
-                            overflow = (right - left) - 220
-                            trim_left = overflow // 2
-                            trim_right = overflow - trim_left
-                            left = min(max(0, left + trim_left), len(ma["text"]))
-                            right = max(min(len(ma["text"]), right - trim_right), 0)
-
+                        # tight union window + short pad, then clamp to CONFLICT_CAP
+                        base_left = max(0, min(s1, s2) - PAD_CONFLICT)
+                        base_right = min(len(ma["text"]), max(e1, e2) + PAD_CONFLICT)
+                        left, right = _clamp_window(
+                            base_left, base_right, CONFLICT_CAP, len(ma["text"])
+                        )
                         snippet = (ma["text"][left:right]).strip()
                         off_a_s, off_a_e = s1 - left, e1 - left
                         off_b_s, off_b_e = s2 - left, e2 - left
@@ -1457,11 +1743,15 @@ def build_s1_fewshots(
         pad_local = 90
         ls = max(0, s - pad_local)
         rs = min(len(text), e + pad_local)
-        snippet = text[ls:rs]
+        snippet, ls, rs, ns, ne = _make_snippet(
+            text, s, e, pad=CLEAN_PAD, cap=CLEAN_CAP
+        )
         if _snippet_hash(snippet) in used_hashes:
             continue
         # prefer clean single-label span windows
-        span = {"label": lab, "start": s - ls, "end": e - ls}
+        if not _span_boundary_ok(snippet, ns, ne):
+            continue
+        span = {"label": lab, "start": ns, "end": ne}
         ex = {
             "doc_id": r["doc_id"],
             "text": snippet,
@@ -1590,6 +1880,49 @@ def build_s1_fewshots(
             if idx_to_remove is None:
                 break
             picked.pop(idx_to_remove)
+
+    # 4c.1) Ensure 1–2 negatives at the FRONT (don’t count toward label quotas)
+    neg_needed = S1_NEG_MIN
+    neg_limit = S1_NEG_MAX
+
+    front_neg = []
+    neg_added = 0
+
+    # reuse hashes from already-picked examples
+    used_hashes = {_snippet_hash(ex.get("text", "")) for ex in picked if ex.get("text")}
+
+    # Pass 1: add up to neg_limit unique, high-quality negatives
+    for q, cand in scored_neg:  # scored_neg is a list of (score, ex) sorted desc
+        if neg_added >= neg_limit:
+            break
+        t = cand.get("text", "")
+        if not t:
+            continue
+        h = _snippet_hash(t)
+        if h in used_hashes:
+            continue
+        front_neg.append(cand)
+        used_hashes.add(h)
+        neg_added += 1
+
+    # Pass 2: if we didn’t meet the minimum, keep scanning the pool to hit neg_needed
+    if neg_added < neg_needed:
+        for q, cand in scored_neg:
+            if neg_added >= neg_needed:
+                break
+            t = cand.get("text", "")
+            if not t:
+                continue
+            h = _snippet_hash(t)
+            if h in used_hashes:
+                continue
+            front_neg.append(cand)
+            used_hashes.add(h)
+            neg_added += 1
+
+    # Prepend if we found any; otherwise leave as-is (no safe unique negatives available)
+    if front_neg:
+        picked = front_neg + picked
 
     # Safety net: drop any weak Evidence that slipped through
     _picked_clean = []

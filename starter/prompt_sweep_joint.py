@@ -29,6 +29,14 @@ from src.psycomark.llm.eda_support import (
     build_s2_policy,
     load_fewshots,
 )
+from prompt_builder import (
+    load_json,
+    build_s1_system,
+    build_s1_user,
+    build_s2_system,
+    build_s2_user,
+    extract_answer_json,
+)
 
 ALL_TECHNIQUES = "fs_policy_boundary_sc5,fs_policy_boundary_cot_sc5,fs_policy_boundary_neg_cot_sc5,fs_cot_sc10,zs_policy_cot_sc5,zs_cot_sc5,fs_neg_cot_sc10"
 
@@ -1294,6 +1302,77 @@ def run_s2(
     return final_label, avg_p_con, avg_p_non
 
 
+def _order_s1_fewshots(fs: list[dict]) -> list[dict]:
+    """
+    Reorder S1 few-shots as:
+      1) one negative (spans==[]),
+      2) one clean prototype per label (Actor,Action,Effect,Victim,Evidence),
+      3) one conflict example (meta.reason starts 'ambiguous_pair'),
+    with graceful fallbacks if any bucket is missing.
+    Assumes examples are {"text":..., "spans":[...], "meta":{...}}.
+    """
+    if not fs:
+        return []
+    LABELS = ["Actor", "Action", "Effect", "Victim", "Evidence"]
+
+    def _is_neg(ex):
+        return isinstance(ex.get("spans"), list) and len(ex["spans"]) == 0
+
+    def _is_conflict(ex):
+        return (ex.get("meta") or {}).get("reason", "").startswith("ambiguous_pair_")
+
+    def _labels(ex):
+        return {m.get("label") for m in (ex.get("spans") or []) if isinstance(m, dict)}
+
+    # 1) negative (first)
+    neg = next((ex for ex in fs if _is_neg(ex)), None)
+    # 2) prototypes: prefer meta.reason starting with 'prototype_clean', else 'per_label_top'
+    protos = {}
+    for lab in LABELS:
+        # best candidate for this label
+        cand = None
+        for ex in fs:
+            if lab in _labels(ex):
+                r = (ex.get("meta") or {}).get("reason", "")
+                if r.startswith("prototype_clean"):
+                    cand = ex
+                    break
+        if cand is None:
+            for ex in fs:
+                if lab in _labels(ex):
+                    r = (ex.get("meta") or {}).get("reason", "")
+                    if r == "per_label_top":
+                        cand = ex
+                        break
+        if cand:
+            protos[lab] = cand
+    proto_list = [protos[l] for l in LABELS if l in protos]
+    # 3) one conflict if present
+    conflict = next((ex for ex in fs if _is_conflict(ex)), None)
+    # stitch with dedup by object id
+    out, seen = [], set()
+
+    def add(x):
+        if x is None:
+            return
+        key = id(x)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(x)
+
+    add(neg)
+    for ex in proto_list:
+        add(ex)
+    add(conflict)
+    # fallback: if we still have < 6, append remaining examples in original order
+    for ex in fs:
+        add(ex)
+        if len(out) >= 8:
+            break
+    return out
+
+
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
@@ -1324,6 +1403,18 @@ def main():
     ap.add_argument("--max-tokens-s2", type=int, default=900)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--sc-temperature", type=float, default=0.7)
+    ap.add_argument(
+        "--art-dir",
+        type=str,
+        default=None,
+        help="Folder with prompt artifacts (best_fewshot_examples.json, priors_prompt.json, fewshot_policy.json). If omitted, falls back to --eda-root.",
+    )
+    ap.add_argument(
+        "--s2-self-consistency",
+        type=int,
+        default=None,
+        help="Override scN from --techniques (e.g., sc5). If set, uses this value for all techniques.",
+    )
     ap.add_argument("--s1-iou", type=float, default=0.5)
     ap.add_argument("--out-root", default="runs/joint_llm")
     ap.add_argument(
@@ -1375,6 +1466,8 @@ def main():
     s1_shots = []
     s2_shots = []
     boundary = ""
+    # Prefer --art-dir if present; else fallback to --eda-root
+    art_dir = None
     if args.eda_root:
         eda = pathlib.Path(args.eda_root)
         print(f"Loading EDA artifacts from: {eda}")
@@ -1394,6 +1487,16 @@ def main():
             s1_shots = (prompt_arts.get("fewshot_bank") or {}).get("s1", [])[:6]
         if not s2_shots:
             s2_shots = (prompt_arts.get("fewshot_bank") or {}).get("s2", [])[:8]
+        art_dir = eda
+    if args.art_dir:
+        art_dir = pathlib.Path(args.art_dir)
+        if art_dir.exists():
+            # refresh artifacts from explicit art_dir if given
+            prompt_arts = _load_prompt_artifacts(art_dir)
+            if not s1_shots:
+                s1_shots = (prompt_arts.get("fewshot_bank") or {}).get("s1", [])[:6]
+            if not s2_shots:
+                s2_shots = (prompt_arts.get("fewshot_bank") or {}).get("s2", [])[:8]
 
     # Data
     rows_s1 = list(read_jsonl(args.test_file_s1))
@@ -1407,34 +1510,51 @@ def main():
     id2doc_s2 = {(r.get("_id") or r.get("doc_id")): r for r in rows_s2}
 
     techniques = [t.strip() for t in args.techniques.split(",") if t.strip()]
+    # --- prompt builders (Sonnet 4.5 XML) ---
+    # Extract priors + conflict pairs from artifacts (if present)
+    priors = prompt_arts.get("priors_prompt") or {}
+    policy_json = prompt_arts.get("fewshot_policy") or {}
+    ambiguous_pairs = []
+    try:
+        cp = (policy_json.get("targets") or {}).get("ambiguous_pairs_top2") or []
+        ambiguous_pairs = [
+            tuple(sorted(p)) for p in cp if isinstance(p, (list, tuple)) and len(p) == 2
+        ]
+    except Exception:
+        ambiguous_pairs = [("Action", "Effect"), ("Actor", "Victim")]
+
     for tech in techniques:
+        print(f"\n=== JOINT S1→S2 :: {tech} ===")
+
+        # per-tech flags (must be inside the loop)
         has_fs = "fs" in tech
         has_neg = "neg" in tech
-        use_cot = "cot" in tech
+        use_cot = (
+            "cot" in tech
+        )  # kept for compatibility; builders already structure reasoning via <thinking>
         use_boundary = "boundary" in tech
         use_policy = "policy" in tech
         sc_match = re.search(r"sc(\d+)", tech)
         sc_n = int(sc_match.group(1)) if sc_match else 1
+        if isinstance(args.s2_self_consistency, int) and args.s2_self_consistency >= 1:
+            sc_n = args.s2_self_consistency
 
-    if has_fs:
-        s1_shots = load_fewshots(eda, "s1", max_n=6)
-        s2_shots = load_fewshots(eda, "s2", max_n=8)
-        if has_neg:
+        # few-shots (per-tech, with optional negatives)
+        fs_s1 = s1_shots[:] if (has_fs and s1_shots) else []
+        fs_s2 = s2_shots[:] if (has_fs and s2_shots) else []
+        if has_fs and has_neg and prompt_arts:
             s1_neg = [
                 ex
-                for ex in prompt_arts.get("fewshot_bank", {}).get("s1", [])
+                for ex in (prompt_arts.get("fewshot_bank") or {}).get("s1", [])
                 if ex.get("markers") == []
             ][:1]
             s2_neg = [
                 ex
-                for ex in prompt_arts.get("fewshot_bank", {}).get("s2", [])
+                for ex in (prompt_arts.get("fewshot_bank") or {}).get("s2", [])
                 if ex.get("gold", {}).get("label") == "non"
             ][:1]
-            s1_shots += s1_neg
-            s2_shots += s2_neg
-
-    for tech in techniques:
-        print(f"\n=== JOINT S1→S2 :: {tech} ===")
+            fs_s1 += s1_neg
+            fs_s2 += s2_neg
 
         tech_dir = pathlib.Path(args.out_root) / tech
         (tech_dir / "s1").mkdir(parents=True, exist_ok=True)
@@ -1504,33 +1624,35 @@ def main():
             _id = rec.get("_id") or rec.get("doc_id")
             txt = rec.get("text", "")
 
-            # ensure fs and zs are mutually exclusive
-            use_fs = "fs" in tech
-            use_zs = "zs" in tech
-            if use_fs and not use_zs and s1_shots:
-                # pick a balanced subset per prompt, e.g., 6
-                fewshots_s1 = _pick_balanced_s1_fewshots(
-                    s1_shots, k=min(6, len(s1_shots))
-                )
-            else:
-                fewshots_s1 = []
-
-            use_fs = "fs" in tech and "zs" not in tech
-            fewshots_s1 = s1_shots if (use_fs and s1_shots) else []
-            if use_fs and not s1_shots:
-                logging.warning(
-                    "[S1] fs requested but no fewshots loaded; falling back to zero-shot."
-                )
-
-            sys_blocks, user_block, n_samples, temp = s1_prompt(
-                txt,
-                policy=s1_policy if use_policy else "",
-                fewshots=fewshots_s1,
-                boundary_note=boundary if use_boundary else "",
-                tech=tech,
-                prompt_arts=prompt_arts if prompt_arts else None,
+            # === New Sonnet 4.5 prompt (XML + <thinking>/<answer>) ===
+            # We do n_samples=1 for S1 to keep spans deterministic
+            fewshots_s1 = (
+                _pick_balanced_s1_fewshots(fs_s1, k=min(8, len(fs_s1))) if fs_s1 else []
             )
-            temp = args.sc_temperature if n_samples > 1 else args.temperature
+            # reorder: negative → one prototype per label → one conflict (if available)
+            fewshots_s1 = _order_s1_fewshots(fewshots_s1)
+            s1_system = build_s1_system(
+                priors=priors,
+                conflict_pairs=ambiguous_pairs,
+                boundary_note=(boundary if use_boundary else None),
+                policy_text=(s1_policy if use_policy else None),
+                include_cot=use_cot,
+            )
+            # (optional) assert sections exist for safety
+            if (
+                "<offset_scope>" not in s1_system
+                or "<forbidden_output>" not in s1_system
+            ):
+                logging.warning("[S1] system prompt missing offset/forbidden sections.")
+            s1_user = build_s1_user(
+                text_input=txt,
+                s1_fewshots=fewshots_s1,
+                include_cot=use_cot,
+            )
+            sys_blocks = [s1_system]
+            user_block = s1_user
+            n_samples = 1
+            temp = args.temperature
             # Save/print prompts per policy
             if args.save_prompts == "all" or (
                 args.save_prompts == "sample" and saved_s1 < 3
@@ -1665,23 +1787,24 @@ def main():
             txt = doc2.get("text", "")
             # use S1 markers if present for the same doc_id
             mks = id2markers.get(_id, [])
-            markers_json = json.dumps(mks, ensure_ascii=False)
 
-            if use_fs and not use_zs and s2_shots:
-                fewshots_s2 = _pick_balanced_s2_fewshots(
-                    s2_shots, k=min(8, len(s2_shots))
-                )
-            else:
-                fewshots_s2 = []
-
-            sys_blocks, user_block, n_samples, temp = s2_prompt_with_markers(
-                txt,
-                policy=s2_policy if use_policy else "",
-                fewshots=fewshots_s2,
-                tech=tech,
-                markers_json=markers_json,
-                prompt_arts=prompt_arts if prompt_arts else None,
+            fewshots_s2 = (
+                _pick_balanced_s2_fewshots(fs_s2, k=min(8, len(fs_s2))) if fs_s2 else []
             )
+            s2_system = build_s2_system(
+                policy_text=(s2_policy if use_policy else None),
+                include_cot=use_cot,
+            )
+            s2_user = build_s2_user(
+                text_input=txt,
+                s1_output=mks,
+                s2_fewshots=fewshots_s2,
+                include_cot=use_cot,
+            )
+            sys_blocks = [s2_system]
+            user_block = s2_user
+            # self-consistency from scN or --s2-self-consistency
+            n_samples = max(1, int(sc_n))
             temp = args.sc_temperature if n_samples > 1 else args.temperature
             if args.save_prompts == "all" or (
                 args.save_prompts == "sample" and saved_s2 < 3
