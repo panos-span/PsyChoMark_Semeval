@@ -23,7 +23,7 @@ import random
 import re
 import sys
 import zipfile
-from collections import defaultdict, Counter
+from collections import defaultdict
 from typing import Any, Dict, List
 
 # --- Make repo root importable ---
@@ -37,18 +37,29 @@ from src.psycomark.llm.bedrock_chat import Chat
 from starter.prompt_sweep_joint import (  # noqa: E402
     _load_prompt_artifacts,
     _snapshot_artifacts,
-    s1_prompt,
-    s2_prompt_with_markers,
     postprocess_s1_spans,
     read_jsonl,
     write_jsonl,
     _save_prompt_bundle,
+    _tokenize_eval,
+    _valid_span,
+    _snap_to_tokens,
+    _prior_dist,
     _save_prompt_meta,
     _to_codabench_s1,
     _pick_balanced_s1_fewshots,
     _pick_balanced_s2_fewshots,
-    tune_threshold_dev,
+    tune_threshold_dev
 )
+
+from starter.prompt_builder import (  # noqa: E402
+    build_s1_system,
+    build_s1_user,
+    build_s2_system,
+    build_s2_user,
+)
+
+
 
 # ---------- tiny helpers you asked to include locally ----------
 _LIST_RE = re.compile(r"\[.*?\]", re.S)
@@ -98,6 +109,94 @@ _CANON_LABEL = {
     k.lower(): k for k in ["Actor", "Action", "Effect", "Victim", "Evidence"]
 }
 
+def _all_occurrences(haystack: str, needle: str):
+    if not needle:
+        return
+    i = 0
+    while True:
+        i = haystack.find(needle, i)
+        if i == -1:
+            break
+        yield i
+        i += 1
+
+def align_text_span(item: dict, text: str, priors: dict | None):
+    lab = (item.get("label") or "").strip()
+    raw = (item.get("text") or "").strip()
+    if not lab or not raw or not text:
+        return None
+
+    # exact matches for substring
+    cand_starts = list(_all_occurrences(text, raw))
+    if not cand_starts:
+        # legacy fallback if model accidentally emitted start/end
+        s = item.get("start")
+        e = item.get("end")
+        if isinstance(s, int) and isinstance(e, int) and e > s:
+            toks = _tokenize_eval(text)
+            snapped = _snap_to_tokens({"label": lab, "start": s, "end": e}, toks)
+            return snapped if snapped and _valid_span(text, snapped["start"], snapped["end"]) else None
+        return None
+
+    # pick candidate: prefer provided start hint if reasonable, else prior-closest
+    hinted = item.get("start")
+    if isinstance(hinted, int):
+        chosen = min(cand_starts, key=lambda s: abs(s - hinted))
+    else:
+        L = len(text)
+        def prior_cost(s0):
+            return _prior_dist(priors or {}, lab, s0, s0 + len(raw), L)
+        chosen = min(cand_starts, key=prior_cost)
+
+    start, end = chosen, chosen + len(raw)
+    toks = _tokenize_eval(text)
+    snapped = _snap_to_tokens({"label": lab, "start": start, "end": end}, toks)
+    if not snapped or not _valid_span(text, snapped["start"], snapped["end"]):
+        return None
+    return snapped  # {"label","start","end"}
+
+def align_and_normalize_s1(model_items: list[dict], text: str, priors: dict | None):
+    """
+    Accepts items from <answer>:
+      - new schema: {"label","text",["start"]}
+      - legacy: {"label","start","end"} or {"type","startIndex","endIndex"}
+    Returns [{"label","start","end"}], snapped to token boundaries.
+    """
+    if not isinstance(model_items, list):
+        return []
+    out = []
+
+    # Preferred: text-based items
+    for m in model_items:
+        if m.get("text"):
+            a = align_text_span(m, text, priors)
+            if a:
+                out.append(a)
+
+    # Fallback: legacy spans if no text fields made it through
+    if not out:
+        for m in model_items:
+            lab = (m.get("label") or m.get("type") or "").strip()
+            s = m.get("start", m.get("startIndex"))
+            e = m.get("end", m.get("endIndex"))
+            try:
+                s, e = int(s), int(e)
+            except Exception:
+                continue
+            if e <= s:
+                continue
+            toks = _tokenize_eval(text)
+            a = _snap_to_tokens({"label": lab, "start": s, "end": e}, toks)
+            if a and _valid_span(text, a["start"], a["end"]):
+                out.append(a)
+
+    # Canonicalize
+    return [
+        {"label": m["label"], "start": int(m["start"]), "end": int(m["end"])}
+        for m in out
+        if m.get("end", 0) > m.get("start", 0)
+    ]
+
 
 def clip_and_validate(spans: list, text: str) -> list:
     """
@@ -123,6 +222,188 @@ def clip_and_validate(spans: list, text: str) -> list:
             continue
         out.append({"label": lab, "start": s, "end": e})
     return out
+
+def align_text_markers_to_spans(doc_text: str, items: List[dict], case_sensitive: bool = False) -> List[dict]:
+    """
+    Convert [{"label":..., "text":...}] to [{"label":..., "start":int, "end":int}]
+    by exact substring matching (prefers non-overlapping, left-to-right).
+    - If items already have start/end, they’re passed through.
+    - If multiple matches exist, choose the first non-overlapping occurrence.
+    """
+    if not doc_text or not items:
+        return []
+    spans = []
+    hay = doc_text if case_sensitive else doc_text.lower()
+
+    # track used character positions to avoid overlaps
+    used = [False] * len(doc_text)
+
+    def _place_span(lab: str, s: int, e: int):
+        if e <= s: 
+            return False
+        # avoid overlaps
+        if any(used[i] for i in range(s, e)):
+            return False
+        spans.append({"label": lab, "start": s, "end": e})
+        for i in range(s, e):
+            used[i] = True
+        return True
+
+    for it in items:
+        lab = (it.get("label") or it.get("type") or "").strip()
+        if not lab:
+            continue
+
+        # already a span? keep it (we'll still snap/dedup downstream)
+        if "start" in it and "end" in it:
+            try:
+                s, e = int(it["start"]), int(it["end"])
+                _place_span(lab, s, e)
+            except Exception:
+                pass
+            continue
+
+        txt = (it.get("text") or "").strip()
+        if not txt:
+            continue
+
+        needle = txt if case_sensitive else txt.lower()
+        pos = 0
+        placed = False
+        while True:
+            idx = hay.find(needle, pos)
+            if idx < 0:
+                break
+            j = idx + len(needle)
+            if _place_span(lab, idx, j):
+                placed = True
+                break
+            pos = idx + 1
+
+        # (optional) fallback: try case-sensitive if insensitive failed
+        if not placed and not case_sensitive:
+            pos = 0
+            while True:
+                idx = doc_text.find(txt, pos)
+                if idx < 0:
+                    break
+                j = idx + len(txt)
+                if _place_span(lab, idx, j):
+                    break
+                pos = idx + 1
+
+    return spans
+
+
+from collections import Counter
+import random, json, re, logging
+
+def run_s2_self_consistent(
+    *,
+    text: str,
+    markers: list,
+    fewshots_pool: list,
+    tech: str,
+    policy_text: str | None,
+    prompt_arts: dict | None,
+    model_id: str | None,
+    region: str | None,
+    max_tokens: int,
+    base_temperature: float,
+    sc_temperature: float,
+    sc_runs: int,
+):
+    """
+    Self-consistency for S2 using your XML builders:
+      - Rebuild prompts each run (shuffle few-shot order)
+      - Use sc_temperature only if sc_runs > 1
+      - Majority vote on labels; averaged probs as tie-break
+    Returns: (final_label, avg_p_con, avg_p_non, first_sys_prompt, first_user_prompt)
+    """
+    temp = sc_temperature if sc_runs > 1 else base_temperature
+
+    preds, label_votes = [], []
+    first_sys = first_user = None
+
+    for r in range(max(1, sc_runs)):
+        # shuffle few-shots per run for diversity
+        fs = fewshots_pool[:] if fewshots_pool else []
+        if fs:
+            random.shuffle(fs)
+
+        # Build XML prompts for this run
+        sys_prompt = build_s2_system(
+            policy_text=(policy_text or None),
+            include_cot=("cot" in tech),
+            boundary_note=None,             # or pass your boundary if desired for S2
+            prompt_arts=(prompt_arts or None),
+        )
+        user_prompt = build_s2_user(
+            text_input=text,
+            s1_output=markers,              # list; builder will json.dumps internally
+            s2_fewshots=fs,
+            include_cot=("cot" in tech),
+        )
+
+        if r == 0:
+            first_sys, first_user = sys_prompt, user_prompt
+
+        # Bedrock call (Chat API)
+        chat = Chat(
+            model_id=(model_id or Chat.SONNET_45_MODEL_ID),
+            region=region,
+            max_tokens=max_tokens,
+            temperature=temp,
+        )
+        chat.add_system(sys_prompt)
+        chat.add_user(user_prompt)
+
+        try:
+            out = chat.generate()
+            m = re.search(r"\{.*\}", out, re.S)  # robust single-JSON capture
+            js = json.loads(m.group(0)) if m else {"label": "non", "confidence": 0.55}
+        except Exception as e:
+            logging.warning(f"[S2] generate() failed -> default non: {e}")
+            js = {"label": "non", "confidence": 0.55}
+
+        # Coerce to {"label","p_conspiracy","p_non"}
+        label = (js.get("label") or "non").strip().lower()
+        def _flt(x):
+            try: return float(x)
+            except Exception: return None
+        p_con = _flt(js.get("p_conspiracy"))
+        p_non = _flt(js.get("p_non"))
+
+        if p_con is None or p_non is None:
+            conf = _flt(js.get("confidence"))
+            if conf is None:
+                conf = 0.9 if label == "conspiracy" else 0.1
+            if label == "conspiracy":
+                p_con, p_non = conf, 1.0 - conf
+            else:
+                p_con, p_non = 1.0 - conf, conf
+
+        s = p_con + p_non
+        if s <= 0:
+            p_con = p_non = 0.5
+        else:
+            p_con, p_non = p_con / s, p_non / s
+
+        if label not in ("conspiracy", "non"):
+            label = "conspiracy" if p_con >= p_non else "non"
+
+        preds.append({"label": label, "p_conspiracy": p_con, "p_non": p_non})
+        label_votes.append(label)
+
+    # Majority vote first
+    maj_label, maj_count = Counter(label_votes).most_common(1)[0]
+    avg_con = sum(p["p_conspiracy"] for p in preds) / len(preds)
+    avg_non = sum(p["p_non"] for p in preds) / len(preds)
+    tot = max(1e-9, avg_con + avg_non)
+    avg_con, avg_non = avg_con / tot, avg_non / tot
+
+    final_label = maj_label if maj_count > (len(preds) / 2.0) else ("conspiracy" if avg_con >= avg_non else "non")
+    return final_label, avg_con, avg_non, first_sys, first_user
 
 
 # ---------- main ----------
@@ -290,14 +571,20 @@ def main():
             )
 
             # Build prompts (XML + boundary/policy/priors loaded in s1_prompt via prompt_arts)
-            sys_blocks, user_block, n_samples, temp = s1_prompt(
-                txt,
-                policy=(s1_policy if use_policy else ""),
-                fewshots=fewshots_s1 if has_fs else [],
-                boundary_note=(boundary if use_boundary else ""),
-                tech=tech,
-                prompt_arts=prompt_arts or None,
+            s1_system = build_s1_system(
+                priors=(prompt_arts.get("priors_prompt") or {}),
+                conflict_pairs=[tuple(p) for p in (prompt_arts.get("conflicts") or {}).get("pairs", [])],
+                boundary_note=(boundary if use_boundary else None),
+                policy_text=(s1_policy if use_policy else None),
+                include_cot=use_cot,
             )
+            s1_user = build_s1_user(
+                text_input=txt,
+                s1_fewshots=(fewshots_s1 if has_fs else []),
+                include_cot=use_cot,
+            )
+            sys_blocks, user_block = [s1_system], s1_user
+            n_samples, temp = 1, args.temperature
 
             # Preview/save
             if args.save_prompts == "all" or (
@@ -327,8 +614,8 @@ def main():
 
             try:
                 s1_raw = chat_s1.generate()
-                spans_raw = list_json_extract(s1_raw)  # robust array extraction
-                spans = clip_and_validate(spans_raw, txt)  # schema+bounds
+                arr = list_json_extract(s1_raw) or []
+                spans = align_and_normalize_s1(arr, txt, priors=(prompt_arts.get("priors_prompt") or {}))
             except Exception as e:
                 logging.warning(f"[S1] generate() failed -> empty spans: {e}")
                 spans = []
@@ -390,121 +677,124 @@ def main():
         )
 
         # ===== S2 =====
-        s2_out_rows = []
-        s2_prob_rows = []
+        s2_out_rows, s2_prob_rows = [], []
         saved_s2 = 0
+        printed_s2_preview = False
 
         for _id, doc2 in id2doc_s2.items():
             txt = (doc2.get("text") or "").strip()
             mks = id2markers.get(_id, [])
 
-            fewshots_s2 = (
-                _pick_balanced_s2_fewshots(fs_s2, k=min(8, len(fs_s2))) if fs_s2 else []
-            )
+            # pick + balance few-shots once per doc (the per-run shuffle happens inside SC)
+            fewshots_s2 = _pick_balanced_s2_fewshots(fs_s2, k=min(8, len(fs_s2))) if fs_s2 else []
 
-            sys_blocks, user_block, n_samples, temp = s2_prompt_with_markers(
-                doc_text=txt,
-                policy=(s2_policy if use_policy else ""),
-                fewshots=fewshots_s2,
+            final_label, avg_con, avg_non, first_sys, first_user = run_s2_self_consistent(
+                text=txt,
+                markers=mks,
+                fewshots_pool=fewshots_s2,
                 tech=tech,
-                markers_json=json.dumps(mks, ensure_ascii=False),
-                prompt_arts=prompt_arts or None,
+                policy_text=(s2_policy if use_policy else None),
+                prompt_arts=prompt_arts,
+                model_id=(model_id or Chat.SONNET_45_MODEL_ID),
+                region=region,
+                max_tokens=args.max_tokens_s2,
+                base_temperature=args.temperature,
+                sc_temperature=args.sc_temperature,
+                sc_runs=max(1, sc_n),
             )
 
-            if args.save_prompts == "all" or (
-                args.save_prompts == "sample" and saved_s2 < 3
-            ):
-                _save_prompt_bundle(tech_dir, "s2", str(_id), sys_blocks, user_block)
+            # Save/preview prompts for first few docs
+            if (args.save_prompts == "all") or (args.save_prompts == "sample" and saved_s2 < 3):
+                _save_prompt_bundle(tech_dir, "s2", str(_id), [first_sys], first_user)
                 saved_s2 += 1
             if args.print_prompts_preview and not printed_s2_preview:
-                print(
-                    "[S2 prompt preview]\nSYSTEM:\n"
-                    + "\n\n---\n\n".join(sys_blocks)
-                    + "\n\nUSER:\n"
-                    + user_block
-                )
+                print("[S2 prompt preview]\nSYSTEM:\n" + first_sys + "\n\nUSER:\n" + first_user)
                 printed_s2_preview = True
 
+            s2_out_rows.append({"_id": _id, "conspiracy": ("Yes" if final_label == "conspiracy" else "No")})
+            s2_prob_rows.append({"_id": _id, "label": final_label,
+                                "p_conspiracy": round(avg_con, 6), "p_non": round(avg_non, 6)})
+
             # self-consistency
-            runs = max(1, int(sc_n))
-            temp2 = args.sc_temperature if runs > 1 else args.temperature
-            preds = []
+            #runs = max(1, int(sc_n))
+            #temp2 = args.sc_temperature if runs > 1 else args.temperature
+            #preds, label_votes = [], []
 
-            for _ in range(runs):
-                chat_s2 = Chat(
-                    model_id=(args.model_id or Chat.SONNET_45_MODEL_ID),
-                    region=args.region,
-                    max_tokens=args.max_tokens_s2,
-                    temperature=temp2,
-                )
-                for s in sys_blocks:
-                    chat_s2.add_system(s)
-                chat_s2.add_user(user_block)
-                try:
-                    out = chat_s2.generate()
-                    # permissive JSON object extraction
-                    m = re.search(r"\{.*\}", out, re.S)
-                    js = (
-                        json.loads(m.group(0))
-                        if m
-                        else {"label": "non", "confidence": 0.55}
-                    )
-                except Exception as e:
-                    logging.warning(f"[S2] generate() failed -> default non: {e}")
-                    js = {"label": "non", "confidence": 0.55}
-
-                # coerce probabilities + label
-                label = (js.get("label") or "non").strip().lower()
-                p_con = js.get("p_conspiracy")
-                p_non = js.get("p_non")
-
-                def _flt(x):
-                    try:
-                        return float(x)
-                    except Exception:
-                        return None
-
-                p_con = _flt(p_con)
-                p_non = _flt(p_non)
-                if p_con is None or p_non is None:
-                    conf = _flt(js.get("confidence")) or (
-                        0.9 if label == "conspiracy" else 0.1
-                    )
-                    if label == "conspiracy":
-                        p_con, p_non = conf, 1.0 - conf
-                    else:
-                        p_con, p_non = 1.0 - conf, conf
-                s = p_con + p_non
-                if s <= 0:
-                    p_con = p_non = 0.5
-                else:
-                    p_con, p_non = p_con / s, p_non / s
-                if label not in ("conspiracy", "non"):
-                    label = "conspiracy" if p_con >= p_non else "non"
-
-                preds.append({"label": label, "p_conspiracy": p_con, "p_non": p_non})
+            #for _ in range(runs):
+            #    chat_s2 = Chat(
+            #        model_id=(model_id or Chat.SONNET_45_MODEL_ID),
+            #        region=region,
+            #        max_tokens=args.max_tokens_s2,
+            #        temperature=temp2,
+            #    )
+            #    for s in sys_blocks:
+            #        chat_s2.add_system(s)
+            #    chat_s2.add_user(user_block)
+            #    try:
+            #        out = chat_s2.generate()
+            #        # permissive JSON object extraction
+            #        m = re.search(r"\{.*\}", out, re.S)
+            #        js = (
+            #            json.loads(m.group(0))
+            #            if m
+            #            else {"label": "non", "confidence": 0.55}
+            #        )
+            #    except Exception as e:
+            #        logging.warning(f"[S2] generate() failed -> default non: {e}")
+            #        js = {"label": "non", "confidence": 0.55}
+            #
+            #    # coerce probabilities + label
+            #    label = (js.get("label") or "non").strip().lower()
+            #    p_con = js.get("p_conspiracy")
+            #    p_non = js.get("p_non")
+            #
+            #    def _flt(x):
+            #        try:
+            #            return float(x)
+            #        except Exception:
+            #            return None
+            #
+            #    p_con = _flt(p_con)
+            #    p_non = _flt(p_non)
+            #    if p_con is None or p_non is None:
+            #        conf = _flt(js.get("confidence")) or (
+            #            0.9 if label == "conspiracy" else 0.1
+            #        )
+            #        if label == "conspiracy":
+            #            p_con, p_non = conf, 1.0 - conf
+            #        else:
+            #            p_con, p_non = 1.0 - conf, conf
+            #    s = p_con + p_non
+            #    if s <= 0:
+            #        p_con = p_non = 0.5
+            #    else:
+            #        p_con, p_non = p_con / s, p_non / s
+            #    if label not in ("conspiracy", "non"):
+            #        label = "conspiracy" if p_con >= p_non else "non"
+            #
+            #    preds.append({"label": label, "p_conspiracy": p_con, "p_non": p_non})
 
             # average probs; final label = argmax
-            avg_con = sum(p["p_conspiracy"] for p in preds) / len(preds)
-            avg_non = sum(p["p_non"] for p in preds) / len(preds)
-            tot = max(1e-9, avg_con + avg_non)
-            avg_con, avg_non = avg_con / tot, avg_non / tot
-            final_label = "conspiracy" if avg_con >= avg_non else "non"
+            #avg_con = sum(p["p_conspiracy"] for p in preds) / len(preds)
+            #avg_non = sum(p["p_non"] for p in preds) / len(preds)
+            #tot = max(1e-9, avg_con + avg_non)
+            #avg_con, avg_non = avg_con / tot, avg_non / tot
+            #final_label = "conspiracy" if avg_con >= avg_non else "non"
 
-            s2_out_rows.append(
-                {
-                    "_id": _id,
-                    "conspiracy": ("Yes" if final_label == "conspiracy" else "No"),
-                }
-            )
-            s2_prob_rows.append(
-                {
-                    "_id": _id,
-                    "label": final_label,
-                    "p_conspiracy": round(avg_con, 6),
-                    "p_non": round(avg_non, 6),
-                }
-            )
+            #s2_out_rows.append(
+            #    {
+            #        "_id": _id,
+            #        "conspiracy": ("Yes" if final_label == "conspiracy" else "No"),
+            #    }
+            #)
+            #s2_prob_rows.append(
+            #    {
+            #        "_id": _id,
+            #        "label": final_label,
+            #        "p_conspiracy": round(avg_con, 6),
+            #        "p_non": round(avg_non, 6),
+            #    }
+            #)
 
         # write raw probs, then choose threshold
         probs_path = tech_dir / "s2" / "probs.jsonl"
