@@ -14,117 +14,71 @@ def load_json(path: Path, default):
 
 
 # --------- S1 builders ----------
-def build_s1_system(
-    priors: Dict[str, Any],
-    conflict_pairs: List[Tuple[str, str]],
-    boundary_note: str | None = None,
-    policy_text: str | None = None,
-    include_cot: bool = True,
-) -> str:
-    priors_lines = []
-    for label, d in (priors or {}).items():
-        q90 = d.get("q90_len")
-        mode_pos = d.get("mode_pos")
-        if isinstance(q90, (int, float)) and isinstance(mode_pos, (int, float)):
-            priors_lines.append(
-                f"- {label}: q90≈{int(q90)} chars; often starts near {int(round(mode_pos*100))}% of the text."
-            )
-    priors_block = (
-        "\n".join(priors_lines)
-        if priors_lines
-        else "- (insufficient priors; rely on rules)"
+def build_s1_system(priors: Dict[str, Any], conflicts: List[List[str]]) -> str:
+    """
+    Builds the streamlined and de-duplicated system prompt for S1 (Marker Extraction).
+    This replaces your current complex system prompt.
+    """
+    priors_str = ""
+    # Consolidate all priors into a single, clear list from your artifacts
+    for label, data in priors.items():
+        q90 = data.get("q90_len")
+        mode_pos = data.get("mode_pos")
+        if q90 is not None and mode_pos is not None:
+            priors_str += f"- **{label}**: Typical span length ≤ {q90:.0f} chars; often starts near {mode_pos*100:.0f}% of the text.\n"
+
+    conflict_pairs_str = (
+        ", ".join([f"{p}-{p[1]}" for p in conflicts])
+        if conflicts
+        else "Action-Effect and Actor-Victim"
     )
 
-    cps = [f"{a}-{b}" for (a, b) in conflict_pairs] if conflict_pairs else []
-    conflicts_block = ", ".join(cps) if cps else "Action-Effect, Actor-Victim"
-
-    boundary_block = (
-        f"<boundary_note>\n{boundary_note.strip()}\n</boundary_note>\n"
-        if boundary_note
-        else ""
-    )
-    policy_block = (
-        f"<policy>\n{policy_text.strip()}\n</policy>\n" if policy_text else ""
-    )
-    cot_workflow = (
-        "<workflow>\n"
-        "1) Do your full analysis inside <thinking>.\n"
-        "2) Then output ONLY the final JSON inside <answer>.\n"
-        "</workflow>\n"
-        if include_cot
-        else "<workflow>\n"
-        "Output ONLY the final JSON inside <answer>. Do not include reasoning.\n"
-        "</workflow>\n"
-    )
-
-    return f"""
-<role>
-You are a precision annotator for SemEval-2026 Task 10 (PsyCoMark), Subtask 1.
+    return f"""<role>
+You are a precision-focused annotator for the SemEval-2026 PsyCoMark Task 10, Subtask 1. Your sole function is to extract psycholinguistic markers from a given text according to a strict schema and a set of rules.
 </role>
 
 <task_definition>
-Extract all character spans for: Actor, Action, Effect, Victim, Evidence.
-Return STRICT JSON ONLY inside <answer>.
+Extract all character spans for the five labels: Actor, Action, Effect, Victim, and Evidence.
 </task_definition>
 
 <marker_definitions>
-- Actor: agent initiating/controlling events.
-- Action: deliberate verb phrase (exclude outcomes/goals).
-- Effect: consequence/goal/purpose of the action.
-- Victim: entity targeted/harmed.
-- Evidence: explicit citation/link/quote/attribution.
+- **Actor**: The agent (person/group) portrayed as initiating, planning, or controlling events.
+- **Action**: The deliberate action expressed as a VERB PHRASE (e.g., "hiding information"). Exclude outcomes or goals.
+- **Effect**: The consequence, intended goal, or purpose of the action (e.g., "to control the population").
+- **Victim**: The entity harmed or targeted by the action.
+- **Evidence**: Explicitly cited support, such as links, quotes, named sources, or attributions (e.g., "according to the report...").
 </marker_definitions>
 
 <rules>
+<output_format>
+You MUST output ONLY a valid JSON list of objects inside <answer> tags. Each object must contain three keys: "label", "start", and "end". Do not include any other text or explanations. If NO markers are present, output an empty JSON array.
+</output_format>
+
 <span_boundaries>
-- 0-indexed, end-exclusive offsets.
-- Tight spans: exclude leading/trailing whitespace and punctuation.
-- Prefer minimal distinct spans; Evidence may overlap others.
+- Spans must be exact character offsets (0-indexed, end-exclusive).
+- Spans must be tight. EXCLUDE leading/trailing whitespace and trailing punctuation.
+- Minimum span length: 3 characters. Maximum span length: 90 characters (Evidence may be up to 120).
 </span_boundaries>
 
 <overlap_policy>
-- Ambiguous pairs: {conflicts_block}.
-- Action vs Effect: split verb phrase (Action) from purpose (Effect).
-- Actor vs Victim: same entity can appear in both roles in different mentions; keep spans minimal.
+- Pay special attention to resolving overlaps between common ambiguous pairs like {conflict_pairs_str}.
+- **Action vs. Effect**: If a verb phrase contains a purpose, split them. The core action is 'Action'; the purpose/goal is 'Effect'.
+- **Actor vs. Victim**: An entity can be both, but spans should be minimal and role-specific for each mention.
+- **Evidence**: Can overlap with any other marker type.
 </overlap_policy>
+</rules>
 
 <statistical_priors>
-Use as tie-breakers when ambiguous:
-{priors_block}
+Use these statistical priors as tie-breakers when a span is ambiguous:
+{priors_str}
+If Action and Effect overlap heavily (IoU ≥ 0.6), prefer the label whose start position is closer to its prior.
 </statistical_priors>
-{boundary_block}{policy_block}
 
-<offset_scope>
-- Compute start/end over EXACTLY the characters inside &lt;text_to_analyze&gt;, 0-indexed, end-exclusive.
-- Do NOT rebase or normalize quotes or whitespace. Use the raw text offsets.
-</offset_scope>
-
-<span_length_limits>
-- Minimum span length: 3 characters (after trimming).
-- Maximum span length: 90 characters. Evidence may reach 120 if it is a single explicit citation/quote.
-</span_length_limits>
-
-<evidence_quality>
-- Prefer explicit sources: URLs, quotations, “according to …”, named reports.
-- Avoid purely hedged claims (“apparently”, “maybe”, “people say”) unless accompanied by an explicit source.
-</evidence_quality>
-
-<negative_case>
-- If NO markers are present, output an empty JSON array [] in &lt;answer&gt;.
-</negative_case>
-
-<forbidden_output>
-- Do NOT output anything outside &lt;answer&gt;.
-- &lt;answer&gt; MUST be valid JSON: only keys "label","start","end". No trailing commas, comments, NaN/inf.
-</forbidden_output>
-
-<output_format>
-ONLY output a JSON array: [{{"label":"Actor|Action|Effect|Victim|Evidence","start":int,"end":int}}, ...]
-The JSON MUST be valid and contain no extra keys. No prose outside <answer>.
-</output_format>
-
-{cot_workflow}
-""".strip()
+<workflow>
+1. First, you will perform a step-by-step analysis of the text inside `<thinking>` tags. In this block, identify potential markers, note any overlaps, and explain how you are applying the rules and priors to resolve them.
+2. After your reasoning, you will generate the final, clean JSON output inside `<answer>` tags.
+</workflow>
+"""
 
 
 def build_s1_user(
@@ -159,34 +113,25 @@ def build_s1_user(
 
 
 # --------- S2 builders ----------
-# --- before: def build_s2_system() -> str:
-def build_s2_system(policy_text: str | None = None, include_cot: bool = True) -> str:
-    policy_block = (
-        f"<policy>\n{policy_text.strip()}\n</policy>\n" if policy_text else ""
-    )
-    cot_workflow = (
-        "<workflow>\n"
-        "1) You receive the original text and extracted S1 markers.\n"
-        "2) Analyze markers as evidence within <thinking> (narrative coherence, Actor-Action-Victim, intent/effect).\n"
-        '3) Output ONLY {"label":"...","rationale":"<=2 sentences"} inside <answer>.\n'
-        "</workflow>\n"
-        if include_cot
-        else "<workflow>\n"
-        'Output ONLY {"label":"...","rationale":"<=2 sentences"} inside <answer>. Do not include reasoning.\n'
-        "</workflow>\n"
-    )
-    return (
-        "<role>\n"
-        'You are an expert social scientist. Classify a Reddit text as "conspiracy", "non", or "cant_tell".\n'
-        "</role>\n\n"
-        "<label_definitions>\n"
-        "- conspiracy: alleges a harmful/illegal secret plan by powerful actors; narrative shows Actor+Action+Victim with intent/effect.\n"
-        "- non: no conspiracy allegation.\n"
-        "- cant_tell: insufficient or ambiguous evidence.\n"
-        "</label_definitions>\n\n"
-        f"{policy_block}"
-        f"{cot_workflow}"
-    ).strip()
+def build_s2_system() -> str:
+    """Builds the system prompt for S2, setting up the evidence-based reasoning task."""
+    return """<role>
+You are an expert social scientist specializing in the analysis of online discourse. Your task is to classify a Reddit submission statement as "conspiracy", "non", or "cant_tell" based on the text and a pre-computed analysis of its psycholinguistic markers.
+</role>
+
+<label_definitions>
+- **conspiracy**: The text alleges a secret plan by a powerful group that is harmful or illegal. The narrative is typically supported by claims of covert actions and specific actors.
+- **non**: The text does not contain conspiratorial allegations. It may be a normal news report, opinion, question, or unrelated story.
+- **cant_tell**: The text is too ambiguous, short, or lacks sufficient information to make a clear determination.
+</label_definitions>
+
+<workflow>
+1. You will be given the original text and a JSON list of psycholinguistic markers that were extracted from it.
+2. First, analyze the provided markers as evidence inside a `<thinking>` block. Consider their presence, density, and how they connect to form a narrative. A text with a clear Actor, Action, and Victim is a strong signal for a conspiracy. The absence of these markers is a strong signal for non-conspiracy.
+3. Based on your analysis of the markers in the context of the original text, make a final classification.
+4. Provide your final answer as a single JSON object inside an `<answer>` block: {"label": "...", "rationale": "..."}
+</workflow>
+"""
 
 
 def build_s2_user(
