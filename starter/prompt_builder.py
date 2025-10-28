@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 import json, re
 from pathlib import Path
-from typing import Any, Dict, List
 
 
 
@@ -56,166 +55,106 @@ def playbook_block() -> str:
 
 # TODO: Check the span extraction method if it is valid or if we should ask the LLM to handle it
 # --------- S1 builders ----------
-def build_s1_system(priors: Dict[str, Any], conflicts: List[List[str]], use_cot: bool) -> str:
-    """System prompt for S1 (Marker Extraction) with XML + two-pass thinking."""
-    # Priors summary (concise; no duplication elsewhere)
+def build_s1_system(priors: dict, conflicts: list[list[str]], use_cot: bool) -> str:
+    # format priors once
     priors_str = ""
-    for label, data in (priors or {}).items():
-        q90 = data.get("q90_len")
-        mode_pos = data.get("mode_pos")
-        if q90 is not None and mode_pos is not None:
-            priors_str += f"- {label}: typical length ≤ {q90:.0f} chars; often starts near {mode_pos*100:.0f}% of the text.\n"
+    for lab, d in (priors or {}).items():
+        q90 = d.get("q90_len"); pos = d.get("mode_pos")
+        if q90 is not None and pos is not None:
+            priors_str += f"- {lab}: typical length ≤ {q90:.0f} chars; often starts near {pos*100:.0f}% of text.\n"
 
-    # Conflict pairs text
-    if conflicts:
-        def _fmt(p): 
-            try:
-                return f"{p[0]}–{p[1]}"
-            except Exception:
-                return "Action–Effect"
-        conflict_pairs_str = ", ".join(_fmt(p) for p in conflicts if p)
-    else:
-        conflict_pairs_str = "Action–Effect, Actor–Victim"
+    conflict_pairs = ", ".join([f"{p[0]}–{p[1]}" for p in conflicts]) if conflicts else "Action–Effect; Actor–Victim"
 
-    # Optional CoT workflow
     workflow_block = ""
     if use_cot:
-        workflow_block = """
-<workflow>
-  <thinking>
-    <pass_a_candidate_scan>
-      - Actor: candidate agent nouns/phrases (incl. vague “they”/collectives).
-      - Action: candidate core verb phrases.
-      - Effect: candidate goals/purposes/results (e.g., ‘to/so that/in order to …’).
-      - Victim: candidate harmed/target entities.
-      - Evidence: candidate citations/quotes/links/attributions; self-sealing moves; cui bono; clichés.
-    </pass_a_candidate_scan>
+        workflow_block = """<workflow>
+<thinking>
+  <pass_a_candidate_scan>
+    - Actor: candidate agent nouns/phrases.
+    - Action: candidate core verb phrases.
+    - Effect: candidate goal/purpose/outcome phrases.
+    - Victim: candidate harmed/targeted entities.
+    - Evidence: candidate citations/quotes/links/attributions.
+  </pass_a_candidate_scan>
+  <pass_b_validation_and_refinement>
+    - Boundary: spans must be tight (no leading/trailing whitespace or punctuation).
+    - Overlap: resolve conflicts (esp. Action vs Effect) by splitting or choosing minimal, role-true spans. Actor vs Victim uses smallest role-specific mention.
+    - Priors: use statistical priors (length/position) as tie-breakers only.
+    - Quality: drop spans < 3 chars after trimming.
+    - Final check: if none remain, answer [].
+  </pass_b_validation_and_refinement>
+</thinking>
+</workflow>"""
 
-    <pass_b_validation_and_refinement>
-      - Apply boundary rules; keep substrings tight (no leading/trailing whitespace; no trailing punctuation).
-      - Resolve overlaps per <overlap_policy> (split Action vs Effect; smallest role-specific for Actor vs Victim).
-      - Use <statistical_priors> only as tie-breakers (never override clear semantics).
-      - Filter out substrings < 3 chars or vague claims lacking explicit lexical support.
-      - If nothing remains, final answer is [].
-    </pass_b_validation_and_refinement>
-  </thinking>
-  <answer>… JSON only …</answer>
-</workflow>
-""".strip()
-
-    return f"""
-<role>
-You are a precision-focused psycholinguistic analyst for SemEval-2026 PsyCoMark Task 10 (Subtask 1). Extract conspiratorial markers using their rhetorical functions and linguistic signals.
+    return f"""<role>
+You are a precision-focused annotator for SemEval-2026 PsyCoMark Task 10 (Subtask 1).
+Extract psycholinguistic markers with exact character offsets.
 </role>
 
-<task_definition>
-Extract all markers for: Actor, Action, Effect, Victim, Evidence.
-Return STRICT JSON only inside <answer>.
-</task_definition>
-
 <marker_definitions>
-  <marker name="Actor">
-    <function>Constructs a powerful, malevolent, often vague out-group (“Them”).</function>
-    <linguistic_signals>Depersonalized 3rd-person plural (“they”); abstract collective nouns (“elite”, “globalists”, “Big Pharma”, “deep state”).</linguistic_signals>
-  </marker>
-
-  <marker name="Victim">
-    <function>Constructs persecuted in-group (“Us”); fosters shared identity/grievance.</function>
-    <linguistic_signals>Inclusive 1st-person plural (“we”, “us”); collective/exclusive victimhood (“the people”, “patriots”, “our way of life”).</linguistic_signals>
-  </marker>
-
-  <marker name="Action">
-    <function>Frames events as intentional, malicious agency.</function>
-    <linguistic_signals>Verbs of secrecy/control/hostility (“plotting”, “scheming”, “concealing”, “engineering”, “manipulating”, “cover up”, “weaponize”).</linguistic_signals>
-  </marker>
-
-  <marker name="Effect">
-    <function>Maximizes perceived threat; elicits strong negative affect.</function>
-    <linguistic_signals>Extreme outcomes/control/death/tyranny themes (“total control”, “enslavement”, “destruction”, “depopulation”).</linguistic_signals>
-  </marker>
-
-  <marker name="Evidence">
-    <function>Creates legitimacy appearance and insulation against falsification.</function>
-    <linguistic_signals>Explicit citations/quotes/links/attributions; self-sealing reframing; cui bono; thought-terminating clichés.</linguistic_signals>
-  </marker>
+- Actor: agent portrayed as initiating/controlling events.
+- Action: deliberate verb phrase describing what is done (exclude outcomes/goals).
+- Effect: consequence/goal/purpose (often NP or purpose clause).
+- Victim: harmed/targeted entity.
+- Evidence: explicit support (links, quotes, numbers, named sources, “according to…”).
 </marker_definitions>
-
-{playbook_block()}
 
 <rules>
   <output_format>
-    <!-- DEFAULT schema for robust post-alignment -->
-    Schema: [{{"label":"Actor|Action|Effect|Victim|Evidence","text":"<verbatim substring>","start":<optional int>}}]
-    Return ONLY the JSON array inside <answer>. No prose, no extra keys.
-    Notes:
-    - "text" MUST be copied verbatim from <text_to_analyze>.
-    - Optional "start" is a hint; downstream computes exact offsets.
-    - Keep substrings tight (no leading/trailing whitespace; no trailing punctuation).
-    <!-- If you must emit offsets directly, switch to:
-         [{{"label":"Actor|Action|Effect|Victim|Evidence","start":int,"end":int}}]
-         0-indexed; end-exclusive; still keep spans tight. -->
+    Return ONLY a JSON array inside <answer>.
+    Each element:
+    {"label":"Actor|Action|Effect|Victim|Evidence","start":int,"end":int,"text":"<optional verbatim substring>"}
+
+    Rules:
+    - start is 0-indexed; end is exclusive (integers).
+    - "text" is OPTIONAL and used only for auditing; evaluator ignores it.
+    - No extra keys and no prose.
   </output_format>
 
-  <span_boundaries>
-    - Measure substrings over raw characters of <text_to_analyze>.
-    - Include particles/prepositions only if integral (“set up”, “cover up”, “in charge of”).
-  </span_boundaries>
+
+  <boundaries>
+    - Spans are measured over the raw TEXT (no normalization).
+    - Keep token-tight; include prepositions/particles only if integral (“set up”, “cover up”, “in charge of”).
+  </boundaries>
 
   <overlap_policy>
-    - Ambiguous pairs: {conflict_pairs_str}.
-    - Action vs Effect: split the verb (Action) from purpose/result (Effect); minimal overlap only if unavoidable.
-    - Actor vs Victim: when the same surface form appears in different roles, choose the smallest role-specific mention for each.
-    - Evidence may overlap others for quotations/citations.
+    - Ambiguous pairs: {conflict_pairs}.
+    - Action vs Effect: split verb (Action) from purpose/result (Effect); allow minimal overlap only if unavoidable.
+    - Evidence may overlap others if it is part of a quotation/citation.
   </overlap_policy>
 
-  <span_length_limits>
-    - Minimum substring length: 3 characters (after trimming).
-    - Maximum: 90; Evidence may reach 120 if a single explicit citation/quote.
-  </span_length_limits>
+  <priors>
+{priors_str if priors_str else "- (no priors provided)\n"}
+  </priors>
 
-  <statistical_priors>
-{priors_str if priors_str else "- (no priors supplied)\n"}    Use priors strictly as tie-breakers; never override clear semantics.
-  </statistical_priors>
-
-  <negative_case>If no markers are present, output [] inside <answer>.</negative_case>
-
-  <forbidden_output>
-    - Nothing outside <answer>.
-    - Inside <answer>, only "label","text","start" (or "start","end" if using the offset schema).
-  </forbidden_output>
+  <negative_case>If no markers are present, output [] in <answer>.</negative_case>
+  <forbidden_output>Nothing outside <answer>.</forbidden_output>
 </rules>
 
-{workflow_block}
-""".strip()
+{workflow_block}"""
 
-
-def build_s1_user(
-    text_input: str, s1_fewshots: List[Dict[str, Any]], include_cot: bool = True
-) -> str:
-    # format few-shots compactly (no duplicated instructions)
+def build_s1_user(text_input: str, s1_fewshots: list[dict], include_cot: bool=True) -> str:
     ex_blocks = []
     for ex in (s1_fewshots or [])[:8]:
+        # expect few-shot spans already in canonical schema
         spans = ex.get("spans", [])
-        spans_json = json.dumps(spans, ensure_ascii=False)
         ex_blocks.append(
             "<example>\n"
             "<text>\n" + ex.get("text","") + "\n</text>\n"
-            "<answer>\n" + spans_json + "\n</answer>\n"
+            "<answer>\n" + json.dumps(spans, ensure_ascii=False) + "\n</answer>\n"
             "</example>"
         )
     examples = "<examples>\n" + "\n".join(ex_blocks) + "\n</examples>\n\n" if ex_blocks else ""
 
-    cot_line = (
-        "Provide your reasoning in <thinking> (kept private), then output ONLY the JSON array described in <output_format> inside <answer>."
-        if include_cot else
-        "Provide ONLY the final JSON in <answer>."
-    )
+    tail = ("Provide your reasoning in <thinking> (kept private), then output ONLY the JSON array in <answer>."
+            if include_cot else
+            "Provide ONLY the final JSON in <answer>.")
 
     return f"""{examples}<task>
 <text_to_analyze>
 {text_input}
 </text_to_analyze>
-{cot_line}
+{tail}
 </task>""".strip()
 
 
@@ -421,3 +360,94 @@ def extract_answer_json(text: str):
             return json.loads(blob)
         except Exception:
             return None
+
+import re
+
+def _safe_clip(s: str, a: int, b: int):
+    a = max(0, int(a))
+    b = min(len(s), int(b))
+    return a, max(a, b)
+
+def _window_bounds(a: int, b: int, L: int, win: int):
+    lo = max(0, min(a, b) - win)
+    hi = min(L, max(a, b) + win)
+    return lo, hi
+
+def _try_local_snap(text: str, start: int, end: int, echo: str, win: int = 16):
+    """
+    If echo doesn't match text[start:end], search a small window around (start,end)
+    for an exact echo, else return original (start,end).
+    """
+    if not echo:
+        return start, end
+    L = len(text)
+    lo, hi = _window_bounds(start, end, L, win)
+    window = text[lo:hi]
+    i = window.find(echo)
+    if i >= 0:
+        s = lo + i
+        return s, s + len(echo)
+    return start, end
+
+def validate_and_repair_s1_spans(items: list[dict], text: str, *, win: int = 16, use_tokens: bool = True):
+    """
+    Hybrid repair:
+      1) Require ints for start/end and clip to bounds.
+      2) If optional "text" present and mismatches, try a local re-align within ±win chars.
+      3) Optionally snap to token boundaries (only *after* local re-align).
+      4) Drop spans < 3 chars after trimming whitespace.
+    Returns canonical [{"label","start","end"}].
+    """
+    out = []
+    L = len(text)
+
+    # Optional token helpers
+    try:
+        from starter.prompt_sweep_joint import _tokenize_eval, _snap_to_tokens
+    except Exception:
+        _tokenize_eval = _snap_to_tokens = None
+        use_tokens = False
+
+    for m in items or []:
+        lab = (m.get("label") or m.get("type") or "").strip()
+        if lab not in ("Actor","Action","Effect","Victim","Evidence"):
+            continue
+
+        # ints + clip
+        try:
+            s = int(m.get("start"))
+            e = int(m.get("end"))
+        except Exception:
+            continue
+        s, e = _safe_clip(text, s, e)
+        if e <= s:
+            continue
+
+        echo = m.get("text")
+        # quick mismatch check
+        if isinstance(echo, str):
+            cur = text[s:e]
+            if cur != echo:
+                # attempt small-window relocate
+                s2, e2 = _try_local_snap(text, s, e, echo, win=win)
+                s2, e2 = _safe_clip(text, s2, e2)
+                if e2 > s2:
+                    s, e = s2, e2  # only adopt if found
+
+        # Optional token snapping (lightweight & local)
+        if use_tokens and _tokenize_eval and _snap_to_tokens:
+            toks = _tokenize_eval(text)
+            snapped = _snap_to_tokens({"label": lab, "start": s, "end": e}, toks)
+            if snapped:
+                s, e = int(snapped["start"]), int(snapped["end"])
+                s, e = _safe_clip(text, s, e)
+
+        # drop tiny spans after trim
+        # (compute trimmed span length with surrounding whitespace removed)
+        trimmed = text[s:e].strip()
+        if len(trimmed) < 3:
+            continue
+
+        out.append({"label": lab, "start": s, "end": e})
+
+    return out

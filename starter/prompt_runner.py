@@ -55,9 +55,9 @@ from starter.prompt_sweep_joint import (  # noqa: E402
 from starter.prompt_builder import (  # noqa: E402
     build_s1_system,
     build_s1_user,
-    build_s2_system,
-    build_s2_user,
-    extract_answer_json
+    extract_answer_json,
+    build_s2_prompts_adapter,
+    validate_and_repair_s1_spans
 )
 
 
@@ -302,33 +302,13 @@ import random, json, re, logging
 from collections import Counter
 import json, random, re, logging
 
-def _coerce_probabilities(js: dict) -> dict:
-    """Coerce model JSON to {'label','p_conspiracy','p_non'} with sane defaults."""
-    label = (js.get("label") or "non").strip().lower()
-    def _flt(x):
-        try:
-            return float(x)
-        except Exception:
-            return None
-    p_con = _flt(js.get("p_conspiracy"))
-    p_non = _flt(js.get("p_non"))
-    if p_con is None or p_non is None:
-        conf = _flt(js.get("confidence"))
-        if conf is None:
-            conf = 0.9 if label == "conspiracy" else 0.1
-        if label == "conspiracy":
-            p_con, p_non = conf, 1.0 - conf
-        else:
-            p_con, p_non = 1.0 - conf, conf
-    s = p_con + p_non
-    if s <= 0:
-        p_con = p_non = 0.5
-    else:
-        p_con, p_non = p_con / s, p_non / s
-    if label not in ("conspiracy", "non"):
-        label = "conspiracy" if p_con >= p_non else "non"
-    return {"label": label, "p_conspiracy": p_con, "p_non": p_non}
+from collections import Counter
+import json, re, random, logging
 
+def _safe_label(x: str, allow_cant_tell: bool) -> str:
+    x = (x or "").strip().lower()
+    valid = {"conspiracy", "non"} | ({"cant_tell"} if allow_cant_tell else set())
+    return x if x in valid else "non"
 
 def run_s2_self_consistent(
     *,
@@ -336,77 +316,79 @@ def run_s2_self_consistent(
     markers: list,
     fewshots_pool: list,
     tech: str,
-    policy_text: str | None,
-    prompt_arts: dict | None,
-    bedrock: BedrockChat,              # stateless client (required)
+    policy_text: str | None,      # kept in signature (ignored in new S2)
+    prompt_arts: dict | None,     # kept in signature (ignored in new S2)
+    model_id: str | None,
+    region: str | None,
+    bedrock,                      # BedrockChat stateless client
     max_tokens: int,
     base_temperature: float,
     sc_temperature: float,
     sc_runs: int,
+    allow_cant_tell: bool = False  # NEW: expose cant_tell policy
 ):
     """
-    Self-consistency for S2 using XML builders
-    - Rebuild prompts each run (shuffle few-shot order)
-    - Use sc_temperature only if sc_runs > 1
-    - Majority vote on labels; averaged probs as tie-break
-    Returns: (final_label, avg_p_con, avg_p_non, first_sys_prompt, first_user_prompt)
+    S2 self-consistency with vote aggregation.
+    - Rebuild prompts per run (few-shot order shuffled).
+    - No model probabilities required; we derive pseudo-probabilities from vote share.
+    Returns: (final_label, p_con, p_non, first_sys, first_user)
     """
     temp = sc_temperature if sc_runs > 1 else base_temperature
-
-    preds, label_votes = [], []
+    preds, labels = [], []
     first_sys = first_user = None
 
     for r in range(max(1, sc_runs)):
-        # Shuffle few-shots per run for diversity
         fs = fewshots_pool[:] if fewshots_pool else []
         if fs:
             random.shuffle(fs)
 
-        # Build XML prompts for this run (system is ONE string; user ONE string)
-        sys_prompt = build_s2_system(
-            policy_text=(policy_text or None),
-            include_cot=("cot" in tech),
-            boundary_note=None,                # pass if you want S2 boundary guidance
-            prompt_arts=(prompt_arts or None),
+        sys_prompt, user_prompt = build_s2_prompts_adapter(
+            text=text, markers=markers, fewshots=fs, tech=tech, allow_cant_tell=allow_cant_tell
         )
-        user_prompt = build_s2_user(
-            text_input=text,
-            s1_output=markers,                 # list; builder dumps internally
-            s2_fewshots=fs,
-            include_cot=("cot" in tech),
-        )
-
         if r == 0:
             first_sys, first_user = sys_prompt, user_prompt
 
-        # Stateless Bedrock call
-        try:
-            out = bedrock.chat(
-                system_prompt=sys_prompt,
-                user_prompt=user_prompt,
-                max_tokens=max_tokens,
-                temperature=temp,
-                # stop_sequences=["</answer>"],   # optional, if you like
-            )
-            # Prefer JSON inside <answer>…</answer>; fallback to last JSON block
-            js = extract_answer_json(out) or {"label": "non", "confidence": 0.55}
-        except Exception as e:
-            logging.warning(f"[S2] generate() failed -> default non: {e}")
-            js = {"label": "non", "confidence": 0.55}
+        out = bedrock.chat(
+            system_prompt=sys_prompt,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+            temperature=temp
+        )
 
-        p = _coerce_probabilities(js)
-        preds.append(p)
-        label_votes.append(p["label"])
+        # Prefer extracting from <answer>...</answer>; fallback to last JSON object
+        js = None
+        m = re.search(r"<answer>\s*(\{.*?\})\s*</answer>", out or "", re.S)
+        if m:
+            try:
+                js = json.loads(m.group(1))
+            except Exception:
+                js = None
+        if js is None:
+            m = re.findall(r"(\{.*?\})", out or "", re.S)
+            if m:
+                try:
+                    js = json.loads(m[-1])
+                except Exception:
+                    js = None
 
-    # Majority first; tie-break with averaged probs
-    maj_label, maj_count = Counter(label_votes).most_common(1)[0]
-    avg_con = sum(p["p_conspiracy"] for p in preds) / len(preds)
-    avg_non = sum(p["p_non"] for p in preds) / len(preds)
-    tot = max(1e-9, avg_con + avg_non)
-    avg_con, avg_non = avg_con / tot, avg_non / tot
+        lbl = _safe_label((js or {}).get("label"), allow_cant_tell=allow_cant_tell)
+        labels.append(lbl)
+        preds.append({"label": lbl})
 
-    final_label = maj_label if maj_count > (len(preds) / 2.0) else ("conspiracy" if avg_con >= avg_non else "non")
-    return final_label, avg_con, avg_non, first_sys, first_user
+    # Majority vote
+    maj_label, maj_count = Counter(labels).most_common(1)[0]
+    vote_share = maj_count / max(1, len(labels))
+
+    # Map vote share to pseudo-probs so your caller stays compatible
+    if maj_label == "conspiracy":
+        p_con, p_non = vote_share, 1.0 - vote_share
+    elif maj_label == "non":
+        p_con, p_non = 1.0 - vote_share, vote_share
+    else:  # cant_tell
+        p_con, p_non = 0.5, 0.5
+
+    return maj_label, round(p_con, 6), round(p_non, 6), first_sys, first_user
+
 
 
 # ---------- main ----------
@@ -607,9 +589,9 @@ def main():
                 )
                 printed_s1_preview = True
 
+            system_str = "\n\n".join(sys_blocks)  # MUST be a single string
             # --- Bedrock: stateless call with a single system string ---
             try:
-                system_str = "\n\n".join(sys_blocks)  # MUST be a single string
                 s1_raw = bc.chat(
                     system_prompt=system_str,
                     user_prompt=user_block,
@@ -621,11 +603,18 @@ def main():
                 # prefer extracting JSON inside <answer>…</answer>
                 arr = extract_answer_json(s1_raw) or []
                 # align our new schema {"label","text",["start"]} -> {"label","start","end"}
-                spans = align_and_normalize_s1(
-                    arr,
-                    txt,
-                    priors=(prompt_arts.get("priors_prompt") or {}),
+                #spans = clip_and_validate(arr, txt)  # your existing bounds/token snapper still fine
+                
+                # NEW: validate/repair hybrid
+                spans = validate_and_repair_s1_spans(
+                    arr, txt, win=16, use_tokens=True
                 )
+                
+                #spans = align_and_normalize_s1(
+                #    arr,
+                #    txt,
+                #    priors=(prompt_arts.get("priors_prompt") or {}),
+                #)
             except Exception as e:
                 logging.warning(f"[S1] generate() failed -> empty spans: {e}")
                 spans = []
@@ -717,6 +706,7 @@ def main():
                 base_temperature=args.temperature,
                 sc_temperature=args.sc_temperature,
                 sc_runs=max(1, sc_n),
+                allow_cant_tell=False 
             )
 
             # (Optional) save a sample of prompts
