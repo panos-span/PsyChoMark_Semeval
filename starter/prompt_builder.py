@@ -4,9 +4,6 @@ import json, re
 from pathlib import Path
 from typing import Any, Dict, List
 
-from starter.prompt_sweep_joint import  (
-    _render_boundary_block, _render_conflicts_block, _render_priors_block
-)
 
 
 # --------- Artifact IO ----------
@@ -20,344 +17,353 @@ def playbook_block() -> str:
     return """
 <psycomark_playbook version="1.0">
   <narrative_roles>
-    <malevolent_actor>
-      <features>Vague 3rd-person plural (“they”), abstract collectives (“the elite”, “globalists”, “deep state”), hyper-competence/secret coordination.</features>
-      <function>Constructs omnipresent enemy; vilifies out-group.</function>
-      <cues>they; the elite; globalists; deep state; big pharma</cues>
-    </malevolent_actor>
-    <victim_us>
-      <features>First-person plural (“we/us”), competitive victimhood, moral-emotional framing.</features>
-      <function>Fosters in-group solidarity; moral high ground.</function>
-      <cues>we the people; our way of life; we suffer</cues>
-    </victim_us>
-    <savior_campaigner>
-      <features>Authoritative “I”, claims of privileged knowledge.</features>
-      <function>Legitimizes authority; promises rescue.</function>
-      <cues>I alone can fix; I know the truth</cues>
-    </savior_campaigner>
+    <malevolent_actor features="vague ‘they’; abstract collectives (‘elite’, ‘globalists’, ‘deep state’); hyper-competence/secret coordination"
+                      function="Constructs omnipresent enemy; vilifies out-group"
+                      cues="they; the elite; globalists; deep state; big pharma"/>
+    <victim_us       features="inclusive ‘we/us’; competitive victimhood; moral-emotional framing"
+                      function="Fosters in-group solidarity; moral high ground"
+                      cues="we the people; our way of life; we suffer"/>
+    <savior_campaigner features="authoritative ‘I’; privileged knowledge claims"
+                      function="Legitimizes authority; promises rescue"
+                      cues="I alone can fix; I know the truth"/>
   </narrative_roles>
 
   <causality_intent>
-    <action_language>
-      <features>Verbs of secrecy/control/hostility; linear causation.</features>
-      <function>Eliminates randomness; centers intentional harm.</function>
-      <cues>plot; scheme; infiltrate; engineer; manipulate; cover up; weaponize</cues>
-    </action_language>
-    <effect_language>
-      <features>Extreme stakes; high negative affect.</features>
-      <function>Maximizes threat/urgency; fuels engagement.</function>
-      <cues>total control; tyranny; enslavement; destruction; depopulation</cues>
-    </effect_language>
+    <action_language features="verbs of secrecy/control/hostility; linear intentional causation"
+                     function="Eliminates randomness; centers intentional harm"
+                     cues="plot; scheme; infiltrate; engineer; manipulate; cover up; weaponize"/>
+    <effect_language features="extreme stakes; high negative affect"
+                     function="Maximizes threat/urgency; fuels engagement"
+                     cues="total control; tyranny; enslavement; destruction; depopulation"/>
   </causality_intent>
 
   <epistemic_stance>
-    <rhetoric_of_evidence>
-      <features>Dismiss counter-evidence as disinformation/cover-up; cui bono; loaded language; thought-terminating clichés.</features>
-      <function>Self-sealing logic; hermeneutics of suspicion.</function>
-      <cues>who benefits; follow the money; do your own research; connect the dots</cues>
-    </rhetoric_of_evidence>
-    <certainty_doubt_paradox>
-      <features>Absolute certainty for claim + radical skepticism of institutions; “faith in intuition”.</features>
-      <function>Epistemic closure and in-group privilege.</function>
-      <cues>truth is obvious; facts are clear; media is lying; don’t trust experts</cues>
-    </certainty_doubt_paradox>
+    <rhetoric_of_evidence features="reframe counter-evidence as cover-up/disinformation; cui bono; loaded language; thought-terminating clichés"
+                          function="Self-sealing logic; hermeneutics of suspicion"
+                          cues="who benefits; follow the money; do your own research; connect the dots"/>
+    <certainty_doubt_paradox features="absolute certainty for claim + radical skepticism of institutions; ‘faith in intuition’"
+                             function="Epistemic closure and in-group privilege"
+                             cues="truth is obvious; facts are clear; media is lying; don’t trust experts"/>
   </epistemic_stance>
 
   <shortcuts_and_pitfalls>
-    <ts_001>Avoid keyword-only flags; context determines if a text is endorsing vs. reporting/debunking.</ts_001>
-    <ts_002>Evidence dismissal must show the self-sealing move (counter-evidence ⇒ proof of cover-up).</ts_002>
+    <ts_001>Avoid keyword-only flags; context decides endorsing vs reporting/debunking.</ts_001>
+    <ts_002>Self-sealing must include the reframing move (counter-evidence leads to ‘cover-up’).</ts_002>
   </shortcuts_and_pitfalls>
 </psycomark_playbook>
+""".strip()
 
-"""
 
-
+# TODO: Check the span extraction method if it is valid or if we should ask the LLM to handle it
 # --------- S1 builders ----------
 def build_s1_system(priors: Dict[str, Any], conflicts: List[List[str]], use_cot: bool) -> str:
-    """
-    Builds the streamlined and de-duplicated system prompt for S1 (Marker Extraction).
-    This replaces your current complex system prompt.
-    """
+    """System prompt for S1 (Marker Extraction) with XML + two-pass thinking."""
+    # Priors summary (concise; no duplication elsewhere)
     priors_str = ""
-    # Consolidate all priors into a single, clear list from your artifacts
-    for label, data in priors.items():
+    for label, data in (priors or {}).items():
         q90 = data.get("q90_len")
         mode_pos = data.get("mode_pos")
         if q90 is not None and mode_pos is not None:
-            priors_str += f"- **{label}**: Typical span length ≤ {q90:.0f} chars; often starts near {mode_pos*100:.0f}% of the text.\n"
+            priors_str += f"- {label}: typical length ≤ {q90:.0f} chars; often starts near {mode_pos*100:.0f}% of the text.\n"
 
-    conflict_pairs_str = (
-        ", ".join([f"{p}-{p[1]}" for p in conflicts])
-        if conflicts
-        else "Action-Effect and Actor-Victim"
-    )
-    
+    # Conflict pairs text
+    if conflicts:
+        def _fmt(p): 
+            try:
+                return f"{p[0]}–{p[1]}"
+            except Exception:
+                return "Action–Effect"
+        conflict_pairs_str = ", ".join(_fmt(p) for p in conflicts if p)
+    else:
+        conflict_pairs_str = "Action–Effect, Actor–Victim"
+
+    # Optional CoT workflow
     workflow_block = ""
     if use_cot:
-        workflow_block = f"""<workflow>
-1) In your <thinking> block, execute exactly two passes using the following XML sections.
+        workflow_block = """
+<workflow>
+  <thinking>
+    <pass_a_candidate_scan>
+      - Actor: candidate agent nouns/phrases (incl. vague “they”/collectives).
+      - Action: candidate core verb phrases.
+      - Effect: candidate goals/purposes/results (e.g., ‘to/so that/in order to …’).
+      - Victim: candidate harmed/target entities.
+      - Evidence: candidate citations/quotes/links/attributions; self-sealing moves; cui bono; clichés.
+    </pass_a_candidate_scan>
 
-<pass_a_candidate_scan>
-- Actor: identify candidate agent nouns/phrases.
-- Action: identify candidate core verb phrases.
-- Effect: identify candidate goal or outcome phrases.
-- Victim: identify candidate harmed/targeted entities.
-- Evidence: identify candidate citations, quotes, links, or explicit attributions.
-</pass_a_candidate_scan>
+    <pass_b_validation_and_refinement>
+      - Apply boundary rules; keep substrings tight (no leading/trailing whitespace; no trailing punctuation).
+      - Resolve overlaps per <overlap_policy> (split Action vs Effect; smallest role-specific for Actor vs Victim).
+      - Use <statistical_priors> only as tie-breakers (never override clear semantics).
+      - Filter out substrings < 3 chars or vague claims lacking explicit lexical support.
+      - If nothing remains, final answer is [].
+    </pass_b_validation_and_refinement>
+  </thinking>
+  <answer>… JSON only …</answer>
+</workflow>
+""".strip()
 
-<pass_b_validation_and_refinement>
-- Apply boundary rules: substrings must be tight (no leading/trailing whitespace or punctuation).
-- Apply overlap_policy: resolve overlaps (especially Action vs Effect) by splitting or choosing the minimal appropriate span; Actor vs Victim should use the smallest role-specific mention.
-- Apply statistical_priors: use the priors on length/position as tie-breakers for ambiguous cases.
-- Filter for quality: discard substrings shorter than 3 characters or speculative-only content without explicit wording.
-- Final check: if nothing remains, confirm the final answer will be [].
-</pass_b_validation_and_refinement>
-
-2) After your reasoning, output ONLY the final JSON array inside <answer>.
-</workflow>"""
-
-    return f"""<role>
-You are a precision-focused annotator for SemEval-2026 PsyCoMark Task 10, Subtask 1. Extract markers exactly as specified.
+    return f"""
+<role>
+You are a precision-focused psycholinguistic analyst for SemEval-2026 PsyCoMark Task 10 (Subtask 1). Extract conspiratorial markers using their rhetorical functions and linguistic signals.
 </role>
 
 <task_definition>
-Extract all markers for: Actor, Action, Effect, Victim, Evidence. Return STRICT JSON ONLY inside <answer>.
+Extract all markers for: Actor, Action, Effect, Victim, Evidence.
+Return STRICT JSON only inside <answer>.
 </task_definition>
 
 <marker_definitions>
-- **Actor**: The agent portrayed as initiating or controlling events.
-  - **Rhetorical Function**: To construct a powerful, malevolent, and often vaguely defined out-group ("Them").
-  - **Linguistic Signals**: Look for depersonalized third-person plural pronouns (e.g., "they") and abstract collective nouns (e.g., "the elite", "globalists", "Big Pharma").
+  <marker name="Actor">
+    <function>Constructs a powerful, malevolent, often vague out-group (“Them”).</function>
+    <linguistic_signals>Depersonalized 3rd-person plural (“they”); abstract collective nouns (“elite”, “globalists”, “Big Pharma”, “deep state”).</linguistic_signals>
+  </marker>
 
-- **Victim**: The entity targeted or harmed by the Action.
-  - **Rhetorical Function**: To construct a morally righteous and persecuted in-group ("Us") and foster a sense of shared identity and grievance.
-  - **Linguistic Signals**: Look for inclusive first-person plural pronouns (e.g., "we", "us") and language of collective or exclusive victimhood (e.g., "the people", "patriots", "our way of life").
+  <marker name="Victim">
+    <function>Constructs persecuted in-group (“Us”); fosters shared identity/grievance.</function>
+    <linguistic_signals>Inclusive 1st-person plural (“we”, “us”); collective/exclusive victimhood (“the people”, “patriots”, “our way of life”).</linguistic_signals>
+  </marker>
 
-- **Action**: The deliberate verb phrase describing the conspirators' activity.
-  - **Rhetorical Function**: To frame events as the result of intentional, malicious agency, rejecting the role of chance or complexity.
-  - **Linguistic Signals**: Look for verbs implying secrecy, control, and hostility (e.g., "plotting", "scheming", "concealing", "engineering") and threat-based framing that calls for a response.
+  <marker name="Action">
+    <function>Frames events as intentional, malicious agency.</function>
+    <linguistic_signals>Verbs of secrecy/control/hostility (“plotting”, “scheming”, “concealing”, “engineering”, “manipulating”, “cover up”, “weaponize”).</linguistic_signals>
+  </marker>
 
-- **Effect**: The consequence, goal, or purpose of the Action.
-  - **Rhetorical Function**: To maximize the perceived threat and generate a powerful negative emotional response (e.g., anger, anxiety) in the audience.
-  - **Linguistic Signals**: Look for language with high negative emotional valence and themes of power, death, control, and destruction.
+  <marker name="Effect">
+    <function>Maximizes perceived threat; elicits strong negative affect.</function>
+    <linguistic_signals>Extreme outcomes/control/death/tyranny themes (“total control”, “enslavement”, “destruction”, “depopulation”).</linguistic_signals>
+  </marker>
 
-- **Evidence**: The justification for the conspiratorial claim.
-  - **Rhetorical Function**: To create an appearance of legitimacy while insulating the narrative from falsification.
-  - **Linguistic Signals**: Beyond explicit citations, look for rhetorical devices like:
-    - **Self-Sealing Logic**: Dismissing counter-evidence as "disinformation" or part of the cover-up.
-    - **Rhetorical Questions**: Using questions like "Who benefits?" (*cui bono*) or "I'm just asking questions" to imply guilt without providing proof.
-    - **Thought-Terminating Clichés**: Using phrases like "do your own research" or "it is what it is" to shut down critical thinking.
+  <marker name="Evidence">
+    <function>Creates legitimacy appearance and insulation against falsification.</function>
+    <linguistic_signals>Explicit citations/quotes/links/attributions; self-sealing reframing; cui bono; thought-terminating clichés.</linguistic_signals>
+  </marker>
 </marker_definitions>
 
+{playbook_block()}
+
 <rules>
-<output_format>
-Return a JSON array inside <answer> ONLY. Each element:
-{{"label":"Actor|Action|Effect|Victim|Evidence","text":"<exact substring from TEXT>","start":<optional int>}}
+  <output_format>
+    <!-- DEFAULT schema for robust post-alignment -->
+    Schema: [{{"label":"Actor|Action|Effect|Victim|Evidence","text":"<verbatim substring>","start":<optional int>}}]
+    Return ONLY the JSON array inside <answer>. No prose, no extra keys.
+    Notes:
+    - "text" MUST be copied verbatim from <text_to_analyze>.
+    - Optional "start" is a hint; downstream computes exact offsets.
+    - Keep substrings tight (no leading/trailing whitespace; no trailing punctuation).
+    <!-- If you must emit offsets directly, switch to:
+         [{{"label":"Actor|Action|Effect|Victim|Evidence","start":int,"end":int}}]
+         0-indexed; end-exclusive; still keep spans tight. -->
+  </output_format>
 
-Notes:
-- "text" must be copied verbatim from <text_to_analyze>.
-- "start" is optional (a hint). Do NOT include "end"; it will be computed downstream.
-- No prose, no extra keys, no trailing commas.
-</output_format>
+  <span_boundaries>
+    - Measure substrings over raw characters of <text_to_analyze>.
+    - Include particles/prepositions only if integral (“set up”, “cover up”, “in charge of”).
+  </span_boundaries>
 
-<span_boundaries>
-- Substrings are measured over raw characters of <text_to_analyze>.
-- Do not output offsets other than the optional "start".
-- Keep substrings tight; include particles/prepositions only if integral (e.g., "set up", "cover up", "in charge of").
-</span_boundaries>
+  <overlap_policy>
+    - Ambiguous pairs: {conflict_pairs_str}.
+    - Action vs Effect: split the verb (Action) from purpose/result (Effect); minimal overlap only if unavoidable.
+    - Actor vs Victim: when the same surface form appears in different roles, choose the smallest role-specific mention for each.
+    - Evidence may overlap others for quotations/citations.
+  </overlap_policy>
 
-<overlap_policy>
-- Ambiguous pairs: {conflict_pairs_str}.
-- Action vs Effect: split verb phrase (Action) from purpose/result (Effect); allow minimal overlap only if unavoidable.
-- Actor vs Victim: if the same surface form appears in different roles, pick the smallest role-specific mention for each.
-- Evidence may overlap others when it is a quotation or citation.
-</overlap_policy>
+  <span_length_limits>
+    - Minimum substring length: 3 characters (after trimming).
+    - Maximum: 90; Evidence may reach 120 if a single explicit citation/quote.
+  </span_length_limits>
 
-<offset_scope>
-- Offsets are computed exactly over <text_to_analyze> by the evaluator; do not normalize quotes/whitespace.
-</offset_scope>
+  <statistical_priors>
+{priors_str if priors_str else "- (no priors supplied)\n"}    Use priors strictly as tie-breakers; never override clear semantics.
+  </statistical_priors>
 
-<span_length_limits>
-- Minimum substring length: 3 characters (after trimming).
-- Maximum substring length: 90; Evidence may reach 120 if it is a single explicit citation/quote.
-</span_length_limits>
+  <negative_case>If no markers are present, output [] inside <answer>.</negative_case>
 
-<evidence_quality>
-- Prefer explicit sources: URLs, quotations, “according to …”, named reports.
-- Avoid purely hedged claims without sources.
-</evidence_quality>
-
-<statistical_priors>
-Use as tie-breakers when ambiguous:
-{priors_str}
-If Action and Effect overlap heavily (IoU ≥ 0.6), prefer the label whose start position is closer to its prior.
-</statistical_priors>
-
-<negative_case>
-- If no markers are present, output [] in <answer>.
-</negative_case>
-
-<forbidden_output>
-- Do not output anything outside <answer>.
-- Inside <answer>, only keys "label","text","start" are allowed. No comments, NaN/inf, or XML echoes.
-</forbidden_output>
+  <forbidden_output>
+    - Nothing outside <answer>.
+    - Inside <answer>, only "label","text","start" (or "start","end" if using the offset schema).
+  </forbidden_output>
 </rules>
 
 {workflow_block}
-"""
+""".strip()
 
 
 def build_s1_user(
     text_input: str, s1_fewshots: List[Dict[str, Any]], include_cot: bool = True
 ) -> str:
-    # format few-shots compactly
+    # format few-shots compactly (no duplicated instructions)
     ex_blocks = []
     for ex in (s1_fewshots or [])[:8]:
         spans = ex.get("spans", [])
         spans_json = json.dumps(spans, ensure_ascii=False)
         ex_blocks.append(
-            f"<example>\n<text>\n{ex.get('text','')}\n</text>\n<answer>\n{spans_json}\n</answer>\n</example>"
+            "<example>\n"
+            "<text>\n" + ex.get("text","") + "\n</text>\n"
+            "<answer>\n" + spans_json + "\n</answer>\n"
+            "</example>"
         )
-    examples = (
-        "<examples>\n" + "\n".join(ex_blocks) + "\n</examples>" if ex_blocks else ""
-    )
+    examples = "<examples>\n" + "\n".join(ex_blocks) + "\n</examples>\n\n" if ex_blocks else ""
+
     cot_line = (
         "Provide your reasoning in <thinking> (kept private), then output ONLY the JSON array described in <output_format> inside <answer>."
-        if include_cot
-        else "Provide ONLY the final JSON in <answer>."
+        if include_cot else
+        "Provide ONLY the final JSON in <answer>."
     )
-    return f"""
-{examples}
 
-<task>
+    return f"""{examples}<task>
 <text_to_analyze>
 {text_input}
 </text_to_analyze>
 {cot_line}
-</task>
-""".strip()
+</task>""".strip()
 
 
 import json
 import re
 
-def build_s2_system(*, policy_text: str | None = None, include_cot: bool = False,
-                    boundary_note: str | None = None, prompt_arts: dict | None = None) -> str:
-    # Optional helper renders (reuse your existing ones if present)
-    boundary_block = ""
-    conflicts_block = ""
-    priors_block = ""
-    if prompt_arts:
-        b = _render_boundary_block(prompt_arts)
-        c = _render_conflicts_block(prompt_arts)
-        p = _render_priors_block(prompt_arts)
-        if b: boundary_block = f"\n<boundary_guidance>\n{b}\n</boundary_guidance>"
-        if c: conflicts_block = f"\n<conflicts>\n{c}\n</conflicts>"
-        if p: priors_block = f"\n<priors>\n{p}\n</priors>"
+# --- S2 prompt adapter: builds prompts from tech flags and passes cant_tell policy ---
+def build_s2_prompts_adapter(
+    *, text: str, markers: list, fewshots: list | None, tech: str, allow_cant_tell: bool = True
+) -> tuple[str, str]:
+    use_cot = ("cot" in tech)
+    sys_prompt = build_s2_system(
+        include_cot=use_cot,
+        allow_cant_tell=allow_cant_tell,
+        # the following are accepted but ignored (kept for backward-compat)
+        policy_text=None, boundary_note=None, prompt_arts=None
+    )
+    user_prompt = build_s2_user(
+        text_input=text,
+        s1_output=markers,
+        s2_fewshots=fewshots or [],
+        include_cot=use_cot,
+        allow_cant_tell=allow_cant_tell,
+    )
+    return sys_prompt, user_prompt
 
-    policy_block = f"\n<policy>\n{policy_text}\n</policy>" if policy_text else ""
+
+def build_s2_system(
+    *, 
+    policy_text: str | None = None,          # accepted for backward compat (DEPRECATED)
+    include_cot: bool = False,
+    boundary_note: str | None = None,        # accepted for backward compat (DEPRECATED)
+    prompt_arts: dict | None = None,         # accepted for backward compat (DEPRECATED)
+    allow_cant_tell: bool = False
+) -> str:
+    """
+    S2 SYSTEM PROMPT (streamlined):
+      - No S1 artifacts (boundary/conflicts/priors) — they are ignored by design.
+      - No probabilities: output is {label, rationale}.
+      - Crisp, enforceable CoT workflow.
+    NOTE: policy_text/boundary_note/prompt_arts are deprecated and ignored to avoid polluting S2.
+    """
+
+    labels_desc = (
+        "- conspiracy: The text endorses a hidden, harmful plot by a powerful actor and exhibits multiple hallmarks.\n"
+        "- non: The text does not endorse conspiratorial framing (e.g., neutral reporting, mocking, debunking).\n"
+        + ("- cant_tell: The text is too ambiguous to classify reliably.\n" if allow_cant_tell else "")
+    )
+
     workflow_block = ""
     if include_cot:
-        workflow_block = """<workflow>
-1. You will be given the original text and a JSON list of psycholinguistic markers extracted from it.
-2. First, analyze the provided markers as evidence inside a `<thinking>` block. Specifically, evaluate them against the `<hallmarks_of_conspiracy_narratives>`.
-   - Does the density and type of 'Actor' and 'Victim' markers establish a strong 'us vs. them' narrative?
-   - Do the 'Action' and 'Effect' markers create a causal story driven by malicious intent, rather than chance?
-   - Do the 'Evidence' markers show signs of a self-sealing or non-falsifiable epistemic style?
-3. Based on this structured analysis, make a final classification.
-4. Provide your final answer as a single JSON object inside an `<answer>` block: {"label": "...", "rationale": "..."}
-</workflow>"""
+        workflow_block = """
+<workflow>
+  <thinking>
+    Step 1 — Stance: Is the author endorsing conspiratorial framing, or merely reporting/mocking/debunking?
+    Step 2 — Hallmarks:
+      • Roles: “us vs. them” (in-group vs. powerful malevolent out-group).
+      • Causality: intentional secret action presented as the driver of events (not chance/complexity).
+      • Epistemic stance: self-sealing logic (counter-evidence as cover-up), cui bono insinuations, clichés.
+      • Affect: strong negative emotion and extreme consequences.
+    Step 3 — Decision: Apply the <analytical_framework> and choose a label.
+  </thinking>
+  <answer>JSON only</answer>
+</workflow>""".strip()
 
-    return f"""<role>
-You are an expert social scientist specializing in the analysis of online discourse. Your task is to classify a text by evaluating its narrative structure against established psycholinguistic patterns of conspiratorial rhetoric.
+    # Keep your playbook content; it’s useful, compact, and not S1-specific.
+    return f"""
+<role>
+You are an expert social scientist specializing in online discourse. Classify the text using psycholinguistic hallmarks of conspiratorial rhetoric.
 </role>
+
 <label_definitions>
-- **conspiracy**: The text alleges a secret plot by a powerful group that is harmful or illegal. It exhibits several of the hallmarks below.
-- **non**: The text does not contain conspiratorial allegations and lacks the key narrative hallmarks.
-- **cant_tell**: The text is too ambiguous or lacks sufficient information to make a clear determination.
+{labels_desc.strip()}
 </label_definitions>
 
-<hallmarks_of_conspiracy_narratives>
-Conspiratorial texts are not just factually wrong; they follow a specific narrative and rhetorical structure. Use these hallmarks to guide your classification:
-1.  **Manichean Worldview ("Us vs. Them"):** The narrative frames events as a struggle between a virtuous in-group ("we", "the people") and a malevolent, powerful out-group ("they", "the elites"). A high density of Actor and Victim markers is a strong signal.
-2.  **Teleological Causality (Nothing is by Accident):** Events are explained as the direct result of intentional, secret actions by the malevolent actors, rejecting the role of chance, complexity, or incompetence.
-3.  **Self-Sealing Epistemology (Unfalsifiable Logic):** The narrative is immune to counter-evidence. Evidence against the theory is re-framed as proof of the cover-up's effectiveness. A lack of evidence is proof of the conspiracy's secrecy.
-4.  **Emotionally Charged Language:** The narrative relies on powerful negative emotions like anger, anxiety, and fear to create a sense of existential threat and urgency.
-</hallmarks_of_conspiracy_narratives>
+<analytical_framework>
+1) Manichean worldview (“Us vs. Them”): a virtuous in-group (“we”, “the people”) vs. a powerful malevolent out-group (“they”, “the elite”, “deep state”).
+2) Teleological causality: events explained as deliberate secret actions; chance/complexity is minimized.
+3) Self-sealing epistemology: counter-evidence reframed as a cover-up; lack of evidence presented as proof of secrecy.
+4) Heightened affect and extreme stakes: fear/anger/urgency, catastrophic outcomes.
+5) Endorsement test: the author must advocate or endorse the conspiratorial frame; mere reporting/mocking/debunking is “non”.
+</analytical_framework>
 
-  <endorsement_test>
-    - Endorsing/advocating conspiratorial framing ⇒ consider "conspiracy".
-    - Reporting, mocking, or debunking (neutral/critical stance) ⇒ "non".
-  </endorsement_test>
+{playbook_block()}
 
-  <marker_signals>
-    - Role Framing: Malevolent Actor (“they”, “elite”, “deep state”) + Victim (“we/us”).
-    - Intentionality: Action verbs of secrecy/control + extreme Effect outcomes.
-    - Epistemic Closure: self-sealing logic (counter-evidence ⇒ “cover-up”), thought-terminating clichés.
-  </marker_signals>
-
-  <calibration>
-    - Strong explicit endorsement of hidden-plot + multiple signals (Actor+Action+Effect OR self-sealing) ⇒ p_conspiracy ≥ 0.85.
-    - Mixed/ambiguous signals without endorsement ⇒ 0.40 ≤ p_conspiracy ≤ 0.60.
-    - Neutral reporting/debunking; absence of hidden-agent framing ⇒ p_non ≥ 0.80.
-    - Ensure p_conspiracy + p_non = 1.0.
-  </calibration>
-
-  <rationale_policy>
-    - ≤2 sentences; name the decisive cues (e.g., “self-sealing logic, ‘they’ + agenda”).
-    - Do NOT reveal chain-of-thought beyond brief cues.
-  </rationale_policy>
-
-  <forbidden_output>
-    - Nothing outside <answer>.
-  </forbidden_output>
-
-{policy_block}{boundary_block}{conflicts_block}{priors_block}
 <output_format>
-Return ONLY a single JSON object inside <answer>:
-{{"label":"conspiracy|non","p_conspiracy":0.xx,"p_non":0.xx,"rationale":"<=2 sentences"}}
-Ensure probabilities sum to 1.0 and label = argmax.
-</output_format>{workflow_block}"""
+Return ONLY one JSON object inside <answer>:
+{{"label":"{('conspiracy|non|cant_tell' if allow_cant_tell else 'conspiracy|non')}", "rationale":"1–2 sentences naming decisive cues"}}
+</output_format>
+{workflow_block}
+""".strip()
 
-def build_s2_user(*, text_input: str, s1_output: list | None,
-                  s2_fewshots: list | None = None, include_cot: bool = False) -> str:
+
+def build_s2_user(
+    *, 
+    text_input: str, 
+    s1_output: list | None,
+    s2_fewshots: list | None = None, 
+    include_cot: bool = False,
+    allow_cant_tell: bool = True
+) -> str:
+    """
+    S2 USER PROMPT (streamlined):
+      - Compact few-shots that show {label, rationale} only.
+      - No probabilities.
+      - Uses S1 markers as evidence.
+    """
+
     ex_block = ""
     if s2_fewshots:
-        # few-shot XML (compact)
         parts = []
         for ex in s2_fewshots:
-            t = ex.get("text","")
+            t = ex.get("text", "")
             lbl = (ex.get("label") or (ex.get("gold") or {}).get("label") or "non").lower()
-            lbl = "conspiracy" if lbl == "conspiracy" else "non"
-            mks = ex.get("markers") or []
+            valid = {"conspiracy", "non"} | ({"cant_tell"} if allow_cant_tell else set())
+            if lbl not in valid:
+                lbl = "non"
+
             mk_norm = []
-            for m in mks:
+            for m in (ex.get("markers") or []):
                 lab = (m.get("type") or m.get("label") or "").strip()
                 s = m.get("startIndex", m.get("start"))
                 e = m.get("endIndex", m.get("end"))
                 try:
                     s, e = int(s), int(e)
-                except: 
+                except Exception:
                     continue
                 if lab and e > s:
                     mk_norm.append({"type": lab, "startIndex": s, "endIndex": e})
-            gold = {"label": lbl, "p_conspiracy": 0.8 if lbl=="conspiracy" else 0.2,
-                    "p_non": 0.2 if lbl=="conspiracy" else 0.8,
-                    "rationale": "concise example rationale."}
+
+            gold = {
+                "label": lbl,
+                "rationale": ex.get("rationale", "Concise example rationale.")
+            }
+
             parts.append(
                 "<example>\n"
-                "<text>\n" + t + "\n</text>\n" +
-                ("<extracted_markers>\n" + json.dumps(mk_norm, ensure_ascii=False) + "\n</extracted_markers>\n" if mk_norm else "") +
-                "<answer>\n" + json.dumps(gold, ensure_ascii=False) + "\n</answer>\n"
+                "<text>\n" + t + "\n</text>\n"
+                + ("<extracted_markers>\n" + json.dumps(mk_norm, ensure_ascii=False) + "\n</extracted_markers>\n" if mk_norm else "")
+                + "<answer>\n" + json.dumps(gold, ensure_ascii=False) + "\n</answer>\n"
                 "</example>"
             )
         ex_block = "<examples>\n" + "\n\n".join(parts) + "\n</examples>\n\n"
 
     markers_json = json.dumps(s1_output or [], ensure_ascii=False)
-
-    task_tail = ("Provide brief reasoning in <thinking> then the final JSON in <answer>."
-                 if include_cot else
-                 "Provide ONLY the final JSON in <answer>.")
+    tail = ("Provide brief reasoning in <thinking>, then return the final JSON in <answer>."
+            if include_cot else
+            "Return only the final JSON in <answer>.")
 
     return f"""{ex_block}<task>
 <text_to_analyze>
@@ -366,9 +372,10 @@ def build_s2_user(*, text_input: str, s1_output: list | None,
 <extracted_markers>
 {markers_json}
 </extracted_markers>
-Instructions: Use the markers as evidence; ambiguity without hidden-plot framing should lean "non".
-{task_tail}
-</task>"""
+Use the extracted markers as evidence to decide the label according to the <analytical_framework>.
+{tail}
+</task>""".strip()
+
 
 
 

@@ -30,7 +30,7 @@ from typing import Any, Dict, List
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 # --- Bedrock Chat (Sonnet 4.5 wrapper) ---
-from src.psycomark.llm.bedrock_chat import Chat
+from src.psycomark.llm.bedrock_chat import BedrockChat
 
 # --- Reuse the largest runner's utilities / builders ---
 # (We import only what we need to avoid code duplication.)
@@ -57,6 +57,7 @@ from starter.prompt_builder import (  # noqa: E402
     build_s1_user,
     build_s2_system,
     build_s2_user,
+    extract_answer_json
 )
 
 
@@ -298,6 +299,37 @@ def align_text_markers_to_spans(doc_text: str, items: List[dict], case_sensitive
 from collections import Counter
 import random, json, re, logging
 
+from collections import Counter
+import json, random, re, logging
+
+def _coerce_probabilities(js: dict) -> dict:
+    """Coerce model JSON to {'label','p_conspiracy','p_non'} with sane defaults."""
+    label = (js.get("label") or "non").strip().lower()
+    def _flt(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+    p_con = _flt(js.get("p_conspiracy"))
+    p_non = _flt(js.get("p_non"))
+    if p_con is None or p_non is None:
+        conf = _flt(js.get("confidence"))
+        if conf is None:
+            conf = 0.9 if label == "conspiracy" else 0.1
+        if label == "conspiracy":
+            p_con, p_non = conf, 1.0 - conf
+        else:
+            p_con, p_non = 1.0 - conf, conf
+    s = p_con + p_non
+    if s <= 0:
+        p_con = p_non = 0.5
+    else:
+        p_con, p_non = p_con / s, p_non / s
+    if label not in ("conspiracy", "non"):
+        label = "conspiracy" if p_con >= p_non else "non"
+    return {"label": label, "p_conspiracy": p_con, "p_non": p_non}
+
+
 def run_s2_self_consistent(
     *,
     text: str,
@@ -306,18 +338,17 @@ def run_s2_self_consistent(
     tech: str,
     policy_text: str | None,
     prompt_arts: dict | None,
-    model_id: str | None,
-    region: str | None,
+    bedrock: BedrockChat,              # stateless client (required)
     max_tokens: int,
     base_temperature: float,
     sc_temperature: float,
     sc_runs: int,
 ):
     """
-    Self-consistency for S2 using your XML builders:
-      - Rebuild prompts each run (shuffle few-shot order)
-      - Use sc_temperature only if sc_runs > 1
-      - Majority vote on labels; averaged probs as tie-break
+    Self-consistency for S2 using XML builders
+    - Rebuild prompts each run (shuffle few-shot order)
+    - Use sc_temperature only if sc_runs > 1
+    - Majority vote on labels; averaged probs as tie-break
     Returns: (final_label, avg_p_con, avg_p_non, first_sys_prompt, first_user_prompt)
     """
     temp = sc_temperature if sc_runs > 1 else base_temperature
@@ -326,21 +357,21 @@ def run_s2_self_consistent(
     first_sys = first_user = None
 
     for r in range(max(1, sc_runs)):
-        # shuffle few-shots per run for diversity
+        # Shuffle few-shots per run for diversity
         fs = fewshots_pool[:] if fewshots_pool else []
         if fs:
             random.shuffle(fs)
 
-        # Build XML prompts for this run
+        # Build XML prompts for this run (system is ONE string; user ONE string)
         sys_prompt = build_s2_system(
             policy_text=(policy_text or None),
             include_cot=("cot" in tech),
-            boundary_note=None,             # or pass your boundary if desired for S2
+            boundary_note=None,                # pass if you want S2 boundary guidance
             prompt_arts=(prompt_arts or None),
         )
         user_prompt = build_s2_user(
             text_input=text,
-            s1_output=markers,              # list; builder will json.dumps internally
+            s1_output=markers,                 # list; builder dumps internally
             s2_fewshots=fs,
             include_cot=("cot" in tech),
         )
@@ -348,54 +379,26 @@ def run_s2_self_consistent(
         if r == 0:
             first_sys, first_user = sys_prompt, user_prompt
 
-        # Bedrock call (Chat API)
-        chat = Chat(
-            model_id=(model_id or Chat.SONNET_45_MODEL_ID),
-            region=region,
-            max_tokens=max_tokens,
-            temperature=temp,
-        )
-        chat.add_system(sys_prompt)
-        chat.add_user(user_prompt)
-
+        # Stateless Bedrock call
         try:
-            out = chat.generate()
-            m = re.search(r"\{.*\}", out, re.S)  # robust single-JSON capture
-            js = json.loads(m.group(0)) if m else {"label": "non", "confidence": 0.55}
+            out = bedrock.chat(
+                system_prompt=sys_prompt,
+                user_prompt=user_prompt,
+                max_tokens=max_tokens,
+                temperature=temp,
+                # stop_sequences=["</answer>"],   # optional, if you like
+            )
+            # Prefer JSON inside <answer>…</answer>; fallback to last JSON block
+            js = extract_answer_json(out) or {"label": "non", "confidence": 0.55}
         except Exception as e:
             logging.warning(f"[S2] generate() failed -> default non: {e}")
             js = {"label": "non", "confidence": 0.55}
 
-        # Coerce to {"label","p_conspiracy","p_non"}
-        label = (js.get("label") or "non").strip().lower()
-        def _flt(x):
-            try: return float(x)
-            except Exception: return None
-        p_con = _flt(js.get("p_conspiracy"))
-        p_non = _flt(js.get("p_non"))
+        p = _coerce_probabilities(js)
+        preds.append(p)
+        label_votes.append(p["label"])
 
-        if p_con is None or p_non is None:
-            conf = _flt(js.get("confidence"))
-            if conf is None:
-                conf = 0.9 if label == "conspiracy" else 0.1
-            if label == "conspiracy":
-                p_con, p_non = conf, 1.0 - conf
-            else:
-                p_con, p_non = 1.0 - conf, conf
-
-        s = p_con + p_non
-        if s <= 0:
-            p_con = p_non = 0.5
-        else:
-            p_con, p_non = p_con / s, p_non / s
-
-        if label not in ("conspiracy", "non"):
-            label = "conspiracy" if p_con >= p_non else "non"
-
-        preds.append({"label": label, "p_conspiracy": p_con, "p_non": p_non})
-        label_votes.append(label)
-
-    # Majority vote first
+    # Majority first; tie-break with averaged probs
     maj_label, maj_count = Counter(label_votes).most_common(1)[0]
     avg_con = sum(p["p_conspiracy"] for p in preds) / len(preds)
     avg_non = sum(p["p_non"] for p in preds) / len(preds)
@@ -444,17 +447,20 @@ def main():
     args = ap.parse_args()
 
     print("=== JOINT PROMPT (Chat API) START ===")
-    print(
-        f"Model ID: {args.model_id or Chat.SONNET_45_MODEL_ID}, Region: {args.region}"
-    )
-
     random.seed(42)
     from os import getenv
 
     model_id = (
-        args.model_id or getenv("MODEL_ID") or getattr(Chat, "SONNET_45_MODEL_ID", None)
+        args.model_id or getenv("MODEL_ID")
     )
     region = args.region or getenv("AWS_DEFAULT_REGION") or "us-east-1"
+    
+    # Initialize bedrock Chat
+    bc = BedrockChat(
+        model_id=(model_id or "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+        region_name=(region or "eu-central-1"),
+    )
+
 
     # ----- Load artifacts (priors/conflicts/boundary/fewshots) -----
     s1_policy = s2_policy = ""
@@ -535,7 +541,7 @@ def main():
             tech_dir,
             {
                 "tech": tech,
-                "model_id": args.model_id or Chat.SONNET_45_MODEL_ID,
+                "model_id": model_id,
                 "region": args.region,
                 "max_tokens_s1": args.max_tokens_s1,
                 "max_tokens_s2": args.max_tokens_s2,
@@ -601,24 +607,29 @@ def main():
                 )
                 printed_s1_preview = True
 
-            # === Bedrock: Chat(add_system/add_user/generate) ===
-            chat_s1 = Chat(
-                model_id=(model_id or Chat.SONNET_45_MODEL_ID),
-                region=region,
-                max_tokens=args.max_tokens_s1,
-                temperature=args.temperature,
-            )
-            for s in sys_blocks:
-                chat_s1.add_system(s)
-            chat_s1.add_user(user_block)
-
+            # --- Bedrock: stateless call with a single system string ---
             try:
-                s1_raw = chat_s1.generate()
-                arr = list_json_extract(s1_raw) or []
-                spans = align_and_normalize_s1(arr, txt, priors=(prompt_arts.get("priors_prompt") or {}))
+                system_str = "\n\n".join(sys_blocks)  # MUST be a single string
+                s1_raw = bc.chat(
+                    system_prompt=system_str,
+                    user_prompt=user_block,
+                    max_tokens=args.max_tokens_s1,
+                    temperature=args.temperature,
+                    # stop_sequences=["</answer>"],  # optional: helps stop right after JSON
+                )
+
+                # prefer extracting JSON inside <answer>…</answer>
+                arr = extract_answer_json(s1_raw) or []
+                # align our new schema {"label","text",["start"]} -> {"label","start","end"}
+                spans = align_and_normalize_s1(
+                    arr,
+                    txt,
+                    priors=(prompt_arts.get("priors_prompt") or {}),
+                )
             except Exception as e:
                 logging.warning(f"[S1] generate() failed -> empty spans: {e}")
                 spans = []
+
 
             total_raw += len(spans)
 
@@ -685,35 +696,48 @@ def main():
             txt = (doc2.get("text") or "").strip()
             mks = id2markers.get(_id, [])
 
-            # pick + balance few-shots once per doc (the per-run shuffle happens inside SC)
+            # --- Build few-shots for this doc once (pool) ---
             fewshots_s2 = _pick_balanced_s2_fewshots(fs_s2, k=min(8, len(fs_s2))) if fs_s2 else []
 
-            final_label, avg_con, avg_non, first_sys, first_user = run_s2_self_consistent(
+            # --- Self-consistency (uses BedrockChat + XML builders) ---
+            sc_match = re.search(r"sc(\d+)", tech)
+            sc_n = int(sc_match.group(1)) if sc_match else 1
+            if isinstance(args.s2_self_consistency, int) and args.s2_self_consistency >= 1:
+                sc_n = args.s2_self_consistency
+
+            final_label, avg_con, avg_non, dbg_sys, dbg_user = run_s2_self_consistent(
                 text=txt,
                 markers=mks,
                 fewshots_pool=fewshots_s2,
                 tech=tech,
                 policy_text=(s2_policy if use_policy else None),
                 prompt_arts=prompt_arts,
-                model_id=(model_id or Chat.SONNET_45_MODEL_ID),
-                region=region,
+                bedrock=bc,                                # pass the shared stateless client
                 max_tokens=args.max_tokens_s2,
                 base_temperature=args.temperature,
                 sc_temperature=args.sc_temperature,
                 sc_runs=max(1, sc_n),
             )
 
-            # Save/preview prompts for first few docs
-            if (args.save_prompts == "all") or (args.save_prompts == "sample" and saved_s2 < 3):
-                _save_prompt_bundle(tech_dir, "s2", str(_id), [first_sys], first_user)
+            # (Optional) save a sample of prompts
+            if args.save_prompts == "all" or (args.save_prompts == "sample" and saved_s2 < 3):
+                _save_prompt_bundle(tech_dir, "s2", str(_id), [dbg_sys], dbg_user)
                 saved_s2 += 1
             if args.print_prompts_preview and not printed_s2_preview:
-                print("[S2 prompt preview]\nSYSTEM:\n" + first_sys + "\n\nUSER:\n" + first_user)
+                print("[S2 prompt preview]\nSYSTEM:\n" + dbg_sys + "\n\nUSER:\n" + dbg_user)
                 printed_s2_preview = True
 
-            s2_out_rows.append({"_id": _id, "conspiracy": ("Yes" if final_label == "conspiracy" else "No")})
-            s2_prob_rows.append({"_id": _id, "label": final_label,
-                                "p_conspiracy": round(avg_con, 6), "p_non": round(avg_non, 6)})
+            # collect outputs
+            s2_out_rows.append({
+                "_id": _id,
+                "conspiracy": ("Yes" if final_label == "conspiracy" else "No"),
+            })
+            s2_prob_rows.append({
+                "_id": _id,
+                "label": final_label,
+                "p_conspiracy": round(avg_con, 6),
+                "p_non": round(avg_non, 6),
+            })
 
             # self-consistency
             #runs = max(1, int(sc_n))
