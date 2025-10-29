@@ -12,19 +12,24 @@ import json
 import time
 import random
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from botocore.exceptions import ClientError
+from botocore.config import Config
 
 # Configure logging once (respect callers who may reconfigure root logger)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 ANTHROPIC_VERSION = "bedrock-2023-05-31"
+
 
 class BedrockChat:
     """
     Stateless wrapper: each call to `chat()` is an independent request.
     No conversation history is stored.
     """
+
     def __init__(self, model_id: str, region_name: str = "eu-central-1"):
         """
         Args:
@@ -33,11 +38,64 @@ class BedrockChat:
         """
         self.model_id = model_id
         try:
-            self.client = boto3.client(service_name="bedrock-runtime", region_name=region_name)
-            logging.info(f"Bedrock client ready | model={self.model_id} region={region_name}")
+            # --- MODIFICATION START ---
+            # Increase the read timeout to accommodate long-running models.
+            # The default is 60 seconds, which is often too short for complex prompts.
+            # 900 seconds (15 minutes) is a safe starting point.
+            config = Config(
+                read_timeout=900,
+                connect_timeout=60,
+                retries={"max_attempts": 0},  # Let your script's retry logic handle it
+            )
+            self.client = boto3.client(
+                service_name="bedrock-runtime", region_name=region_name, config=config
+            )
+            logging.info(
+                f"Bedrock client ready | model={self.model_id} region={region_name}"
+            )
         except Exception as e:
-            logging.error("FATAL: Could not initialize Bedrock client (check AWS creds/region).")
+            logging.error(
+                "FATAL: Could not initialize Bedrock client (check AWS creds/region)."
+            )
             raise e
+
+    @staticmethod
+    def _parse_content_blocks(data: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Handles both standard responses (single text block) and Extended Thinking
+        responses (sequence of 'thinking' blocks followed by 'text').
+        Returns {"thinking": "...", "answer": "..."} (empty strings if absent).
+        """
+        thinking_parts: List[str] = []
+        final_answer = ""
+
+        # Claude Messages API returns {"content": [{"type": "...", ...}, ...]}
+        content = data.get("content") or []
+        for block in content:
+            btype = block.get("type")
+            if btype == "thinking":
+                # Claude 4 models often return a short summary here.
+                # We concatenate them; production can choose to ignore/log it.
+                txt = block.get("text") or ""
+                if txt:
+                    thinking_parts.append(txt)
+            elif btype == "text":
+                final_answer = block.get("text") or final_answer
+
+        # Fallback: some older paths put text directly at top-level
+        if (
+            not final_answer
+            and isinstance(data.get("content"), list)
+            and data["content"]
+        ):
+            maybe_text = data["content"][0].get("text")
+            if isinstance(maybe_text, str):
+                final_answer = maybe_text
+
+        return {
+            "thinking": ("\n".join(thinking_parts)).strip(),
+            "answer": (final_answer or "").strip(),
+        }
 
     def chat(
         self,
@@ -51,6 +109,9 @@ class BedrockChat:
         stop_sequences: Optional[List[str]] = None,
         retries: int = 3,
         backoff: float = 1.5,
+        # --- NEW ---
+        enable_extended_thinking: bool = False,
+        thinking_budget_tokens: Optional[int] = None,
     ) -> str:
         """
         Single, stateless Messages API call with retries.
@@ -79,9 +140,25 @@ class BedrockChat:
         if stop_sequences:
             payload["stop_sequences"] = list(stop_sequences)
 
+        # --- NEW: Extended Thinking injection ---
+        if enable_extended_thinking:
+            if (
+                thinking_budget_tokens is None
+                or thinking_budget_tokens <= 0
+                or thinking_budget_tokens >= max_tokens
+            ):
+                raise ValueError(
+                    "When enable_extended_thinking=True, thinking_budget_tokens must be set, >0, and < max_tokens."
+                )
+            payload["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": int(thinking_budget_tokens),
+            }
+
         body = json.dumps(payload)
 
-        last_exc = None
+        last_exc: Optional[Exception] = None
+        tried_without_xt = False
         for attempt in range(retries):
             try:
                 resp = self.client.invoke_model(
@@ -92,27 +169,42 @@ class BedrockChat:
                 )
                 data = json.loads(resp["body"].read())
 
-                # Expected Messages API shape:
+                # Expected Messages API shape:s
                 # {"content":[{"type":"text","text":"..."}], ...}
-                content = data.get("content")
-                if isinstance(content, list) and content and isinstance(content[0], dict):
-                    if content[0].get("type") == "text":
-                        return content[0].get("text", "")
-
-                logging.warning("Bedrock response missing expected content[0].text; returning empty string.")
-                return ""
-
+                # --- NEW: robust parsing for thinking + text blocks ---
+                parsed = self._parse_content_blocks(data)
+                if parsed["answer"] or parsed["thinking"]:
+                    return parsed
+                logging.warning(
+                    "Bedrock response contained no 'text' or 'thinking' blocks; returning empty strings."
+                )
+                return {"thinking": "", "answer": ""}
             except ClientError as e:
                 last_exc = e
-                logging.warning(f"[Bedrock ClientError try {attempt+1}/{retries}]: {e}")
+                msg = str(e)
+                logging.warning(
+                    f"[Bedrock ClientError try {attempt+1}/{retries}]: {msg}"
+                )
+                # If Extended Thinking is not supported in this region/model, auto-fallback once
+                if (
+                    enable_extended_thinking
+                    and not tried_without_xt
+                    and ("thinking" in msg or "validation" in msg.lower())
+                ):
+                    logging.info(
+                        "Extended Thinking not accepted by model/region. Retrying once without it."
+                    )
+                    enable_extended_thinking = False
+                    tried_without_xt = True
+                    continue
             except Exception as e:
                 last_exc = e
                 logging.warning(f"[Bedrock Error try {attempt+1}/{retries}]: {e}")
 
             if attempt < retries - 1:
-                wait = (backoff ** attempt) * (1 + 0.1 * random.random())
+                wait = (backoff**attempt) * (1 + 0.1 * random.random())
                 logging.info(f"Retrying in {wait:.2f}s…")
                 time.sleep(wait)
 
         logging.error(f"All {retries} retries failed. Last exception: {last_exc}")
-        return ""
+        return {"thinking": "", "answer": ""}

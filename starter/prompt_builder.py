@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 import json, re
 from pathlib import Path
-
+from typing import Optional, List, Dict
 
 
 # --------- Artifact IO ----------
@@ -11,7 +11,8 @@ def load_json(path: Path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
-    
+
+
 def playbook_block() -> str:
     return """
 <psycomark_playbook version="1.0">
@@ -53,17 +54,97 @@ def playbook_block() -> str:
 """.strip()
 
 
+# ---------- Few-shot utilities (S1) ----------
+def _clip_span_to_text(span: dict, text: str) -> Optional[dict]:
+    try:
+        s = int(span.get("start", span.get("startIndex")))
+        e = int(span.get("end", span.get("endIndex")))
+        s = max(0, min(s, len(text)))
+        e = max(s, min(e, len(text)))
+        lab = (span.get("label") or span.get("type") or "").strip()
+        if lab not in ("Actor", "Action", "Effect", "Victim", "Evidence"):
+            return None
+        if e - s < 3:
+            return None
+        return {"label": lab, "start": s, "end": e, "text": text[s:e]}
+    except Exception:
+        return None
+
+
+def _coerce_fewshot_s1(ex: dict) -> Optional[dict]:
+    """Accepts {'text','spans'} or {'text','answer'} (list/dict). Returns {'text','spans':[...]} or None."""
+    if not isinstance(ex, dict):
+        return None
+    text = (ex.get("text") or "").strip()
+    if not text:
+        return None
+    spans = ex.get("spans")
+    if spans is None:
+        ans = ex.get("answer")
+        if isinstance(ans, dict) and "spans" in ans:
+            spans = ans.get("spans")
+        else:
+            spans = ans
+    out = []
+    if isinstance(spans, list):
+        for m in spans:
+            m2 = _clip_span_to_text(m, text)
+            if m2:
+                out.append(m2)
+    return {"text": text, "spans": out}
+
+
+def build_s1_verifier_prompts(
+    *, text: str, candidate_spans: List[Dict]
+) -> tuple[str, str]:
+    """
+    Returns (system, user) prompts. Model should output ONLY:
+      {"keep":[int,int,...], "reject":[int,int,...]}
+    where indices refer to candidate_spans order.
+    Criteria:
+      - text slice at [start:end] MUST match candidate "text" if provided (± trivial whitespace).
+      - Label validity: apply Evidence gate (URL/quote+attribution/source OR numbers+units+source),
+                        Action-Effect split heuristic (verbs vs purpose clause),
+                        drop spans < 3 chars.
+    """
+    sys = """
+<role>You are a strict validator for span extraction.</role>
+<rules>
+  1) Offsets are 0-indexed, end-exclusive; slice must equal candidate "text" if present.
+  2) Evidence requires URL/domain OR quoted+attributed source OR numeric facts+units+source.
+  3) Action vs Effect: verb head = Action; purpose/result (to/in order to/so that …) = Effect.
+  4) Drop spans shorter than 3 chars or obvious role mismatch.
+  5) Output ONLY one JSON object: {"keep":[...], "reject":[...]}.
+</rules>
+""".strip()
+    user = json.dumps(
+        {
+            "text": text,
+            "candidates": candidate_spans,
+            "output_format": {"keep": [0], "reject": [1]},
+        },
+        ensure_ascii=False,
+    )
+    # We intentionally give a JSON-shaped user payload; your runner can wrap it with <task> if desired.
+    return sys, f"<task>\n{user}\n</task>"
+
+
 # TODO: Check the span extraction method if it is valid or if we should ask the LLM to handle it
 # --------- S1 builders ----------
 def build_s1_system(priors: dict, conflicts: list[list[str]], use_cot: bool) -> str:
     # format priors once
     priors_str = ""
     for lab, d in (priors or {}).items():
-        q90 = d.get("q90_len"); pos = d.get("mode_pos")
+        q90 = d.get("q90_len")
+        pos = d.get("mode_pos")
         if q90 is not None and pos is not None:
             priors_str += f"- {lab}: typical length ≤ {q90:.0f} chars; often starts near {pos*100:.0f}% of text.\n"
 
-    conflict_pairs = ", ".join([f"{p[0]}–{p[1]}" for p in conflicts]) if conflicts else "Action–Effect; Actor–Victim"
+    conflict_pairs = (
+        ", ".join([f"{p[0]}–{p[1]}" for p in conflicts])
+        if conflicts
+        else "Action-Effect; Actor-Victim"
+    )
 
     workflow_block = ""
     if use_cot:
@@ -76,13 +157,19 @@ def build_s1_system(priors: dict, conflicts: list[list[str]], use_cot: bool) -> 
     - Victim: candidate harmed/targeted entities.
     - Evidence: candidate citations/quotes/links/attributions.
   </pass_a_candidate_scan>
-  <pass_b_validation_and_refinement>
-    - Boundary: spans must be tight (no leading/trailing whitespace or punctuation).
-    - Overlap: resolve conflicts (esp. Action vs Effect) by splitting or choosing minimal, role-true spans. Actor vs Victim uses smallest role-specific mention.
-    - Priors: use statistical priors (length/position) as tie-breakers only.
-    - Quality: drop spans < 3 chars after trimming.
-    - Final check: if none remain, answer [].
-  </pass_b_validation_and_refinement>
+  <pass_b_verbatim_extraction_and_filtering>
+    - For each candidate from Pass A, extract the exact, verbatim text string. Do not determine character offsets yet.
+    - Apply boundary rules to the text itself: ensure the extracted string is tight (no leading/trailing whitespace or punctuation).
+    - Apply quality rules to the text itself: drop any extracted string that is less than 3 characters long.
+  </pass_b_verbatim_extraction_and_filtering>
+  <pass_c_index_mapping_and_finalization>
+    - For each valid verbatim text string from Pass B:
+        1. Locate this exact string within the original <text_to_analyze>.
+        2. Determine its precise `start` and `end` character offsets.
+    - Resolve Overlaps: Now that you have precise spans, resolve conflicts (esp. Action vs Effect) by choosing the minimal, role-true span. Actor vs Victim uses the smallest role-specific mention.
+    - Use Priors: Use statistical priors (length/position) as tie-breakers only if ambiguity remains after all other rules.
+    - Final check: if none remain, answer.
+  </pass_c_index_mapping_and_finalization>
 </thinking>
 </workflow>"""
 
@@ -103,24 +190,35 @@ Extract psycholinguistic markers with exact character offsets.
   <output_format>
     Return ONLY a JSON array inside <answer>.
     Each element:
-    {"label":"Actor|Action|Effect|Victim|Evidence","start":int,"end":int,"text":"<optional verbatim substring>"}
+    [
+        {{"label":"Actor|Action|Effect|Victim|Evidence","start": <int>,"end": <int>,"text":"<optional verbatim substring>"}}
+    ]
 
     Rules:
-    - start is 0-indexed; end is exclusive (integers).
-    - "text" is OPTIONAL and used only for auditing; evaluator ignores it.
-    - No extra keys and no prose.
+    - "text" must be copied verbatim from <text_to_analyze>.
+    - "start" and "end" are mandatory integers (0-indexed, end-exclusive).
+    - No prose, no extra keys, no trailing commas.
   </output_format>
-
 
   <boundaries>
     - Spans are measured over the raw TEXT (no normalization).
     - Keep token-tight; include prepositions/particles only if integral (“set up”, “cover up”, “in charge of”).
   </boundaries>
+  
+  <evidence_gate>
+    Only label as Evidence if the substring contains (a) a URL/domain, OR (b) quotation marks with an attribution verb (e.g., “said”, “according to”) AND a concrete source name, OR (c) numeric facts with units AND a source (“report”, “Reuters”, “CDC”).
+    Phrases like “some say”, “it has been said”, “according to X” with no URL/quote/source are NOT Evidence.
+  </evidence_gate>
+  
+  <action_effect_split>
+    If a verb phrase has a purpose/result introduced by “to/so that/in order to”, label the verb head as Action and the purpose/result as Effect. Prefer the minimal verb head as Action.
+  </action_effect_split>
 
   <overlap_policy>
     - Ambiguous pairs: {conflict_pairs}.
     - Action vs Effect: split verb (Action) from purpose/result (Effect); allow minimal overlap only if unavoidable.
     - Evidence may overlap others if it is part of a quotation/citation.
+    - Action vs Effect: verb head = Action; purpose/result introduced by “to”, “in order to”, “so that”, “for” = Effect.
   </overlap_policy>
 
   <priors>
@@ -133,22 +231,63 @@ Extract psycholinguistic markers with exact character offsets.
 
 {workflow_block}"""
 
-def build_s1_user(text_input: str, s1_fewshots: list[dict], include_cot: bool=True) -> str:
+
+def build_s1_user(
+    text_input: str, s1_fewshots: list[dict], include_cot: bool = True
+) -> str:
+    # --- normalize & guardrail the few-shots ---
+    raw = []
+    for ex in s1_fewshots or []:
+        coerced = _coerce_fewshot_s1(ex)
+        if coerced:
+            raw.append(coerced)
+
+    # Split into positive (has spans) vs negative ([]); prefer positives, cap negatives
+    pos = [e for e in raw if (e.get("spans") or [])]
+    neg = [e for e in raw if not (e.get("spans") or [])]
+
+    # Label coverage heuristic: try to keep a mix; simple greedy cover
+    want = 8
+    kept: List[dict] = []
+    have = set()
+    for e in pos:
+        labs = {m["label"] for m in e["spans"]}
+        if not labs.issubset(have):
+            kept.append(e)
+            have |= labs
+        if len(kept) >= want:
+            break
+    # Fill remaining with other positives
+    if len(kept) < want:
+        for e in pos:
+            if e not in kept:
+                kept.append(e)
+                if len(kept) >= want:
+                    break
+    # Allow at most 2 negatives (avoid “all-[]” priming)
+    if len(kept) < want and neg:
+        kept.extend(neg[: min(2, want - len(kept))])
+    kept = kept[:want]
+
+    # Render examples
     ex_blocks = []
-    for ex in (s1_fewshots or [])[:8]:
-        # expect few-shot spans already in canonical schema
+    for ex in kept:
         spans = ex.get("spans", [])
         ex_blocks.append(
             "<example>\n"
-            "<text>\n" + ex.get("text","") + "\n</text>\n"
+            "<text>\n" + ex.get("text", "") + "\n</text>\n"
             "<answer>\n" + json.dumps(spans, ensure_ascii=False) + "\n</answer>\n"
             "</example>"
         )
-    examples = "<examples>\n" + "\n".join(ex_blocks) + "\n</examples>\n\n" if ex_blocks else ""
+    examples = (
+        "<examples>\n" + "\n".join(ex_blocks) + "\n</examples>\n\n" if ex_blocks else ""
+    )
 
-    tail = ("Provide your reasoning in <thinking> (kept private), then output ONLY the JSON array in <answer>."
-            if include_cot else
-            "Provide ONLY the final JSON in <answer>.")
+    tail = (
+        "Provide your reasoning in <thinking> (kept private), then output ONLY the JSON array in <answer>."
+        if include_cot
+        else "Provide ONLY the final JSON in <answer>."
+    )
 
     return f"""{examples}<task>
 <text_to_analyze>
@@ -161,16 +300,24 @@ def build_s1_user(text_input: str, s1_fewshots: list[dict], include_cot: bool=Tr
 import json
 import re
 
+
 # --- S2 prompt adapter: builds prompts from tech flags and passes cant_tell policy ---
 def build_s2_prompts_adapter(
-    *, text: str, markers: list, fewshots: list | None, tech: str, allow_cant_tell: bool = True
+    *,
+    text: str,
+    markers: list,
+    fewshots: list | None,
+    tech: str,
+    allow_cant_tell: bool = False,
 ) -> tuple[str, str]:
-    use_cot = ("cot" in tech)
+    use_cot = "cot" in tech
     sys_prompt = build_s2_system(
         include_cot=use_cot,
         allow_cant_tell=allow_cant_tell,
         # the following are accepted but ignored (kept for backward-compat)
-        policy_text=None, boundary_note=None, prompt_arts=None
+        policy_text=None,
+        boundary_note=None,
+        prompt_arts=None,
     )
     user_prompt = build_s2_user(
         text_input=text,
@@ -183,12 +330,12 @@ def build_s2_prompts_adapter(
 
 
 def build_s2_system(
-    *, 
-    policy_text: str | None = None,          # accepted for backward compat (DEPRECATED)
+    *,
+    policy_text: str | None = None,  # accepted for backward compat (DEPRECATED)
     include_cot: bool = False,
-    boundary_note: str | None = None,        # accepted for backward compat (DEPRECATED)
-    prompt_arts: dict | None = None,         # accepted for backward compat (DEPRECATED)
-    allow_cant_tell: bool = False
+    boundary_note: str | None = None,  # accepted for backward compat (DEPRECATED)
+    prompt_arts: dict | None = None,  # accepted for backward compat (DEPRECATED)
+    allow_cant_tell: bool = False,
 ) -> str:
     """
     S2 SYSTEM PROMPT (streamlined):
@@ -201,7 +348,11 @@ def build_s2_system(
     labels_desc = (
         "- conspiracy: The text endorses a hidden, harmful plot by a powerful actor and exhibits multiple hallmarks.\n"
         "- non: The text does not endorse conspiratorial framing (e.g., neutral reporting, mocking, debunking).\n"
-        + ("- cant_tell: The text is too ambiguous to classify reliably.\n" if allow_cant_tell else "")
+        + (
+            "- cant_tell: The text is too ambiguous to classify reliably.\n"
+            if allow_cant_tell
+            else ""
+        )
     )
 
     workflow_block = ""
@@ -242,19 +393,19 @@ You are an expert social scientist specializing in online discourse. Classify th
 
 <output_format>
 Return ONLY one JSON object inside <answer>:
-{{"label":"{('conspiracy|non|cant_tell' if allow_cant_tell else 'conspiracy|non')}", "rationale":"1–2 sentences naming decisive cues"}}
+{{"label":"{('conspiracy|non|cant_tell' if allow_cant_tell else 'conspiracy|non')}", "rationale":"1-2 sentences naming decisive cues"}}
 </output_format>
 {workflow_block}
 """.strip()
 
 
 def build_s2_user(
-    *, 
-    text_input: str, 
+    *,
+    text_input: str,
     s1_output: list | None,
-    s2_fewshots: list | None = None, 
+    s2_fewshots: list | None = None,
     include_cot: bool = False,
-    allow_cant_tell: bool = True
+    allow_cant_tell: bool = False,
 ) -> str:
     """
     S2 USER PROMPT (streamlined):
@@ -263,59 +414,76 @@ def build_s2_user(
       - Uses S1 markers as evidence.
     """
 
+    # ------- Few-shot block (normalize markers using each example's text) -------
     ex_block = ""
     if s2_fewshots:
         parts = []
         for ex in s2_fewshots:
-            t = ex.get("text", "")
-            lbl = (ex.get("label") or (ex.get("gold") or {}).get("label") or "non").lower()
-            valid = {"conspiracy", "non"} | ({"cant_tell"} if allow_cant_tell else set())
+            doc_text = ex.get("text", "")
+            lbl = (
+                ex.get("label") or (ex.get("gold") or {}).get("label") or "non"
+            ).lower()
+            valid = {"conspiracy", "non"} | (
+                {"cant_tell"} if allow_cant_tell else set()
+            )
             if lbl not in valid:
                 lbl = "non"
 
             mk_norm = []
-            for m in (ex.get("markers") or []):
-                lab = (m.get("type") or m.get("label") or "").strip()
-                s = m.get("startIndex", m.get("start"))
-                e = m.get("endIndex", m.get("end"))
+            for m in ex.get("markers") or []:
                 try:
-                    s, e = int(s), int(e)
+                    mk_norm.append(to_s2_marker(m, doc_text))
                 except Exception:
                     continue
-                if lab and e > s:
-                    mk_norm.append({"type": lab, "startIndex": s, "endIndex": e})
 
             gold = {
                 "label": lbl,
-                "rationale": ex.get("rationale", "Concise example rationale.")
+                "rationale": ex.get("rationale", "concise example rationale."),
             }
 
             parts.append(
                 "<example>\n"
-                "<text>\n" + t + "\n</text>\n"
-                + ("<extracted_markers>\n" + json.dumps(mk_norm, ensure_ascii=False) + "\n</extracted_markers>\n" if mk_norm else "")
-                + "<answer>\n" + json.dumps(gold, ensure_ascii=False) + "\n</answer>\n"
+                "<text>\n"
+                + doc_text
+                + "\n</text>\n"
+                + (
+                    "<extracted_markers>\n"
+                    + json.dumps(mk_norm, ensure_ascii=False)
+                    + "\n</extracted_markers>\n"
+                    if mk_norm
+                    else ""
+                )
+                + "<answer>\n"
+                + json.dumps(gold, ensure_ascii=False)
+                + "\n</answer>\n"
                 "</example>"
             )
         ex_block = "<examples>\n" + "\n\n".join(parts) + "\n</examples>\n\n"
 
-    markers_json = json.dumps(s1_output or [], ensure_ascii=False)
-    tail = ("Provide brief reasoning in <thinking>, then return the final JSON in <answer>."
-            if include_cot else
-            "Return only the final JSON in <answer>.")
+    # ------- Normalize live S1 markers against the CURRENT doc text -------
+    s1_norm = []
+    for m in s1_output or []:
+        try:
+            s1_norm.append(to_s2_marker(m, text_input))
+        except Exception:
+            continue
+
+    task_tail = (
+        "Provide brief reasoning in <thinking> then the final JSON in <answer>."
+        if include_cot
+        else "Provide ONLY the final JSON in <answer>."
+    )
 
     return f"""{ex_block}<task>
 <text_to_analyze>
 {text_input}
 </text_to_analyze>
 <extracted_markers>
-{markers_json}
+{json.dumps(s1_norm, ensure_ascii=False)}
 </extracted_markers>
-Use the extracted markers as evidence to decide the label according to the <analytical_framework>.
-{tail}
+Instructions: Use the markers as evidence; ambiguity without hidden-plot framing should lean "non".
+{task_tail}
 </task>""".strip()
-
-
 
 
 # --------- Utilities ----------
@@ -335,43 +503,71 @@ def _normalize_quotes(s: str) -> str:
     return s
 
 
-def extract_answer_json(text: str):
-    """Extract JSON from inside <answer>...</answer>. Falls back to last JSON-like block."""
-    if not isinstance(text, str):
-        return None
-    s = _normalize_quotes(text)
-    m = re.search(r"<answer>\s*(\[.*?\]|\{.*?\})\s*</answer>", s, re.S)
+def extract_answer_json(x):
+    """
+    Returns either:
+      - list[dict] (for S1 spans), or
+      - dict (for S2 {"label":..., "rationale":..., "confidence":...})
+    Robust to dict/bytes/str; prefers JSON inside <answer>...</answer>; else last JSON blob.
+    """
+
+    def _as_text(v):
+        if v is None:
+            return ""
+        if isinstance(v, (bytes, bytearray)):
+            try:
+                return v.decode("utf-8", errors="ignore")
+            except Exception:
+                return str(v)
+        if isinstance(v, dict):
+            cand = v.get("answer") or v.get("text") or v.get("content") or v
+            return (
+                json.dumps(cand, ensure_ascii=False)
+                if not isinstance(cand, str)
+                else cand
+            )
+        return str(v)
+
+    s = _as_text(x)
+
+    # Prefer content inside <answer>...</answer>
+    m = re.search(r"<answer>\s*(\{.*?\}|\[.*?\])\s*</answer>", s, re.S)
     blob = m.group(1) if m else None
+
+    # Fallback: take last JSON object/array in the text
     if not blob:
-        # fallback: last JSON-looking block
-        cand = re.findall(r"(\[.*\]|\{.*\})", s, re.S)
-        blob = cand[-1] if cand else None
+        parts = re.findall(r"(\{.*?\}|\[.*?\])", s, re.S)
+        blob = parts[-1] if parts else None
+
     if not blob:
-        return None
-    # simple cleanup
-    blob = blob.strip().strip("`")
+        return []  # default for S1 call sites
+
     try:
-        return json.loads(blob)
+        js = json.loads(blob)
     except Exception:
-        # crude repairs
-        blob = re.sub(r",\s*([}\]])", r"\1", blob)  # trailing commas
-        blob = blob.replace("'", '"')  # single -> double
+        blob2 = re.sub(r",\s*([\}\]])", r"\1", blob)
         try:
-            return json.loads(blob)
+            js = json.loads(blob2)
         except Exception:
-            return None
+            return []
+
+    return js
+
 
 import re
+
 
 def _safe_clip(s: str, a: int, b: int):
     a = max(0, int(a))
     b = min(len(s), int(b))
     return a, max(a, b)
 
+
 def _window_bounds(a: int, b: int, L: int, win: int):
     lo = max(0, min(a, b) - win)
     hi = min(L, max(a, b) + win)
     return lo, hi
+
 
 def _try_local_snap(text: str, start: int, end: int, echo: str, win: int = 16):
     """
@@ -389,7 +585,10 @@ def _try_local_snap(text: str, start: int, end: int, echo: str, win: int = 16):
         return s, s + len(echo)
     return start, end
 
-def validate_and_repair_s1_spans(items: list[dict], text: str, *, win: int = 16, use_tokens: bool = True):
+
+def validate_and_repair_s1_spans(
+    items: list[dict], text: str, *, win: int = 16, use_tokens: bool = True
+):
     """
     Hybrid repair:
       1) Require ints for start/end and clip to bounds.
@@ -410,7 +609,7 @@ def validate_and_repair_s1_spans(items: list[dict], text: str, *, win: int = 16,
 
     for m in items or []:
         lab = (m.get("label") or m.get("type") or "").strip()
-        if lab not in ("Actor","Action","Effect","Victim","Evidence"):
+        if lab not in ("Actor", "Action", "Effect", "Victim", "Evidence"):
             continue
 
         # ints + clip
@@ -451,3 +650,23 @@ def validate_and_repair_s1_spans(items: list[dict], text: str, *, win: int = 16,
         out.append({"label": lab, "start": s, "end": e})
 
     return out
+
+
+# ---- Utilities (shared) ----
+def to_s2_marker(m: dict, txt: str) -> dict:
+    """
+    Normalize an S1-style span (label/start/end[/text]) into the S2 schema:
+      {"type","startIndex","endIndex","text"}
+    - Clips to bounds
+    - Recomputes 'text' slice from offsets (ignores any echoed text)
+    """
+    s = int(m.get("start", m.get("startIndex", 0)))
+    e = int(m.get("end", m.get("endIndex", s)))
+    s = max(0, min(s, len(txt)))
+    e = max(s, min(e, len(txt)))
+    return {
+        "type": (m.get("type") or m.get("label")),
+        "startIndex": s,
+        "endIndex": e,
+        "text": txt[s:e],
+    }

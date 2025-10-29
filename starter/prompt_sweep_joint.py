@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover
 # repo root on path
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import pathlib as _pathlib
-from src.psycomark.llm.bedrock_chat import Chat
+from src.psycomark.llm.bedrock_chat import BedrockChat
 from src.psycomark.llm.eda_support import (
     build_s1_policy,
     build_s2_policy,
@@ -409,6 +409,221 @@ def _conflict_nms(spans, iou_thr=0.50, text_len=1, priors=None):
     return [s for k, s in zip(keep, spans) if k]
 
 
+def _looks_like_evidence(txt: str) -> bool:
+    t = txt.strip()
+    has_url = re.search(r"https?://|www\.", t, re.I)
+    has_domain = re.search(r"\b[A-Za-z0-9-]+\.(com|org|net|gov|edu)\b", t)
+    has_quote = '"' in t or "“" in t or "”" in t or "'" in t
+    has_attrb = re.search(
+        r"\b(according to|said|reported|per|per\s+\w+|study|report)\b", t, re.I
+    )
+    has_number = re.search(
+        r"\b\d[\d,]*(\.\d+)?\s*(%|million|billion|cases|people|USD|dollars|€)\b", t
+    )
+    return bool(
+        has_url or has_domain or (has_quote and has_attrb) or (has_number and has_attrb)
+    )
+
+
+def _span_quality_gate(s: dict, full_text: str) -> bool:
+    lab = (s.get("label") or s.get("type") or "").lower()
+    a = s.get("start", s.get("startIndex"))
+    b = s.get("end", s.get("endIndex"))
+    if not isinstance(a, int) or not isinstance(b, int) or b <= a:
+        return False
+    t = full_text[a:b].strip()
+    # Drop tiny/noisy spans
+    if len(t) < 3:
+        return False
+    if len(t.split()) == 1 and re.fullmatch(
+        r"(to|of|and|the|you|them|it|he|she|they|we|us)", t, re.I
+    ):
+        return False
+    # Evidence gate
+    if lab == "evidence" and not _looks_like_evidence(t):
+        return False
+    # Action must contain a verb character
+    if lab == "action" and not re.search(
+        r"\b\w+(ed|ing|s)\b|\b(be|do|have|go|make|take|give|get|use|say)\b", t, re.I
+    ):
+        return False
+    # Actor/Victim should be nouny (avoid starting with auxiliaries)
+    if lab in ("actor", "victim") and re.match(
+        r"^(is|are|was|were|be|do|did|does|to)\b", t, re.I
+    ):
+        return False
+    return True
+
+
+_ALLOWED = {"Actor", "Action", "Effect", "Victim", "Evidence"}
+
+_VERBISH = re.compile(
+    r"\b(\w+ed|\w+ing|\w+s|be|is|are|was|were|do|does|did|have|has|had|make|take|give|get|use|say|go)\b",
+    re.I,
+)
+_AUX_START = re.compile(r"^(is|are|was|were|be|do|did|does|to)\b", re.I)
+_PURPOSE = re.compile(r"\b(to|in order to|so that)\b", re.I)
+_URL_OR_DOMAIN = re.compile(
+    r"(https?://|www\.)|([A-Za-z0-9-]+\.(com|org|net|gov|edu))", re.I
+)
+_ATTRIB = re.compile(
+    r"\b(according to|said|reported|per|study|report|Reuters|AP|NYT|CDC|WHO)\b", re.I
+)
+_NUM_UNIT = re.compile(
+    r"\b\d[\d,]*(\.\d+)?\s*(%|k|m|million|billion|cases|people|USD|dollars|€)\b", re.I
+)
+
+
+def _evidence_gate(txt: str) -> bool:
+    t = (txt or "").strip()
+    if not t:
+        return False
+    has_url = bool(_URL_OR_DOMAIN.search(t))
+    has_quote = any(q in t for q in ['"', "“", "”", "'"])
+    has_attr = bool(_ATTRIB.search(t))
+    has_num = bool(_NUM_UNIT.search(t))
+    # Need: URL/domain OR (quote & attribution) OR (numbers & attribution)
+    return has_url or (has_quote and has_attr) or (has_num and has_attr)
+
+
+def _quality_gate(m: dict, full_text: str, priors: dict | None) -> bool:
+    lab = (m.get("label") or m.get("type") or "").strip()
+    if lab not in _ALLOWED:
+        return False
+    s = m.get("start")
+    e = m.get("end")
+    if not isinstance(s, int) or not isinstance(e, int) or e <= s:
+        return False
+    t = full_text[s:e].strip()
+    if len(t) < 3:
+        return False
+    if len(t.split()) == 1 and t.lower() in {
+        "to",
+        "of",
+        "and",
+        "the",
+        "you",
+        "them",
+        "it",
+        "he",
+        "she",
+        "they",
+        "we",
+        "us",
+    }:
+        return False
+    # Label-specific checks
+    if lab == "Evidence" and not _evidence_gate(t):
+        return False
+    if lab == "Action" and not _VERBISH.search(t):
+        return False
+    if lab in {"Actor", "Victim"} and _AUX_START.match(t):
+        return False
+    # Optional upper-bound using priors (cap at ~1.2*q90_len)
+    if priors:
+        pr = (priors.get("s1_priors") or priors).get(lab) or {}
+        q90 = pr.get("q90_len")
+        if isinstance(q90, int) and (e - s) > int(1.2 * max(8, q90)):
+            # allow long Evidence (quotes/URLs) but clip others
+            if lab != "Evidence":
+                return False
+    return True
+
+
+def _split_action_effect(m: dict, full_text: str) -> list[dict]:
+    """If Action contains a clear purpose clause, split tail to Effect."""
+    if (m.get("label") or m.get("type")) != "Action":
+        return [m]
+    s, e = m["start"], m["end"]
+    seg = full_text[s:e]
+    mobj = _PURPOSE.search(seg)
+    if not mobj:
+        return [m]
+    cut = s + mobj.start()
+    # left = minimal Action head
+    left = dict(m)
+    left["end"] = cut
+    # right = Effect tail (skip the conjunction token)
+    right = dict(m)
+    right["label"] = right["type"] = "Effect"
+    right["start"] = cut + len(mobj.group(0))
+    # trim space
+    while right["start"] < e and full_text[right["start"]] == " ":
+        right["start"] += 1
+    if left["end"] - left["start"] < 3:  # too tiny
+        return [m]
+    if right["end"] - right["start"] < 3:
+        return [left]
+    return [left, right]
+
+
+import re
+
+# (keep your existing helpers/imports)
+
+# --- 3) Heuristic split of Action→Effect on purpose markers ---
+_PURPOSE = re.compile(r"\b(to|in order to|so that)\b", re.I)
+
+
+def _split_action_effect(span: dict, full_text: str) -> list[dict]:
+    """
+    If an Action span contains a clear purpose/result clause ('to / in order to / so that'),
+    split the tail into an Effect. Keeps minimal verb head as Action.
+    """
+    lab = (span.get("label") or span.get("type") or "").strip()
+    if lab != "Action":
+        return [span]
+    s = span.get("start", span.get("startIndex"))
+    e = span.get("end", span.get("endIndex"))
+    if not isinstance(s, int) or not isinstance(e, int) or e <= s:
+        return [span]
+    seg = full_text[s:e]
+    m = _PURPOSE.search(seg)
+    if not m:
+        return [span]
+    cut = s + m.start()
+    # Left: minimal Action head
+    left = dict(span)
+    left["label"] = left.get("label", span.get("type", "Action"))
+    left["type"] = "Action"
+    left["start"] = left.get("start", left.get("startIndex", s))
+    left["end"] = left["endIndex"] = cut
+    # Right: Effect tail (skip the marker token)
+    right = dict(span)
+    right["label"] = right["type"] = "Effect"
+    right["start"] = right["startIndex"] = cut + len(m.group(0))
+    while right["start"] < e and full_text[right["start"]] == " ":
+        right["start"] += 1
+    right["end"] = right["endIndex"] = e
+    # Guard tiny fragments
+    if (left["end"] - left["start"]) < 3:
+        return [span]
+    if (right["end"] - right["start"]) < 3:
+        return [left]
+    return [left, right]
+
+
+def _prefer_role_true_minimal(a: dict, b: dict, full_text: str) -> str:
+    """
+    Return the label to keep (either a['label'] or b['label']) when two spans conflict.
+    - If identical surface and labels are Victim/Effect: prefer Victim if 'harmed-group' words present; else Effect.
+    - Else prefer the shorter span (more 'minimal').
+    """
+    ta = full_text[a["start"] : a["end"]]
+    tb = full_text[b["start"] : b["end"]]
+    if ta == tb and {a["label"], b["label"]} == {"Victim", "Effect"}:
+        if re.search(
+            r"\b(people|citizens|workers|children|victims?|students|minorities|civilians)\b",
+            ta,
+            re.I,
+        ):
+            return "Victim"
+        return "Effect"
+    len_a = a["end"] - a["start"]
+    len_b = b["end"] - b["start"]
+    return a["label"] if len_a <= len_b else b["label"]
+
+
 def postprocess_s1_spans(
     text: str,
     spans: List[dict],
@@ -417,7 +632,7 @@ def postprocess_s1_spans(
     dedup_iou: float = 0.90,
     conflict_iou: float = 0.50,
 ):
-    """Main post-proc: snap -> drop zero -> merge tiny gaps -> dedup -> conflict NMS."""
+    """Main post-proc: snap -> quality gate -> split AE -> merge tiny gaps -> dedup -> conflict NMS."""
     if not text or not spans:
         return []
     toks = _tokenize_eval(text)
@@ -426,6 +641,8 @@ def postprocess_s1_spans(
     canon = []
     for m in spans:
         lab = (m.get("label") or m.get("type") or "").strip()
+        if lab not in _ALLOWED:
+            continue
         s = m.get("start", m.get("startIndex"))
         e = m.get("end", m.get("endIndex"))
         try:
@@ -441,23 +658,60 @@ def postprocess_s1_spans(
             canon.append(snapped)
     if not canon:
         return []
+
+    # 1.5) quality gate (drop tiny/noisy, Evidence without source, etc.)
+    canon = [m for m in canon if _quality_gate(m, text, priors)]
+    if not canon:
+        return []
+    # 1.6) split Action→Effect on purpose markers
+    _tmp = []
+    for m in canon:
+        _tmp.extend(_split_action_effect(m, text))
+    canon = [m for m in _tmp if _quality_gate(m, text, priors)]
+
     # 2) merge tiny gaps (same label)
     canon = _merge_tiny_gaps(canon, gap=merge_gap)
     # 3) de-dup near duplicates (same label)
     canon = _dedup_same_label(canon, iou_thr=dedup_iou, text_len=L, priors=priors)
     # 4) conflict-aware NMS (Action/Effect, Actor/Victim)
     canon = _conflict_nms(canon, iou_thr=conflict_iou, text_len=L, priors=priors)
+    # 4.1) tough conflicts with identical surfaces across labels
+    if len(canon) > 1:
+        keep = []
+        used = [False] * len(canon)
+        for i in range(len(canon)):
+            if used[i]:
+                continue
+            a = canon[i]
+            chosen = i
+            for j in range(i + 1, len(canon)):
+                if used[j]:
+                    continue
+                b = canon[j]
+                # strong conflict if IoU >= conflict_iou OR identical surface
+                iou = _iou(a, b)
+                same_surface = (
+                    text[a["start"] : a["end"]] == text[b["start"] : b["end"]]
+                )
+                if (iou >= conflict_iou) or same_surface:
+                    keep_lab = _prefer_role_true_minimal(a, b, text)
+                    chosen = i if keep_lab == a["label"] else j
+                    used[i] = used[j] = True
+                    break
+            used[chosen] = True
+            keep.append(canon[chosen])
+        canon = keep
     # back to submission schema + attach text slice
-    out = []
-    for m in canon:
-        out.append(
-            {
-                "type": m["label"],
-                "startIndex": m["start"],
-                "endIndex": m["end"],
-                "text": text[m["start"] : m["end"]],
-            }
-        )
+    canon.sort(key=lambda m: (m["start"], m["end"]))
+    out = [
+        {
+            "type": m["label"],
+            "startIndex": m["start"],
+            "endIndex": m["end"],
+            "text": text[m["start"] : m["end"]],
+        }
+        for m in canon
+    ]
     return out
 
 
@@ -1374,566 +1628,568 @@ def _order_s1_fewshots(fs: list[dict]) -> list[dict]:
 
 
 # ---------- main ----------
-def main():
-    ap = argparse.ArgumentParser()
-    # Use dev_rehydrated.jsonl for both S1 and S2 by default
-    ap.add_argument("--test-file-s1", required=False, default="dev_rehydrated.jsonl")
-    ap.add_argument("--test-file-s2", required=False, default="dev_rehydrated.jsonl")
-    ap.add_argument("--eda-root", required=False, default=None)
-    ap.add_argument(
-        "--techniques",
-        default=ALL_TECHNIQUES,
-        help="Comma list applied jointly. Examples: zs,fs_boundary_policy,sc5,sc10",
-    )
-    ap.add_argument(
-        "--save-prompts",
-        choices=["none", "sample", "all"],
-        default="sample",
-        help="Save prompts to runs/<out>/prompts. 'sample' saves first 3 docs per task+tech.",
-    )
-    ap.add_argument(
-        "--print-prompts-preview",
-        action="store_true",
-        default=True,
-        help="Print a short preview (first 500 chars) of the final system+user prompts once per technique.",
-    )
-    ap.add_argument("--model-id", default=None)
-    ap.add_argument("--region", default=None)
-    ap.add_argument("--max-tokens-s1", type=int, default=1200)
-    ap.add_argument("--max-tokens-s2", type=int, default=900)
-    ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--sc-temperature", type=float, default=0.7)
-    ap.add_argument(
-        "--art-dir",
-        type=str,
-        default=None,
-        help="Folder with prompt artifacts (best_fewshot_examples.json, priors_prompt.json, fewshot_policy.json). If omitted, falls back to --eda-root.",
-    )
-    ap.add_argument(
-        "--s2-self-consistency",
-        type=int,
-        default=None,
-        help="Override scN from --techniques (e.g., sc5). If set, uses this value for all techniques.",
-    )
-    ap.add_argument("--s1-iou", type=float, default=0.5)
-    ap.add_argument("--out-root", default="runs/joint_llm")
-    ap.add_argument(
-        "--pp-merge-gap",
-        type=int,
-        default=1,
-        help="Merge same-label spans separated by <= gap chars.",
-    )
-    ap.add_argument(
-        "--pp-dedup-iou",
-        type=float,
-        default=0.90,
-        help="De-dup same-label spans with IoU>=thr (keep prior-closer).",
-    )
-    ap.add_argument(
-        "--pp-conflict-iou",
-        type=float,
-        default=0.50,
-        help="NMS IoU for conflict pairs (Actor/Victim, Action/Effect).",
-    )
-    ap.add_argument(
-        "--max-markers-per-label",
-        type=int,
-        default=3,
-        help="Limit markers passed to S2 to control prompt length.",
-    )
-    ap.add_argument(
-        "--limit-docs",
-        type=int,
-        default=None,
-        help="Process only the first N documents for each of S1/S2 (for quicker prompt sweeps).",
-    )
-    ap.add_argument(
-        "--s2-thresh",
-        default="auto",
-        help='Decision threshold for S2. Use "auto" to tune on dev probs, or a float like 0.45.',
-    )
-    args = ap.parse_args()
-
-    print("=== JOINT PROMPT SWEEP START ===")
-    # Print model info
-    print(f"Model ID: {args.model_id}, Region: {args.region}")
-
-    random.seed(42)
-
-    # EDA
-    prompt_arts = {}
-    s1_policy = s2_policy = ""
-    s1_shots = []
-    s2_shots = []
-    boundary = ""
-    # Prefer --art-dir if present; else fallback to --eda-root
-    art_dir = None
-    if args.eda_root:
-        eda = pathlib.Path(args.eda_root)
-        print(f"Loading EDA artifacts from: {eda}")
-        s1_policy = build_s1_policy(eda) or ""
-        s2_policy = build_s2_policy(eda) or ""
-        s1_shots = load_fewshots(eda, "s1", max_n=6) or []
-        s2_shots = load_fewshots(eda, "s2", max_n=8) or []
-        bctx = eda / "boundary_context.json"
-        if bctx.exists():
-            try:
-                boundary = json.loads(bctx.read_text(encoding="utf-8")).get("note", "")
-            except Exception:
-                boundary = ""
-        # --- NEW: load prompt artifacts & provide few-shot fallback ---
-        prompt_arts = _load_prompt_artifacts(eda)
-        if not s1_shots:
-            s1_shots = (prompt_arts.get("fewshot_bank") or {}).get("s1", [])[:6]
-        if not s2_shots:
-            s2_shots = (prompt_arts.get("fewshot_bank") or {}).get("s2", [])[:8]
-        art_dir = eda
-    if args.art_dir:
-        art_dir = pathlib.Path(args.art_dir)
-        if art_dir.exists():
-            # refresh artifacts from explicit art_dir if given
-            prompt_arts = _load_prompt_artifacts(art_dir)
-            if not s1_shots:
-                s1_shots = (prompt_arts.get("fewshot_bank") or {}).get("s1", [])[:6]
-            if not s2_shots:
-                s2_shots = (prompt_arts.get("fewshot_bank") or {}).get("s2", [])[:8]
-
-    # Data
-    rows_s1 = list(read_jsonl(args.test_file_s1))
-    rows_s2 = list(read_jsonl(args.test_file_s2))
-    if args.limit_docs is not None:
-        rows_s1 = rows_s1[: args.limit_docs]
-        rows_s2 = rows_s2[: args.limit_docs]
-        logging.info(
-            f"Limiting to first {args.limit_docs} docs for S1 ({len(rows_s1)}) and S2 ({len(rows_s2)})"
-        )
-    id2doc_s2 = {(r.get("_id") or r.get("doc_id")): r for r in rows_s2}
-
-    techniques = [t.strip() for t in args.techniques.split(",") if t.strip()]
-    # --- prompt builders (Sonnet 4.5 XML) ---
-    # Extract priors + conflict pairs from artifacts (if present)
-    priors = prompt_arts.get("priors_prompt") or {}
-    policy_json = prompt_arts.get("fewshot_policy") or {}
-    ambiguous_pairs = []
-    try:
-        cp = (policy_json.get("targets") or {}).get("ambiguous_pairs_top2") or []
-        ambiguous_pairs = [
-            tuple(sorted(p)) for p in cp if isinstance(p, (list, tuple)) and len(p) == 2
-        ]
-    except Exception:
-        ambiguous_pairs = [("Action", "Effect"), ("Actor", "Victim")]
-
-    for tech in techniques:
-        print(f"\n=== JOINT S1→S2 :: {tech} ===")
-
-        # per-tech flags (must be inside the loop)
-        has_fs = "fs" in tech
-        has_neg = "neg" in tech
-        use_cot = (
-            "cot" in tech
-        )  # kept for compatibility; builders already structure reasoning via <thinking>
-        use_boundary = "boundary" in tech
-        use_policy = "policy" in tech
-        sc_match = re.search(r"sc(\d+)", tech)
-        sc_n = int(sc_match.group(1)) if sc_match else 1
-        if isinstance(args.s2_self_consistency, int) and args.s2_self_consistency >= 1:
-            sc_n = args.s2_self_consistency
-
-        # few-shots (per-tech, with optional negatives)
-        fs_s1 = s1_shots[:] if (has_fs and s1_shots) else []
-        fs_s2 = s2_shots[:] if (has_fs and s2_shots) else []
-        if has_fs and has_neg and prompt_arts:
-            s1_neg = [
-                ex
-                for ex in (prompt_arts.get("fewshot_bank") or {}).get("s1", [])
-                if ex.get("markers") == []
-            ][:1]
-            s2_neg = [
-                ex
-                for ex in (prompt_arts.get("fewshot_bank") or {}).get("s2", [])
-                if ex.get("gold", {}).get("label") == "non"
-            ][:1]
-            fs_s1 += s1_neg
-            fs_s2 += s2_neg
-
-        tech_dir = pathlib.Path(args.out_root) / tech
-        (tech_dir / "s1").mkdir(parents=True, exist_ok=True)
-        (tech_dir / "s2").mkdir(parents=True, exist_ok=True)
-        (tech_dir / "prompts").mkdir(parents=True, exist_ok=True)
-        # --- NEW: snapshot artifacts into the run folder ---
-        if prompt_arts:
-            _snapshot_artifacts(prompt_arts, tech_dir)
-        s1_sub = tech_dir / "s1" / "submission.jsonl"
-        s1_pruned_sub = tech_dir / "s1" / "submission_pruned.jsonl"
-        s2_sub = tech_dir / "s2" / "submission.jsonl"
-        # If limiting docs, create a ground-truth subset for fair S1 eval
-        gt_subset_path = None
-        if args.limit_docs is not None:
-            gt_subset_path = tech_dir / "s1" / "gt_subset.jsonl"
-            write_jsonl(gt_subset_path, rows_s1)  # rows_s1 already limited
-
-        # Save prompt metadata once per technique
-        _save_prompt_meta(
-            tech_dir,
-            {
-                "tech": tech,
-                "model_id": args.model_id,
-                "region": args.region,
-                "max_tokens_s1": args.max_tokens_s1,
-                "max_tokens_s2": args.max_tokens_s2,
-                "temperature": args.temperature,
-                "sc_temperature": args.sc_temperature,
-                "s1_policy_used": bool(s1_policy),
-                "s2_policy_used": bool(s2_policy),
-                "boundary_note_used": bool(boundary) and ("boundary" in tech),
-                "fewshots_s1_count": len(s1_shots),
-                "fewshots_s2_count": len(s2_shots),
-                "eda_root": str(args.eda_root) if args.eda_root else None,
-                "s1_iou_threshold": args.s1_iou,
-                # --- NEW: one-line summary of artifacts loaded ---
-                "artifact_summary": (
-                    "arts: boundary={b} conflicts={c} priors={p} lexicons={x} fewshot_bank(s1={s1},s2={s2})"
-                ).format(
-                    b=int(bool((prompt_arts or {}).get("boundary_prompts"))),
-                    c=len(
-                        ((prompt_arts or {}).get("conflicts") or {}).get("pairs", [])
-                    ),
-                    p=len((prompt_arts or {}).get("priors_prompt") or {}),
-                    x=int(bool((prompt_arts or {}).get("lexicons"))),
-                    s1=len(
-                        ((prompt_arts or {}).get("fewshot_bank") or {}).get("s1", [])
-                    ),
-                    s2=len(
-                        ((prompt_arts or {}).get("fewshot_bank") or {}).get("s2", [])
-                    ),
-                ),
-            },
-        )
-
-        # For console preview, show the first built prompts once per technique
-        printed_s1_preview = False
-        printed_s2_preview = False
-
-        # ------ S1 inference ------
-        s1_out_rows = []
-        s1_pruned_rows = []
-        id2markers = {}  # for S2 conditioning
-        total_raw, total_valid, total_pruned = 0, 0, 0
-        saved_s1 = 0
-        for rec in rows_s1:
-            _id = rec.get("_id") or rec.get("doc_id")
-            txt = rec.get("text", "")
-
-            # === New Sonnet 4.5 prompt (XML + <thinking>/<answer>) ===
-            # We do n_samples=1 for S1 to keep spans deterministic
-            fewshots_s1 = (
-                _pick_balanced_s1_fewshots(fs_s1, k=min(8, len(fs_s1))) if fs_s1 else []
-            )
-            # reorder: negative → one prototype per label → one conflict (if available)
-            fewshots_s1 = _order_s1_fewshots(fewshots_s1)
-            s1_system = build_s1_system(
-                priors=priors,
-                conflict_pairs=ambiguous_pairs,
-                boundary_note=(boundary if use_boundary else None),
-                policy_text=(s1_policy if use_policy else None),
-                include_cot=use_cot,
-            )
-            # (optional) assert sections exist for safety
-            if (
-                "<offset_scope>" not in s1_system
-                or "<forbidden_output>" not in s1_system
-            ):
-                logging.warning("[S1] system prompt missing offset/forbidden sections.")
-            s1_user = build_s1_user(
-                text_input=txt,
-                s1_fewshots=fewshots_s1,
-                include_cot=use_cot,
-            )
-            sys_blocks = [s1_system]
-            user_block = s1_user
-            n_samples = 1
-            temp = args.temperature
-            # Save/print prompts per policy
-            if args.save_prompts == "all" or (
-                args.save_prompts == "sample" and saved_s1 < 3
-            ):
-                _save_prompt_bundle(tech_dir, "s1", str(_id), sys_blocks, user_block)
-                saved_s1 += 1
-            if args.print_prompts_preview and not printed_s1_preview:
-                sys_preview = "\\n\\n---\\n\\n".join(sys_blocks)
-                user_preview = user_block
-                print(
-                    "[S1 prompt preview]\nSYSTEM:\n"
-                    + sys_preview
-                    + "\n\nUSER:\n"
-                    + user_preview
-                )
-                printed_s1_preview = True
-
-            spans = run_s1(
-                rec,
-                sys_blocks,
-                user_block,
-                args.model_id,
-                args.region,
-                args.max_tokens_s1,
-                temp,
-                n_samples,
-            )
-            total_raw += len(spans)
-            if not spans:
-                id2markers[_id] = []
-                empty_markers = []
-                s1_out_rows.append({"_id": _id, "markers": empty_markers})
-                s1_pruned_rows.append({"_id": _id, "markers": empty_markers})
-                continue
-
-            # Post-process with evaluator-aligned token snap + cleanup + conflict NMS
-            markers = postprocess_s1_spans(
-                text=txt,
-                spans=spans,  # raw model output (label/start/end)
-                priors=(
-                    json.loads(
-                        (eda / "length_position_priors.json").read_text(
-                            encoding="utf-8"
-                        )
-                    )
-                    if args.eda_root and (eda / "length_position_priors.json").exists()
-                    else {}
-                ),
-                merge_gap=args.pp_merge_gap,
-                dedup_iou=args.pp_dedup_iou,
-                conflict_iou=args.pp_conflict_iou,
-            )
-            s1_out_rows.append({"_id": _id, "markers": markers})
-
-            # limit per label for S2 prompt brevity
-            by_lab = defaultdict(list)
-            for m in markers:
-                by_lab[m["type"]].append(m)
-
-            total_valid += len(markers)
-            pruned = []
-            k = args.max_markers_per_label  # always Namespace here
-
-            def _start_end(m):
-                # accept either style; default to 0 if missing to avoid crashes
-                s = m.get("start", m.get("startIndex", 0))
-                e = m.get("end", m.get("endIndex", s))
-                return int(s), int(e)
-
-            lex = (prompt_arts or {}).get("lexicons", {})
-            for lab, arr in by_lab.items():
-                # --- NEW: filter bad Victim spans (money/objects/etc.) before salience sort ---
-                def _is_bad_victim(text_slice: str) -> bool:
-                    s = (text_slice or "").strip().lower()
-                    # numeric/money tokens or abstract objects are not victims
-                    if re.fullmatch(
-                        r"\$?\d[\d,]*(\.\d+)?(\s*(k|m|b|million|billion))?", s
-                    ):
-                        return True
-                    if s in {
-                        "bribe money",
-                        "taxes",
-                        "cash",
-                        "evidence",
-                        "agenda",
-                        "plan",
-                        "policy",
-                    }:
-                        return True
-                    return False
-
-                def _text_of(m):
-                    s, e = _start_end(m)
-                    return txt[s:e]
-
-                arr = [
-                    m
-                    for m in arr
-                    if _valid_span(txt, *_start_end(m))
-                    and not ((lab == "Victim") and _is_bad_victim(_text_of(m)))
-                ]
-                arr_sorted = sorted(arr, key=lambda m: _salience(m, txt, lex))
-                pruned.extend(arr_sorted[:k])
-
-            # store pruned markers using the *Bedrock/S2 prompt* schema (startIndex/endIndex)
-            def _to_s2_marker(m):
-                s, e = _start_end(m)
-                return {
-                    "type": m.get("type"),
-                    "startIndex": s,
-                    "endIndex": e,
-                    "text": txt[s:e],
-                }
-
-            id2markers[_id] = [_to_s2_marker(m) for m in pruned]
-            total_pruned += len(id2markers[_id])
-            s1_pruned_rows.append({"_id": _id, "markers": id2markers[_id]})
-
-        write_jsonl(s1_sub, s1_out_rows)
-        write_jsonl(s1_pruned_sub, s1_pruned_rows)
-        print(f"S1 done -> {s1_sub}")
-        print(f"S1 pruned-for-S2 -> {s1_pruned_sub}")
-        print(
-            f"S1 debug: spans raw/valid/pruned = {total_raw}/{total_valid}/{total_pruned}"
-        )
-
-        # ------ S2 inference (conditioned on S1) ------
-        s2_out_rows = []
-        s2_prob_rows = []
-        saved_s2 = 0
-        for _id, doc2 in id2doc_s2.items():
-            txt = doc2.get("text", "")
-            # use S1 markers if present for the same doc_id
-            mks = id2markers.get(_id, [])
-
-            fewshots_s2 = (
-                _pick_balanced_s2_fewshots(fs_s2, k=min(8, len(fs_s2))) if fs_s2 else []
-            )
-            s2_system = build_s2_system(
-                policy_text=(s2_policy if use_policy else None),
-                include_cot=use_cot,
-            )
-            s2_user = build_s2_user(
-                text_input=txt,
-                s1_output=mks,
-                s2_fewshots=fewshots_s2,
-                include_cot=use_cot,
-            )
-            sys_blocks = [s2_system]
-            user_block = s2_user
-            # self-consistency from scN or --s2-self-consistency
-            n_samples = max(1, int(sc_n))
-            temp = args.sc_temperature if n_samples > 1 else args.temperature
-            if args.save_prompts == "all" or (
-                args.save_prompts == "sample" and saved_s2 < 3
-            ):
-                _save_prompt_bundle(tech_dir, "s2", str(_id), sys_blocks, user_block)
-                saved_s2 += 1
-            if args.print_prompts_preview and not printed_s2_preview:
-                sys_preview = "\\n\\n---\\n\\n".join(sys_blocks)
-                user_preview = user_block
-                print(
-                    "[S2 prompt preview]\nSYSTEM:\n"
-                    + sys_preview
-                    + "\n\nUSER:\n"
-                    + user_preview
-                )
-                printed_s2_preview = True
-
-            lbl, p_con, p_non = run_s2(
-                doc2,
-                sys_blocks,
-                user_block,
-                args.model_id,
-                args.region,
-                args.max_tokens_s2,
-                temp,
-                n_samples,
-            )
-            pred = "Yes" if lbl == "conspiracy" else "No"
-            s2_out_rows.append({"_id": _id, "conspiracy": pred})
-            s2_prob_rows.append(
-                {
-                    "_id": _id,
-                    "label": lbl,
-                    "p_conspiracy": round(p_con, 6),
-                    "p_non": round(p_non, 6),
-                }
-            )
-
-        write_jsonl(s2_sub, s2_out_rows)
-        probs_path = tech_dir / "s2" / "probs.jsonl"
-        write_jsonl(probs_path, s2_prob_rows)
-        mean_p = None
-        if s2_prob_rows:
-            mean_p = sum(r["p_conspiracy"] for r in s2_prob_rows) / len(s2_prob_rows)
-            frac_pos = sum(1 for r in s2_prob_rows if r["p_conspiracy"] >= 0.5) / len(
-                s2_prob_rows
-            )
-            print(f"S2 prob stats: mean_p={mean_p:.3f} frac_p>=0.5={frac_pos:.3f}")
-
-        # --- NEW: threshold from dev probs (auto) ---
-        # --- threshold selection ---
-        thr = 0.50
-        if isinstance(args.s2_thresh, str) and args.s2_thresh.lower() == "auto":
-            if s2_prob_rows:  # only tune if we actually have probs
-                best_t, best_f1, stats = tune_threshold_dev(rows_s2, s2_prob_rows)
-                if stats.get("n", 0) <= 0:
-                    print(
-                        "[S2] No gold labels available for threshold tuning; keeping default 0.50."
-                    )
-                    thr = 0.50
-                else:
-                    thr = best_t
-                    print(
-                        f"[S2] auto threshold tuned on dev: t={best_t:.2f} (dev f1={best_f1:.3f}, mean_p={stats['mean_p']:.3f}, n={stats['n']})"
-                    )
-            else:
-                logging.warning("[S2] no probability rows; falling back to 0.50")
-        else:
-            try:
-                thr = float(args.s2_thresh)
-            except Exception:
-                logging.warning(
-                    f"[S2] invalid --s2-thresh={args.s2_thresh}; using 0.50"
-                )
-                thr = 0.50
-
-        # Rebuild submission using chosen threshold
-        pred2 = [
-            {
-                "_id": r["_id"],
-                "conspiracy": ("Yes" if r["p_conspiracy"] >= thr else "No"),
-            }
-            for r in s2_prob_rows
-        ]
-        write_jsonl(s2_sub, pred2)
-
-        if mean_p is not None and mean_p < 0.15:
-            logging.warning(
-                "[S2] mean_p extremely low; likely 'all-No' drift. Check few-shots and markers."
-            )
-
-        print(f"S2 done -> {s2_sub}")
-
-        # ---- NEW: also emit top-level Codabench files from this technique ----
-        # S1 top-level file (strip 'text' from markers)
-        codabench_s1 = [
-            {"_id": r["_id"], "markers": _to_codabench_s1(r.get("markers", []))}
-            for r in s1_out_rows
-        ]
-        write_jsonl("submission_s1.jsonl", codabench_s1)
-        # S2 top-level file (final thresholded labels)
-        write_jsonl("submission_s2.jsonl", pred2)
-        print("Wrote top-level submissions: submission_s1.jsonl, submission_s2.jsonl")
-        # --- NEW: zip each technique's submissions into ./submissions/submission_{tech}.zip ---
-        try:
-            submissions_dir = pathlib.Path("submissions")
-            submissions_dir.mkdir(parents=True, exist_ok=True)
-            zip_path = submissions_dir / f"submission_{tech}.zip"
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                # include top-level files as required by Codabench
-                if pathlib.Path("submission_s1.jsonl").exists():
-                    zf.write("submission_s1.jsonl", arcname="submission_s1.jsonl")
-                if pathlib.Path("submission_s2.jsonl").exists():
-                    zf.write("submission_s2.jsonl", arcname="submission_s2.jsonl")
-                # also include per-tech originals for traceability
-                if s1_sub.exists():
-                    zf.write(s1_sub, arcname=f"{tech}/s1/submission.jsonl")
-                if s1_pruned_sub.exists():
-                    zf.write(
-                        s1_pruned_sub, arcname=f"{tech}/s1/submission_pruned.jsonl"
-                    )
-                if s2_sub.exists():
-                    zf.write(s2_sub, arcname=f"{tech}/s2/submission.jsonl")
-                if probs_path.exists():
-                    zf.write(probs_path, arcname=f"{tech}/s2/probs.jsonl")
-            print(f"Packaged ZIP -> {zip_path}")
-        except Exception as e:
-            logging.warning(f"[ZIP] Failed to create technique ZIP: {e}")
-
-
-if __name__ == "__main__":
-    main()
+# def main():
+#    ap = argparse.ArgumentParser()
+#    # Use dev_rehydrated.jsonl for both S1 and S2 by default
+#    ap.add_argument("--test-file-s1", required=False, default="dev_rehydrated.jsonl")
+#    ap.add_argument("--test-file-s2", required=False, default="dev_rehydrated.jsonl")
+#    ap.add_argument("--eda-root", required=False, default=None)
+#    ap.add_argument(
+#        "--techniques",
+#        default=ALL_TECHNIQUES,
+#        help="Comma list applied jointly. Examples: zs,fs_boundary_policy,sc5,sc10",
+#    )
+#    ap.add_argument(
+#        "--save-prompts",
+#        choices=["none", "sample", "all"],
+#        default="sample",
+#        help="Save prompts to runs/<out>/prompts. 'sample' saves first 3 docs per task+tech.",
+#    )
+#    ap.add_argument(
+#        "--print-prompts-preview",
+#        action="store_true",
+#        default=True,
+#        help="Print a short preview (first 500 chars) of the final system+user prompts once per technique.",
+#    )
+#    ap.add_argument("--model-id", default=None)
+#    ap.add_argument("--region", default=None)
+#    ap.add_argument("--max-tokens-s1", type=int, default=1200)
+#    ap.add_argument("--max-tokens-s2", type=int, default=900)
+#    ap.add_argument("--temperature", type=float, default=0.0)
+#    ap.add_argument("--sc-temperature", type=float, default=0.7)
+#    ap.add_argument(
+#        "--art-dir",
+#        type=str,
+#        default=None,
+#        help="Folder with prompt artifacts (best_fewshot_examples.json, priors_prompt.json, fewshot_policy.json). If omitted, falls back to --eda-root.",
+#    )
+#    ap.add_argument(
+#        "--s2-self-consistency",
+#        type=int,
+#        default=None,
+#        help="Override scN from --techniques (e.g., sc5). If set, uses this value for all techniques.",
+#    )
+#    ap.add_argument("--s1-iou", type=float, default=0.5)
+#    ap.add_argument("--out-root", default="runs/joint_llm")
+#    ap.add_argument(
+#        "--pp-merge-gap",
+#        type=int,
+#        default=1,
+#        help="Merge same-label spans separated by <= gap chars.",
+#    )
+#    ap.add_argument(
+#        "--pp-dedup-iou",
+#        type=float,
+#        default=0.90,
+#        help="De-dup same-label spans with IoU>=thr (keep prior-closer).",
+#    )
+#    ap.add_argument(
+#        "--pp-conflict-iou",
+#        type=float,
+#        default=0.50,
+#        help="NMS IoU for conflict pairs (Actor/Victim, Action/Effect).",
+#    )
+#    ap.add_argument(
+#        "--max-markers-per-label",
+#        type=int,
+#        default=3,
+#        help="Limit markers passed to S2 to control prompt length.",
+#    )
+#    ap.add_argument(
+#        "--limit-docs",
+#        type=int,
+#        default=None,
+#        help="Process only the first N documents for each of S1/S2 (for quicker prompt sweeps).",
+#    )
+#    ap.add_argument(
+#        "--s2-thresh",
+#        default="auto",
+#        help='Decision threshold for S2. Use "auto" to tune on dev probs, or a float like 0.45.',
+#    )
+#    args = ap.parse_args()
+#
+#    print("=== JOINT PROMPT SWEEP START ===")
+#    # Print model info
+#    print(f"Model ID: {args.model_id}, Region: {args.region}")
+#
+#    random.seed(42)
+#
+#    # EDA
+#    prompt_arts = {}
+#    s1_policy = s2_policy = ""
+#    s1_shots = []
+#    s2_shots = []
+#    boundary = ""
+#    # Prefer --art-dir if present; else fallback to --eda-root
+#    art_dir = None
+#    if args.eda_root:
+#        eda = pathlib.Path(args.eda_root)
+#        print(f"Loading EDA artifacts from: {eda}")
+#        s1_policy = build_s1_policy(eda) or ""
+#        s2_policy = build_s2_policy(eda) or ""
+#        s1_shots = load_fewshots(eda, "s1", max_n=6) or []
+#        s2_shots = load_fewshots(eda, "s2", max_n=8) or []
+#        bctx = eda / "boundary_context.json"
+#        if bctx.exists():
+#            try:
+#                boundary = json.loads(bctx.read_text(encoding="utf-8")).get("note", "")
+#            except Exception:
+#                boundary = ""
+#        # --- NEW: load prompt artifacts & provide few-shot fallback ---
+#        prompt_arts = _load_prompt_artifacts(eda)
+#        if not s1_shots:
+#            s1_shots = (prompt_arts.get("fewshot_bank") or {}).get("s1", [])[:6]
+#        if not s2_shots:
+#            s2_shots = (prompt_arts.get("fewshot_bank") or {}).get("s2", [])[:8]
+#        art_dir = eda
+#    if args.art_dir:
+#        art_dir = pathlib.Path(args.art_dir)
+#        if art_dir.exists():
+#            # refresh artifacts from explicit art_dir if given
+#            prompt_arts = _load_prompt_artifacts(art_dir)
+#            if not s1_shots:
+#                s1_shots = (prompt_arts.get("fewshot_bank") or {}).get("s1", [])[:6]
+#            if not s2_shots:
+#                s2_shots = (prompt_arts.get("fewshot_bank") or {}).get("s2", [])[:8]
+#
+#    # Data
+#    rows_s1 = list(read_jsonl(args.test_file_s1))
+#    rows_s2 = list(read_jsonl(args.test_file_s2))
+#    if args.limit_docs is not None:
+#        rows_s1 = rows_s1[: args.limit_docs]
+#        rows_s2 = rows_s2[: args.limit_docs]
+#        logging.info(
+#            f"Limiting to first {args.limit_docs} docs for S1 ({len(rows_s1)}) and S2 ({len(rows_s2)})"
+#        )
+#    id2doc_s2 = {(r.get("_id") or r.get("doc_id")): r for r in rows_s2}
+#
+#    techniques = [t.strip() for t in args.techniques.split(",") if t.strip()]
+#    # --- prompt builders (Sonnet 4.5 XML) ---
+#    # Extract priors + conflict pairs from artifacts (if present)
+#    priors = prompt_arts.get("priors_prompt") or {}
+#    policy_json = prompt_arts.get("fewshot_policy") or {}
+#    ambiguous_pairs = []
+#    try:
+#        cp = (policy_json.get("targets") or {}).get("ambiguous_pairs_top2") or []
+#        ambiguous_pairs = [
+#            tuple(sorted(p)) for p in cp if isinstance(p, (list, tuple)) and len(p) == 2
+#        ]
+#    except Exception:
+#        ambiguous_pairs = [("Action", "Effect"), ("Actor", "Victim")]
+#
+#    for tech in techniques:
+#        print(f"\n=== JOINT S1→S2 :: {tech} ===")
+#
+#        # per-tech flags (must be inside the loop)
+#        has_fs = "fs" in tech
+#        has_neg = "neg" in tech
+#        use_cot = (
+#            "cot" in tech
+#        )  # kept for compatibility; builders already structure reasoning via <thinking>
+#        use_boundary = "boundary" in tech
+#        use_policy = "policy" in tech
+#        sc_match = re.search(r"sc(\d+)", tech)
+#        sc_n = int(sc_match.group(1)) if sc_match else 1
+#        if isinstance(args.s2_self_consistency, int) and args.s2_self_consistency >= 1:
+#            sc_n = args.s2_self_consistency
+#
+#        # few-shots (per-tech, with optional negatives)
+#        fs_s1 = s1_shots[:] if (has_fs and s1_shots) else []
+#        fs_s2 = s2_shots[:] if (has_fs and s2_shots) else []
+#        if has_fs and has_neg and prompt_arts:
+#            # S1 negatives: schema has "spans" (empty) for no-markers examples
+#            s1_neg = [
+#                ex
+#                for ex in (prompt_arts.get("fewshot_bank") or {}).get("s1", [])
+#                if isinstance(ex.get("spans"), list) and len(ex["spans"]) == 0
+#            ][:1]
+#            s2_neg = [
+#                ex
+#                for ex in (prompt_arts.get("fewshot_bank") or {}).get("s2", [])
+#                if ex.get("gold", {}).get("label") == "non"
+#            ][:1]
+#            fs_s1 += s1_neg
+#            fs_s2 += s2_neg
+#
+#        tech_dir = pathlib.Path(args.out_root) / tech
+#        (tech_dir / "s1").mkdir(parents=True, exist_ok=True)
+#        (tech_dir / "s2").mkdir(parents=True, exist_ok=True)
+#        (tech_dir / "prompts").mkdir(parents=True, exist_ok=True)
+#        # --- NEW: snapshot artifacts into the run folder ---
+#        if prompt_arts:
+#            _snapshot_artifacts(prompt_arts, tech_dir)
+#        s1_sub = tech_dir / "s1" / "submission.jsonl"
+#        s1_pruned_sub = tech_dir / "s1" / "submission_pruned.jsonl"
+#        s2_sub = tech_dir / "s2" / "submission.jsonl"
+#        # If limiting docs, create a ground-truth subset for fair S1 eval
+#        gt_subset_path = None
+#        if args.limit_docs is not None:
+#            gt_subset_path = tech_dir / "s1" / "gt_subset.jsonl"
+#            write_jsonl(gt_subset_path, rows_s1)  # rows_s1 already limited
+#
+#        # Save prompt metadata once per technique
+#        _save_prompt_meta(
+#            tech_dir,
+#            {
+#                "tech": tech,
+#                "model_id": args.model_id,
+#                "region": args.region,
+#                "max_tokens_s1": args.max_tokens_s1,
+#                "max_tokens_s2": args.max_tokens_s2,
+#                "temperature": args.temperature,
+#                "sc_temperature": args.sc_temperature,
+#                "s1_policy_used": bool(s1_policy),
+#                "s2_policy_used": bool(s2_policy),
+#                "boundary_note_used": bool(boundary) and ("boundary" in tech),
+#                "fewshots_s1_count": len(s1_shots),
+#                "fewshots_s2_count": len(s2_shots),
+#                "eda_root": str(args.eda_root) if args.eda_root else None,
+#                "s1_iou_threshold": args.s1_iou,
+#                # --- NEW: one-line summary of artifacts loaded ---
+#                "artifact_summary": (
+#                    "arts: boundary={b} conflicts={c} priors={p} lexicons={x} fewshot_bank(s1={s1},s2={s2})"
+#                ).format(
+#                    b=int(bool((prompt_arts or {}).get("boundary_prompts"))),
+#                    c=len(
+#                        ((prompt_arts or {}).get("conflicts") or {}).get("pairs", [])
+#                    ),
+#                    p=len((prompt_arts or {}).get("priors_prompt") or {}),
+#                    x=int(bool((prompt_arts or {}).get("lexicons"))),
+#                    s1=len(
+#                        ((prompt_arts or {}).get("fewshot_bank") or {}).get("s1", [])
+#                    ),
+#                    s2=len(
+#                        ((prompt_arts or {}).get("fewshot_bank") or {}).get("s2", [])
+#                    ),
+#                ),
+#            },
+#        )
+#
+#        # For console preview, show the first built prompts once per technique
+#        printed_s1_preview = False
+#        printed_s2_preview = False
+#
+#        # ------ S1 inference ------
+#        s1_out_rows = []
+#        s1_pruned_rows = []
+#        id2markers = {}  # for S2 conditioning
+#        total_raw, total_valid, total_pruned = 0, 0, 0
+#        saved_s1 = 0
+#        for rec in rows_s1:
+#            _id = rec.get("_id") or rec.get("doc_id")
+#            txt = rec.get("text", "")
+#
+#            # === New Sonnet 4.5 prompt (XML + <thinking>/<answer>) ===
+#            # We do n_samples=1 for S1 to keep spans deterministic
+#            fewshots_s1 = (
+#                _pick_balanced_s1_fewshots(fs_s1, k=min(8, len(fs_s1))) if fs_s1 else []
+#            )
+#            # reorder: negative → one prototype per label → one conflict (if available)
+#            fewshots_s1 = _order_s1_fewshots(fewshots_s1)
+#            s1_system = build_s1_system(
+#                priors=priors,
+#                conflict_pairs=ambiguous_pairs,
+#                boundary_note=(boundary if use_boundary else None),
+#                policy_text=(s1_policy if use_policy else None),
+#                include_cot=use_cot,
+#            )
+#            # (optional) assert sections exist for safety
+#            if (
+#                "<offset_scope>" not in s1_system
+#                or "<forbidden_output>" not in s1_system
+#            ):
+#                logging.warning("[S1] system prompt missing offset/forbidden sections.")
+#            s1_user = build_s1_user(
+#                text_input=txt,
+#                s1_fewshots=fewshots_s1,
+#                include_cot=use_cot,
+#            )
+#            sys_blocks = [s1_system]
+#            user_block = s1_user
+#            n_samples = 1
+#            temp = args.temperature
+#            # Save/print prompts per policy
+#            if args.save_prompts == "all" or (
+#                args.save_prompts == "sample" and saved_s1 < 3
+#            ):
+#                _save_prompt_bundle(tech_dir, "s1", str(_id), sys_blocks, user_block)
+#                saved_s1 += 1
+#            if args.print_prompts_preview and not printed_s1_preview:
+#                sys_preview = "\\n\\n---\\n\\n".join(sys_blocks)
+#                user_preview = user_block
+#                print(
+#                    "[S1 prompt preview]\nSYSTEM:\n"
+#                    + sys_preview
+#                    + "\n\nUSER:\n"
+#                    + user_preview
+#                )
+#                printed_s1_preview = True
+#
+#            spans = run_s1(
+#                rec,
+#                sys_blocks,
+#                user_block,
+#                args.model_id,
+#                args.region,
+#                args.max_tokens_s1,
+#                temp,
+#                n_samples,
+#            )
+#            total_raw += len(spans)
+#            if not spans:
+#                id2markers[_id] = []
+#                empty_markers = []
+#                s1_out_rows.append({"_id": _id, "markers": empty_markers})
+#                s1_pruned_rows.append({"_id": _id, "markers": empty_markers})
+#                continue
+#
+#            # Post-process with evaluator-aligned token snap + cleanup + conflict NMS
+#            markers = postprocess_s1_spans(
+#                text=txt,
+#                spans=spans,  # raw model output (label/start/end)
+#                priors=(
+#                    json.loads(
+#                        (eda / "length_position_priors.json").read_text(
+#                            encoding="utf-8"
+#                        )
+#                    )
+#                    if args.eda_root and (eda / "length_position_priors.json").exists()
+#                    else {}
+#                ),
+#                merge_gap=args.pp_merge_gap,
+#                dedup_iou=args.pp_dedup_iou,
+#                conflict_iou=args.pp_conflict_iou,
+#            )
+#            s1_out_rows.append({"_id": _id, "markers": markers})
+#
+#            # limit per label for S2 prompt brevity
+#            by_lab = defaultdict(list)
+#            for m in markers:
+#                by_lab[m["type"]].append(m)
+#
+#            total_valid += len(markers)
+#            pruned = []
+#            k = args.max_markers_per_label  # always Namespace here
+#
+#            def _start_end(m):
+#                # accept either style; default to 0 if missing to avoid crashes
+#                s = m.get("start", m.get("startIndex", 0))
+#                e = m.get("end", m.get("endIndex", s))
+#                return int(s), int(e)
+#
+#            lex = (prompt_arts or {}).get("lexicons", {})
+#            for lab, arr in by_lab.items():
+#                # --- NEW: filter bad Victim spans (money/objects/etc.) before salience sort ---
+#                def _is_bad_victim(text_slice: str) -> bool:
+#                    s = (text_slice or "").strip().lower()
+#                    # numeric/money tokens or abstract objects are not victims
+#                    if re.fullmatch(
+#                        r"\$?\d[\d,]*(\.\d+)?(\s*(k|m|b|million|billion))?", s
+#                    ):
+#                        return True
+#                    if s in {
+#                        "bribe money",
+#                        "taxes",
+#                        "cash",
+#                        "evidence",
+#                        "agenda",
+#                        "plan",
+#                        "policy",
+#                    }:
+#                        return True
+#                    return False
+#
+#                def _text_of(m):
+#                    s, e = _start_end(m)
+#                    return txt[s:e]
+#
+#                arr = [
+#                    m
+#                    for m in arr
+#                    if _valid_span(txt, *_start_end(m))
+#                    and not ((lab == "Victim") and _is_bad_victim(_text_of(m)))
+#                ]
+#                arr_sorted = sorted(arr, key=lambda m: _salience(m, txt, lex))
+#                pruned.extend(arr_sorted[:k])
+#
+#            # store pruned markers using the *Bedrock/S2 prompt* schema (startIndex/endIndex)
+#            def _to_s2_marker(m):
+#                s, e = _start_end(m)
+#                return {
+#                    "type": m.get("type"),
+#                    "startIndex": s,
+#                    "endIndex": e,
+#                    "text": txt[s:e],
+#                }
+#
+#            id2markers[_id] = [_to_s2_marker(m) for m in pruned]
+#            total_pruned += len(id2markers[_id])
+#            s1_pruned_rows.append({"_id": _id, "markers": id2markers[_id]})
+#
+#        write_jsonl(s1_sub, s1_out_rows)
+#        write_jsonl(s1_pruned_sub, s1_pruned_rows)
+#        print(f"S1 done -> {s1_sub}")
+#        print(f"S1 pruned-for-S2 -> {s1_pruned_sub}")
+#        print(
+#            f"S1 debug: spans raw/valid/pruned = {total_raw}/{total_valid}/{total_pruned}"
+#        )
+#
+#        # ------ S2 inference (conditioned on S1) ------
+#        s2_out_rows = []
+#        s2_prob_rows = []
+#        saved_s2 = 0
+#        for _id, doc2 in id2doc_s2.items():
+#            txt = doc2.get("text", "")
+#            # use S1 markers if present for the same doc_id
+#            mks = id2markers.get(_id, [])
+#
+#            fewshots_s2 = (
+#                _pick_balanced_s2_fewshots(fs_s2, k=min(8, len(fs_s2))) if fs_s2 else []
+#            )
+#            s2_system = build_s2_system(
+#                policy_text=(s2_policy if use_policy else None),
+#                include_cot=use_cot,
+#            )
+#            s2_user = build_s2_user(
+#                text_input=txt,
+#                s1_output=mks,
+#                s2_fewshots=fewshots_s2,
+#                include_cot=use_cot,
+#            )
+#            sys_blocks = [s2_system]
+#            user_block = s2_user
+#            # self-consistency from scN or --s2-self-consistency
+#            n_samples = max(1, int(sc_n))
+#            temp = args.sc_temperature if n_samples > 1 else args.temperature
+#            if args.save_prompts == "all" or (
+#                args.save_prompts == "sample" and saved_s2 < 3
+#            ):
+#                _save_prompt_bundle(tech_dir, "s2", str(_id), sys_blocks, user_block)
+#                saved_s2 += 1
+#            if args.print_prompts_preview and not printed_s2_preview:
+#                sys_preview = "\\n\\n---\\n\\n".join(sys_blocks)
+#                user_preview = user_block
+#                print(
+#                    "[S2 prompt preview]\nSYSTEM:\n"
+#                    + sys_preview
+#                    + "\n\nUSER:\n"
+#                    + user_preview
+#                )
+#                printed_s2_preview = True
+#
+#            lbl, p_con, p_non = run_s2(
+#                doc2,
+#                sys_blocks,
+#                user_block,
+#                args.model_id,
+#                args.region,
+#                args.max_tokens_s2,
+#                temp,
+#                n_samples,
+#            )
+#            pred = "Yes" if lbl == "conspiracy" else "No"
+#            s2_out_rows.append({"_id": _id, "conspiracy": pred})
+#            s2_prob_rows.append(
+#                {
+#                    "_id": _id,
+#                    "label": lbl,
+#                    "p_conspiracy": round(p_con, 6),
+#                    "p_non": round(p_non, 6),
+#                }
+#            )
+#
+#        write_jsonl(s2_sub, s2_out_rows)
+#        probs_path = tech_dir / "s2" / "probs.jsonl"
+#        write_jsonl(probs_path, s2_prob_rows)
+#        mean_p = None
+#        if s2_prob_rows:
+#            mean_p = sum(r["p_conspiracy"] for r in s2_prob_rows) / len(s2_prob_rows)
+#            frac_pos = sum(1 for r in s2_prob_rows if r["p_conspiracy"] >= 0.5) / len(
+#                s2_prob_rows
+#            )
+#            print(f"S2 prob stats: mean_p={mean_p:.3f} frac_p>=0.5={frac_pos:.3f}")
+#
+#        # --- NEW: threshold from dev probs (auto) ---
+#        # --- threshold selection ---
+#        thr = 0.50
+#        if isinstance(args.s2_thresh, str) and args.s2_thresh.lower() == "auto":
+#            if s2_prob_rows:  # only tune if we actually have probs
+#                best_t, best_f1, stats = tune_threshold_dev(rows_s2, s2_prob_rows)
+#                if stats.get("n", 0) <= 0:
+#                    print(
+#                        "[S2] No gold labels available for threshold tuning; keeping default 0.50."
+#                    )
+#                    thr = 0.50
+#                else:
+#                    thr = best_t
+#                    print(
+#                        f"[S2] auto threshold tuned on dev: t={best_t:.2f} (dev f1={best_f1:.3f}, mean_p={stats['mean_p']:.3f}, n={stats['n']})"
+#                    )
+#            else:
+#                logging.warning("[S2] no probability rows; falling back to 0.50")
+#        else:
+#            try:
+#                thr = float(args.s2_thresh)
+#            except Exception:
+#                logging.warning(
+#                    f"[S2] invalid --s2-thresh={args.s2_thresh}; using 0.50"
+#                )
+#                thr = 0.50
+#
+#        # Rebuild submission using chosen threshold
+#        pred2 = [
+#            {
+#                "_id": r["_id"],
+#                "conspiracy": ("Yes" if r["p_conspiracy"] >= thr else "No"),
+#            }
+#            for r in s2_prob_rows
+#        ]
+#        write_jsonl(s2_sub, pred2)
+#
+#        if mean_p is not None and mean_p < 0.15:
+#            logging.warning(
+#                "[S2] mean_p extremely low; likely 'all-No' drift. Check few-shots and markers."
+#            )
+#
+#        print(f"S2 done -> {s2_sub}")
+#
+#        # ---- NEW: also emit top-level Codabench files from this technique ----
+#        # S1 top-level file (strip 'text' from markers)
+#        codabench_s1 = [
+#            {"_id": r["_id"], "markers": _to_codabench_s1(r.get("markers", []))}
+#            for r in s1_out_rows
+#        ]
+#        write_jsonl("submission_s1.jsonl", codabench_s1)
+#        # S2 top-level file (final thresholded labels)
+#        write_jsonl("submission_s2.jsonl", pred2)
+#        print("Wrote top-level submissions: submission_s1.jsonl, submission_s2.jsonl")
+#        # --- NEW: zip each technique's submissions into ./submissions/submission_{tech}.zip ---
+#        try:
+#            submissions_dir = pathlib.Path("submissions")
+#            submissions_dir.mkdir(parents=True, exist_ok=True)
+#            zip_path = submissions_dir / f"submission_{tech}.zip"
+#            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+#                # include top-level files as required by Codabench
+#                if pathlib.Path("submission_s1.jsonl").exists():
+#                    zf.write("submission_s1.jsonl", arcname="submission_s1.jsonl")
+#                if pathlib.Path("submission_s2.jsonl").exists():
+#                    zf.write("submission_s2.jsonl", arcname="submission_s2.jsonl")
+#                # also include per-tech originals for traceability
+#                if s1_sub.exists():
+#                    zf.write(s1_sub, arcname=f"{tech}/s1/submission.jsonl")
+#                if s1_pruned_sub.exists():
+#                    zf.write(
+#                        s1_pruned_sub, arcname=f"{tech}/s1/submission_pruned.jsonl"
+#                    )
+#                if s2_sub.exists():
+#                    zf.write(s2_sub, arcname=f"{tech}/s2/submission.jsonl")
+#                if probs_path.exists():
+#                    zf.write(probs_path, arcname=f"{tech}/s2/probs.jsonl")
+#            print(f"Packaged ZIP -> {zip_path}")
+#        except Exception as e:
+#            logging.warning(f"[ZIP] Failed to create technique ZIP: {e}")
+#
+#
+# if __name__ == "__main__":
+#    main()
+#
