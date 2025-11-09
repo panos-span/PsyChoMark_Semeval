@@ -377,13 +377,106 @@ def _dedup_same_label(spans, iou_thr=0.90, text_len=1, priors=None):
     return sorted(out, key=lambda x: (x["start"], x["end"]))
 
 
-def _conflict_nms(spans, iou_thr=0.50, text_len=1, priors=None):
-    """Suppress overlaps across conflict pairs using priors (lower prior_dist wins)."""
+import re
+
+_PURPOSE_PREFIXES = ("to ", "in order to ", "so that", "for ")
+
+
+def _starts_purpose(text_slice: str) -> bool:
+    s = text_slice.lstrip().lower()
+    return any(s.startswith(p) for p in _PURPOSE_PREFIXES)
+
+
+def _looks_like_citation(evidence_slice: str) -> bool:
+    s = evidence_slice.lower()
+    return (
+        ("http" in s)
+        or ("www." in s)
+        or ("according to" in s)
+        or ('"' in evidence_slice)
+        or ("’" in evidence_slice)
+        or ("‘" in evidence_slice)
+        or ("“" in evidence_slice)
+        or ("”" in evidence_slice)
+    )
+
+
+def _overlap_len(a, b) -> int:
+    return max(0, min(a["end"], b["end"]) - max(a["start"], b["start"]))
+
+
+def _trim_overlap_action_effect(a, b, text, max_overlap=2):
+    """
+    Try to keep both Action and Effect by trimming overlap to ≤ max_overlap.
+    Mutates spans in place. Returns True if trimmed, else False.
+    Assumes a and b are overlapping and labels are Action/Effect in any order.
+    """
+    # normalize order: act = Action, eff = Effect
+    if a["label"] == "Action" and b["label"] == "Effect":
+        act, eff = a, b
+    elif a["label"] == "Effect" and b["label"] == "Action":
+        act, eff = b, a
+    else:
+        return False
+
+    ov = _overlap_len(act, eff)
+    if ov <= max_overlap:
+        return True  # already fine
+
+    # Heuristic: if Effect has purpose prefix, prefer trimming Action to end at Effect.start
+    eff_text = text[eff["start"] : eff["end"]]
+    act_text = text[act["start"] : act["end"]]
+    eff_has_purpose = _starts_purpose(eff_text)
+    act_has_purpose = _starts_purpose(act_text)
+
+    if eff_has_purpose and not act_has_purpose:
+        # trim Action to end at (eff.start + max_overlap)
+        new_end = min(act["end"], eff["start"] + max_overlap)
+        if new_end > act["start"]:
+            act["end"] = new_end
+            return True
+
+    # Else try trimming Effect to start at (act.end - max_overlap)
+    new_start = max(eff["start"], act["end"] - max_overlap)
+    if new_start < eff["end"]:
+        eff["start"] = new_start
+        return True
+
+    return False
+
+
+def _role_true_cmp(a, b, priors, text_len, text):
+    """
+    Return -1 if a preferred, +1 if b preferred, 0 if tie.
+    Generic tie-breaker: prior_dist → longer → earlier.
+    """
+    da = _prior_dist(priors, a["label"], a["start"], a["end"], text_len)
+    db = _prior_dist(priors, b["label"], b["start"], b["end"], text_len)
+    if da != db:
+        return -1 if da < db else 1
+    la = a["end"] - a["start"]
+    lb = b["end"] - b["start"]
+    if la != lb:
+        return -1 if la > lb else 1
+    if a["start"] != b["start"]:
+        return -1 if a["start"] < b["start"] else 1
+    return 0
+
+
+def _conflict_nms(spans, *, text, iou_thr=0.50, text_len=1, priors=None):
+    """
+    Suppress/trim overlaps across conflict pairs using role-aware rules.
+    - Special handling for Action–Effect (purpose clause).
+    - Actor–Victim must not overlap (keep minimal mention).
+    - Evidence may overlap others if citation/quote/link.
+    """
     priors = priors or {}
     if not spans:
         return spans
+
     spans = sorted(spans, key=lambda x: (x["start"], x["end"]))
     keep = [True] * len(spans)
+
     for i in range(len(spans)):
         if not keep[i]:
             continue
@@ -392,21 +485,117 @@ def _conflict_nms(spans, iou_thr=0.50, text_len=1, priors=None):
             if not keep[j]:
                 continue
             b = spans[j]
+
             pair = tuple(sorted((a["label"], b["label"])))
             if pair not in CONFLICT_PAIRS:
                 continue
-            if _iou(a, b) >= iou_thr:
-                da = _prior_dist(priors, a["label"], a["start"], a["end"], text_len)
-                db = _prior_dist(priors, b["label"], b["start"], b["end"], text_len)
-                # keep prior-closer; if tie, keep longer; if still tie, keep earlier
-                score_a = (da, -(a["end"] - a["start"]), a["start"])
-                score_b = (db, -(b["end"] - b["start"]), b["start"])
-                if score_a <= score_b:
+
+            # If no spatial overlap, skip fast
+            if _overlap_len(a, b) == 0:
+                continue
+
+            # Evidence exceptions (allow overlap if looks like citation/quote/link)
+            if "Evidence" in pair:
+                ev = a if a["label"] == "Evidence" else b
+                ev_text = text[ev["start"] : ev["end"]]
+                if _looks_like_citation(ev_text):
+                    # allow overlap; no suppression
+                    continue
+                # else fall through to standard resolution below
+
+            # Action–Effect: try to keep both by trimming to ≤ 2 chars overlap
+            if set(pair) == {"Action", "Effect"}:
+                # Prefer role-true shapes: Effect should start with purpose introducer and be longer.
+                # If both obviously role-true, attempt trim; else pick role-strong one.
+                # Check role signals
+                a_text = text[a["start"] : a["end"]]
+                b_text = text[b["start"] : b["end"]]
+                a_purpose = _starts_purpose(a_text)
+                b_purpose = _starts_purpose(b_text)
+
+                # If both valid roles (Action shortish; Effect has purpose)
+                action_len = (
+                    (a["end"] - a["start"])
+                    if a["label"] == "Action"
+                    else (b["end"] - b["start"])
+                )
+                effect_has_purpose = b_purpose if b["label"] == "Effect" else a_purpose
+                if effect_has_purpose and action_len <= 16:
+                    if _trim_overlap_action_effect(a, b, text, max_overlap=2):
+                        continue  # both kept after trim
+
+                # Otherwise choose role-true:
+                # - Prefer the span that exhibits the expected role signal
+                #   (Effect with purpose-prefix beats Action that contains 'to ...'; Action shorter beats long Action)
+                if (
+                    a["label"] == "Effect"
+                    and _starts_purpose(a_text)
+                    and not _starts_purpose(b_text)
+                ):
+                    # prefer a (Effect), drop b
+                    keep[j] = False
+                    continue
+                if (
+                    b["label"] == "Effect"
+                    and _starts_purpose(b_text)
+                    and not _starts_purpose(a_text)
+                ):
+                    keep[i] = False
+                    break
+
+                # Fallback to prior/length/earlier
+                cmp = _role_true_cmp(a, b, priors, text_len, text)
+                if cmp <= 0:
                     keep[j] = False
                 else:
                     keep[i] = False
                     break
-    return [s for k, s in zip(keep, spans) if k]
+                continue  # next j
+
+            # Actor–Victim: must not overlap; keep the smallest (role-true minimal mention)
+            if set(pair) == {"Actor", "Victim"}:
+                len_a = a["end"] - a["start"]
+                len_b = b["end"] - b["start"]
+                if len_a != len_b:
+                    if len_a <= len_b:
+                        keep[j] = False
+                    else:
+                        keep[i] = False
+                        break
+                else:
+                    # tie → earlier
+                    if a["start"] <= b["start"]:
+                        keep[j] = False
+                    else:
+                        keep[i] = False
+                        break
+                continue
+
+            # Generic conflict: IoU threshold → prior distance → longer → earlier
+            if _iou(a, b) >= iou_thr:
+                cmp = _role_true_cmp(a, b, priors, text_len, text)
+                if cmp <= 0:
+                    keep[j] = False
+                else:
+                    keep[i] = False
+                    break
+
+    # filter kept
+    out = [s for k, s in zip(keep, spans) if k]
+
+    # Final polish for Action–Effect pairs we kept: enforce ≤2 chars overlap
+    # (In case they slipped through generic branch without trimming.)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(out)):
+            for j in range(i + 1, len(out)):
+                ai, bj = out[i], out[j]
+                if set((ai["label"], bj["label"])) == {"Action", "Effect"}:
+                    if _overlap_len(ai, bj) > 2:
+                        if _trim_overlap_action_effect(ai, bj, text, max_overlap=2):
+                            changed = True
+    return out
 
 
 def _looks_like_evidence(txt: str) -> bool:
@@ -669,12 +858,20 @@ def postprocess_s1_spans(
         _tmp.extend(_split_action_effect(m, text))
     canon = [m for m in _tmp if _quality_gate(m, text, priors)]
 
+    # 1b) role-aware min-lengths (after snap, before merges)
+    _min_len = {"Actor": 3, "Victim": 3, "Action": 3, "Effect": 7, "Evidence": 5}
+    canon = [m for m in canon if (m["end"] - m["start"]) >= _min_len.get(m["label"], 3)]
+    if not canon:
+        return []
+
     # 2) merge tiny gaps (same label)
     canon = _merge_tiny_gaps(canon, gap=merge_gap)
     # 3) de-dup near duplicates (same label)
     canon = _dedup_same_label(canon, iou_thr=dedup_iou, text_len=L, priors=priors)
     # 4) conflict-aware NMS (Action/Effect, Actor/Victim)
-    canon = _conflict_nms(canon, iou_thr=conflict_iou, text_len=L, priors=priors)
+    canon = _conflict_nms(
+        spans, text=text, iou_thr=0.50, text_len=len(text), priors=priors
+    )
     # 4.1) tough conflicts with identical surfaces across labels
     if len(canon) > 1:
         keep = []

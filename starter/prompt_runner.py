@@ -18,6 +18,7 @@ Author: you
 
 from __future__ import annotations
 
+import unicodedata
 import argparse
 import json
 import logging
@@ -27,18 +28,46 @@ import random
 import re
 import sys
 import time
-from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
-# ---- Paths / imports ---------------------------------------------------------
-# _THIS = pathlib.Path(__file__).resolve()
-# ROOT = _THIS.parents[3]
-# SRC = ROOT / "src"
-# for p in (str(ROOT), str(SRC)):
-#    if p not in sys.path:
-#        sys.path.insert(0, p)
+LOG = logging.getLogger("prompt_runner")  # Keep the global LOG object
+
+
+def setup_logging(level: str = "INFO", file_path: Optional[pathlib.Path] = None):
+    """
+    Configures the global LOG object for console and optional file logging.
+    """
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    LOG.setLevel(log_level)
+
+    # Clear any existing handlers (e.g., from previous script runs)
+    if LOG.hasHandlers():
+        LOG.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # 1. Console Handler (always add)
+    # Logs to stdout, which works fine with tqdm (which uses stderr)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(log_level)
+    LOG.addHandler(console_handler)
+
+    # 2. File Handler (optional)
+    if file_path:
+        # Ensure the directory for the log file exists
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        file_handler = logging.FileHandler(file_path, mode="a", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(log_level)
+        LOG.addHandler(file_handler)
+
+    LOG.info(f"Logger configured at level {level}")
+    if file_path:
+        LOG.info(f"Logging to file: {file_path}")
 
 
 # --- Make repo root importable ---
@@ -50,15 +79,13 @@ from src.psycomark.llm.bedrock_chat import BedrockChat as Chat
 
 # Your prompt builder (we rely on these)
 from starter.prompt_builder import (
-    build_s1_system,
-    build_s1_user,
-    build_s1_verify_system,
-    load_artifacts,
-    build_s1_verify_user,
-    build_s2_system,
     build_s1_prompts_adapter,
-    build_s2_prompts_adapter,  # <-- FIX: Import the correct S2 adapter
-    build_s2_user,
+    build_s1_verify_system,
+    build_s2_prompts_adapter,
+    build_s1_verify_user,
+    load_artifacts,
+    build_s1_usc_system,
+    build_s1_usc_user,
 )
 
 # ------------------------------------------------------------------------------
@@ -98,6 +125,18 @@ ALLOWED_S1 = {"Actor", "Action", "Effect", "Evidence", "Victim"}
 _WS = re.compile(r"\s+")
 JSON_GUESS = re.compile(r"\{|\[")
 ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.S | re.I)
+
+# --- NEW: Snapping Configuration & Helpers ---
+_WS_MULTI = re.compile(r"\s+")
+SNAP_OFFSETS = True
+SNAP_WINDOW = 6  # give it more room
+
+
+def _to_json_string(obj) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return str(obj)
 
 
 def _read_json(path: pathlib.Path) -> Any:
@@ -156,10 +195,6 @@ def _safe_int(x, default=0) -> int:
 # Few-shot bank normalization
 # ------------------------------------------------------------------------------
 def _norm_s1_span(m: Any) -> Optional[dict]:
-    """
-    Normalize ONE S1 span to {type,startIndex,endIndex,text} OR return None.
-    Drop anything malformed (strings, missing fields, bad bounds).
-    """
     if not isinstance(m, dict):
         return None
     t = (m.get("type") or m.get("label") or "").strip()
@@ -168,9 +203,10 @@ def _norm_s1_span(m: Any) -> Optional[dict]:
     s = _safe_int(m.get("startIndex", m.get("start")), -1)
     e = _safe_int(m.get("endIndex", m.get("end")), -1)
     txt = (m.get("text") or "").strip()
-    if s < 0 or e <= s or not txt:
+    if s < 0 or e <= s:
         return None
-    return {"type": t, "startIndex": s, "endIndex": e, "text": txt}
+    # 'text' is optional here; we only require offsets
+    return {"type": t, "startIndex": s, "endIndex": e, "text": txt or None}
 
 
 def _norm_s1_entry(ex: Any) -> Optional[dict]:
@@ -352,7 +388,9 @@ def _select_s2_fewshots_for_doc(pool: List[dict], k: int = 8) -> List[dict]:
 # ------------------------------------------------------------------------------
 # Model I/O
 # ------------------------------------------------------------------------------
-def _get_chat(model_id: Optional[str], region: Optional[str]):
+def _get_chat(
+    model_id: Optional[str], region: Optional[str], keep_thinking: bool = False
+):
     if Chat is None:
         LOG.warning("BedrockChat not available; returning None (dry run).")
         return None
@@ -363,26 +401,85 @@ def _get_chat(model_id: Optional[str], region: Optional[str]):
         or "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
     )
     reg = os.getenv("AWS_DEFAULT_REGION") or region or "eu-central-1"
-    LOG.info("Bedrock client ready | model=%s region=%s", mdl, reg)
-    return Chat(model_id=mdl, region_name=reg)
+
+    # The Chat class now logs its own creation, so LOG.info here is redundant
+    return Chat(model_id=mdl, region_name=reg, keep_thinking_in_history=keep_thinking)
 
 
 def _extract_json_from_answer(raw: str) -> str:
     """
-    Given a raw LLM answer, try to isolate the JSON array/object.
-    Prefer <answer>...</answer> if present.
+    Robustly isolate a single JSON array/object from model output.
+    - Prefer the JSON immediately following <answer>.
+    - Do NOT require </answer> (stop sequences strip it).
+    - Fall back to the first well-formed JSON array/object in the string.
     """
     if not raw:
         return ""
-    m = ANSWER_TAG_RE.search(raw)
+
+    # 1) If <answer> exists, start from there
+    start_pos = None
+    m = re.search(r"<answer>", raw, re.I)
     if m:
-        return m.group(1).strip()
-    # crude fallback: find the first JSON-looking section
-    if JSON_GUESS.search(raw):
-        # find first { or [
-        i = min([i for i in [raw.find("{"), raw.find("[")] if i >= 0] or [0])
-        return raw[i:].strip()
-    return raw.strip()
+        start_pos = m.end()
+    else:
+        # else, start at the first JSON-looking token
+        m2 = re.search(r"[\[\{]", raw)
+        if m2:
+            start_pos = m2.start()
+
+    if start_pos is None:
+        return ""
+
+    s = raw[start_pos:]
+
+    # 2) Find first JSON opener
+    open_idx = None
+    opener = None
+    for i, ch in enumerate(s):
+        if ch in "[{":
+            open_idx, opener = i, ch
+            break
+        # skip whitespace/newlines before JSON
+        if not ch.isspace():
+            # encountered non-JSON char before opener; keep scanning
+            continue
+    if open_idx is None:
+        return ""
+
+    closer = "]" if opener == "[" else "}"
+    depth = 0
+    in_str = False
+    esc = False
+    end_idx = None
+
+    for j in range(open_idx, len(s)):
+        ch = s[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    end_idx = j + 1
+                    break
+
+    if end_idx is None:
+        # no balanced close found; last-resort truncate at newline
+        tail = s[open_idx:].splitlines()[0].strip()
+        return tail
+
+    return s[open_idx:end_idx].strip()
 
 
 def _safe_parse_s1_generation(raw: str) -> List[dict]:
@@ -414,25 +511,6 @@ def _safe_parse_s1_generation(raw: str) -> List[dict]:
             # but we'll keep normalized for consistency.
             out.append(nm)
     return out
-
-
-def _print_prompt_preview(
-    task_name: str, system_prompt: str, user_prompt: str, max_chars: int = 2000
-):
-    sep = "=" * 80
-    print(
-        f"\n{sep}\n[{task_name}] SYSTEM PROMPT (preview)\n{sep}\n{system_prompt[:max_chars]}"
-    )
-    print(
-        f"\n{sep}\n[{task_name}] USER PROMPT (preview)\n{sep}\n{user_prompt[:max_chars]}\n"
-    )
-
-
-def _print_answer_preview(
-    task_name: str, doc_id: str, raw_answer: str, ordinal: int, max_chars: int = 1200
-):
-    print(f"[{task_name}] #{ordinal:02d} doc={doc_id}  raw_answer↓")
-    print((raw_answer or "").strip()[:max_chars] + ("\n" if raw_answer else ""))
 
 
 def _normalize_span_key(m: dict) -> tuple:
@@ -528,52 +606,509 @@ def _merge_sc_spans(samples: list[list[dict]], top_k: int = 4) -> list[dict]:
     return out
 
 
-def _verify_s1_spans(
-    chat, text: str, spans: list[dict], keep_max: int = 4
-) -> list[dict]:
-    if not spans:
-        return []
+# ------------------------------------------------------------------------------
+# S1 Verification Pipeline (NEW HELPERS)
+# ------------------------------------------------------------------------------
+
+
+def _fold_quotes(s: str) -> str:
+    # map common smart quotes/apostrophes to ASCII
+    return s.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+
+
+def _norm(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = _fold_quotes(s)
+    s = s.lower()
+    s = _WS_MULTI.sub(" ", s).strip()
+    return s
+
+
+def _build_norm_map(s: str) -> tuple[str, list[int]]:
+    """
+    Return (normalized_string, map_idx) where map_idx[i] is the original
+    index in s corresponding to normalized[i].
+    We only collapse whitespace runs and fold quotes; keep per-char map.
+    """
+    norm_chars = []
+    idx_map = []
+    i = 0
+    L = len(s)
+    while i < L:
+        ch = s[i]
+        ch_fold = _fold_quotes(unicodedata.normalize("NFKC", ch))
+        if ch_fold.isspace():
+            # collapse whitespace runs to a single space
+            # advance to end of run but map that one space to the first char of run
+            j = i + 1
+            while j < L and s[j].isspace():
+                j += 1
+            norm_chars.append(" ")
+            idx_map.append(i)
+            i = j
+            continue
+        # normal char
+        norm_chars.append(ch_fold.lower())
+        idx_map.append(i)
+        i += 1
+    # strip leading/trailing space in normalized view (adjust map accordingly)
+    # leading
+    while norm_chars and norm_chars[0] == " ":
+        norm_chars.pop(0)
+        idx_map.pop(0)
+    # trailing
+    while norm_chars and norm_chars[-1] == " ":
+        norm_chars.pop()
+        idx_map.pop()
+    return ("".join(norm_chars), idx_map)
+
+
+def _expand_to_token_bounds(s: str, start: int, end: int) -> tuple[int, int]:
+    # expand to word boundaries [^\w] on both sides (best-effort)
+    L = len(s)
+    i, j = start, end
+    while i > 0 and s[i - 1].isalnum():
+        i -= 1
+    while j < L and s[j].isalnum():
+        j += 1
+    return i, j
+
+
+def snap_offsets_to_text(span: dict, doc: str) -> dict:
+    """Find model 'text' inside a local window using normalized matching."""
+    if not SNAP_OFFSETS:
+        return span
+    t = span.get("text") or ""
+    if not t:
+        return span
+
+    s0, e0 = span["startIndex"], span["endIndex"]
+    lo = max(0, s0 - SNAP_WINDOW)
+    hi = min(len(doc), max(e0, s0) + SNAP_WINDOW)  # window around s0/e0
+    window = doc[lo:hi]
+
+    # First try literal search with token-boundary expansion
+    i = window.find(t)
+    if i < 0:
+        # Try token-boundary expansion of the candidate slice
+        lo2, hi2 = _expand_to_token_bounds(doc, s0, e0)
+        window2 = doc[lo2:hi2]
+        i = window2.find(t)
+        if i >= 0:
+            s = lo2 + i
+            e = s + len(t)
+            if 0 <= s < e <= len(doc):
+                span["startIndex"], span["endIndex"] = s, e
+                return span
+
+    if i >= 0:
+        s = lo + i
+        e = s + len(t)
+        if 0 <= s < e <= len(doc):
+            span["startIndex"], span["endIndex"] = s, e
+            return span
+
+    # Normalized search (handles curly quotes / case / ws)
+    norm_t = _norm(t)
+    norm_win, map_idx = _build_norm_map(window)
+    j = norm_win.find(norm_t)
+    if j >= 0:
+        # map back to original indices
+        s = lo + map_idx[j]
+        e = lo + map_idx[min(j + len(norm_t) - 1, len(map_idx) - 1)] + 1
+        span["startIndex"], span["endIndex"] = s, e
+        return span
+
+    return span  # no change
+
+
+def _coerce_s1_item(d: dict) -> dict | None:
+    # Accept both schemas and normalize
+    if not isinstance(d, dict):
+        return None
+    label = (d.get("type") or d.get("label") or "").strip()
+    s = d.get("startIndex", d.get("start"))
+    e = d.get("endIndex", d.get("end"))
+    if label not in ALLOWED_S1:
+        return None
     try:
-        sys_p = build_s1_verify_system()
-        usr_p = build_s1_verify_user(text=text, candidates=spans)
-        resp = chat.chat(
-            system_prompt=sys_p,
-            user_prompt=usr_p,
-            max_tokens=8196,
-            temperature=0.0,
-            stop_sequences=["</answer>"],
-        )
-        raw = resp.get("answer") if isinstance(resp, dict) else (resp or "")
-        js = _extract_json_from_answer(raw)
-        obj = json.loads(js) if js else {}
-        kept = obj.get("kept") if isinstance(obj, dict) else []
-        # sanitize
-        clean = []
-        for m in kept or []:
-            try:
-                t = (m.get("type") or "").strip()
-                s = int(m.get("startIndex"))
-                e = int(m.get("endIndex"))
-                txt = (m.get("text") or "").strip()
-                if t and txt and e > s and txt == text[s:e]:
-                    clean.append(
-                        {"type": t, "startIndex": s, "endIndex": e, "text": txt}
-                    )
-            except Exception:
-                continue
-        # role-cap and max
-        final, role_seen = [], {}
-        for m in clean:
-            r = m["type"]
-            if role_seen.get(r, 0) >= 1:
-                continue
-            role_seen[r] = role_seen.get(r, 0) + 1
-            final.append(m)
-            if len(final) >= keep_max:
-                break
-        return final
+        s = int(s)
+        e = int(e)
     except Exception:
-        return spans[:keep_max]  # fail-open but capped
+        return None
+    if e <= s:
+        return None
+    return {"type": label, "startIndex": s, "endIndex": e, "text": d.get("text")}
+
+
+def _validate_and_repair_spans(items: list, doc_text: str) -> tuple[list, dict]:
+    diag = {"ok": 0, "oob": 0, "mismatch": 0, "badlabel": 0, "badkeys": 0, "snapped": 0}
+    L = len(doc_text)
+    out = []
+
+    for it in items or []:
+        it = _coerce_s1_item(it)
+        if not it:
+            diag["badkeys"] += 1
+            continue
+
+        t, s_orig, e_orig = it["type"], it["startIndex"], it["endIndex"]
+        model_text = it.get("text") or ""
+
+        # Try snapping if we have model text
+        before = (it["startIndex"], it["endIndex"])
+        if model_text:
+            snap_offsets_to_text(it, doc_text)
+        after = (it["startIndex"], it["endIndex"])
+        if after != before:
+            diag["snapped"] += 1
+
+        s, e = it["startIndex"], it["endIndex"]
+
+        if t not in ALLOWED_S1:
+            diag["badlabel"] += 1
+            continue
+        if not (0 <= s < e <= L):
+            diag["oob"] += 1
+            continue
+
+        slice_txt = doc_text[s:e]
+        if model_text and model_text != slice_txt:
+            diag["mismatch"] += 1  # just log it
+
+        it["text"] = slice_txt  # authoritative
+        out.append(it)
+        diag["ok"] += 1
+
+    return out, diag
+
+
+def _fmt_span(span: Dict[str, Any], text: str, maxw: int = 60) -> str:
+    s, e = span["startIndex"], span["endIndex"]
+    frag = text[s:e].replace("\n", " ")
+    if len(frag) > maxw:
+        frag = frag[: maxw - 1] + "…"
+    return f"{span['type']}[{s}:{e}] “{frag}”"
+
+
+def _explain_drop(span: Dict[str, Any], text: str, rules: Dict[str, Any]) -> str:
+    # Customize these checks to mirror your verifier logic:
+    s, e = span["startIndex"], span["endIndex"]
+    label = span["type"]
+    L = len(text)
+
+    if not (0 <= s < e <= L):
+        return "oob"
+
+    # Example heuristics that might drop items; align with your code:
+    min_len = rules.get("min_len", {}).get(label, 2)
+    max_len = rules.get("max_len", {}).get(label, 200)
+    if (e - s) < min_len:
+        return f"too_short<{min_len}"
+    if (e - s) > max_len:
+        return f"too_long>{max_len}"
+
+    # NOTE: Your _coerce_s1_item already handles this, but good to have
+    if label not in ALLOWED_S1:
+        return "disallowed_label"
+
+    if "text" in span and span.get("text") != text[s:e]:
+        return "text_mismatch"
+
+    return "unknown"
+
+
+def _len(sp):
+    return sp["endIndex"] - sp["startIndex"]
+
+
+def _contained(inner, outer):
+    return (
+        outer["startIndex"] <= inner["startIndex"]
+        and inner["endIndex"] <= outer["endIndex"]
+    )
+
+
+def _allow_overlap(a, b):
+    kinds = {a["type"], b["type"]}
+    if kinds == {"Actor", "Victim"}:
+        return False
+    if "Victim" in kinds and "Action" in kinds:
+        v = a if a["type"] == "Victim" else b
+        act = b if a["type"] == "Action" else a
+        return _contained(v, act) and _len(v) <= 24
+    return True
+
+
+def _conflict(x, y):
+    return not (x["endIndex"] <= y["startIndex"] or y["endIndex"] <= x["startIndex"])
+
+
+def _apply_overlap_policy(spans):
+    kept = []
+    for sp in sorted(spans, key=lambda z: (z["startIndex"], -_len(z))):
+        drop = False
+        for k in kept:
+            if _conflict(sp, k) and not _allow_overlap(sp, k):
+                # prefer Actor over Victim if those two clash; otherwise keep earlier/longer
+                if sp["type"] == "Victim" and k["type"] == "Actor":
+                    drop = True
+                    break
+                if k["type"] == "Victim" and sp["type"] == "Actor":
+                    kept.remove(k)
+                    break
+                if _len(sp) <= _len(k):
+                    drop = True
+                    break
+                else:
+                    kept.remove(k)
+                    break
+        if not drop:
+            kept.append(sp)
+    return kept
+
+
+def _span_len(m):
+    return int(m["endIndex"] - m["startIndex"])
+
+
+def _iou(a, b):
+    ia = max(
+        0, min(a["endIndex"], b["endIndex"]) - max(a["startIndex"], b["startIndex"])
+    )
+    ua = _span_len(a) + _span_len(b) - ia
+    return 0.0 if ua <= 0 else ia / ua
+
+
+def _near_tie_bounds(a, b, tol=2):
+    return (
+        abs(a["startIndex"] - b["startIndex"]) <= tol
+        and abs(a["endIndex"] - b["endIndex"]) <= tol
+    )
+
+
+def _is_short_np_candidate(m, max_len=24):
+    # Heuristic: treat as NP if short and text has <= 6 tokens and no obvious verbal head.
+    txt = (m.get("text") or "").strip()
+    toks = [t for t in txt.split() if t]
+    has_verbish = any(
+        t.lower() in {"is", "are", "was", "were", "be", "am", "been", "being"}
+        for t in toks
+    ) or any(t.endswith(("ed", "ing")) for t in toks)
+    return _span_len(m) <= max_len and len(toks) <= 6 and not has_verbish
+
+
+def _apply_overlap_policy_permissive(spans: list[dict]) -> list[dict]:
+    # 1) Same-label dedup by IoU
+    kept = []
+    for m in sorted(
+        spans, key=lambda x: (_span_len(x), x["type"])
+    ):  # prefer tighter spans
+        dup = False
+        for k in kept:
+            if k["type"] == m["type"] and _iou(k, m) > 0.5:
+                dup = True
+                break
+        if not dup:
+            kept.append(m)
+
+    # 2) Resolve cross-label conflicts with permissive Actor↔Victim and Victim⊂Action
+    out = []
+    for m in kept:
+        drop = False
+        for k in out:
+            overlap = not (
+                m["endIndex"] <= k["startIndex"] or m["startIndex"] >= k["endIndex"]
+            )
+            if not overlap:
+                continue
+
+            pair = {m["type"], k["type"]}
+            if pair == {"Actor", "Victim"}:
+                # Allow near-ties to coexist
+                if _near_tie_bounds(m, k, tol=2):
+                    continue
+                # Otherwise prefer the one with clearer role by heuristic: shorter Victim NP wins over sprawling Actor,
+                # else keep Actor.
+                if m["type"] == "Victim" and _is_short_np_candidate(m):
+                    # keep both (Victim NP nested is acceptable)
+                    continue
+                if k["type"] == "Victim" and _is_short_np_candidate(k):
+                    continue
+                # default: keep Actor, drop Victim
+                if m["type"] == "Victim":
+                    drop = True
+                    break
+                else:
+                    # drop existing Victim k, keep Actor m
+                    out.remove(k)
+                    # continue checking against remaining ones
+                    continue
+
+            if pair == {"Action", "Victim"}:
+                # Allow Victim⊂Action if Victim short NP
+                vm = m if m["type"] == "Victim" else k
+                if _is_short_np_candidate(vm):
+                    continue  # keep both
+
+            # Other cross-label overlaps: prefer tighter span; if similar size, keep first
+            if _span_len(m) >= _span_len(k) + 3:
+                drop = True
+                break
+            # else keep both if close in size
+
+        if not drop:
+            out.append(m)
+
+    return out
+
+
+def _verify_s1_spans(
+    *,
+    chat,  # BedrockChat
+    system_prompt: str,
+    user_prompt: str,
+    candidates: List[Dict[str, Any]],
+    doc_text: str,
+    rules: Dict[str, Any] | None = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    rules = rules or {}
+    LOG.info("[verify] candidates=%d", len(candidates))
+
+    # Candidate preview
+    for i, sp in enumerate(candidates[:10]):
+        LOG.debug("[verify][cand %d] %s", i, _fmt_span(sp, doc_text))
+
+    # ---- Call the verifier LLM ----
+    resp = chat.chat(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=8196,  # Use S1 max tokens for safety
+        temperature=0.0,
+        stop_sequences=["</answer>"],
+        enable_extended_thinking=False,
+        store_thinking_in_history=False,
+    )
+    thinking, answer = resp.get("thinking", ""), resp.get("answer", "")
+    LOG.info(
+        "[verify] thinking(%d chars): %s",
+        len(thinking),
+        thinking[:600].replace("\n", " "),
+    )
+    LOG.info(
+        "[verify] answer(%d chars): %s", len(answer), answer[:600].replace("\n", " ")
+    )
+
+    kept_raw: List[Any] = []
+    rej_raw: List[Any] = []
+    ver_diag = {"json_ok": False, "parse_error": "", "schema": ""}
+
+    try:
+        js = _extract_json_from_answer(answer)  # balanced-bracket extractor
+        obj = json.loads(js)
+        ver_diag["json_ok"] = True
+        # --- Accept multiple schemas: dict with keep/kept + reject/rejected, or list of kept
+        if isinstance(obj, dict):
+            kept_raw = obj.get("keep") or obj.get("kept") or []
+            rej_raw = obj.get("reject") or obj.get("rejected") or []
+            ver_diag["schema"] = "dict"
+        elif isinstance(obj, list):
+            kept_raw = obj
+            ver_diag["schema"] = "list"
+        else:
+            ver_diag["schema"] = f"unexpected:{type(obj).__name__}"
+            LOG.warning("[verify] Unexpected schema; passing all candidates through.")
+            return candidates, {"verifier": ver_diag, "schema": ver_diag["schema"]}
+    except Exception as e:
+        ver_diag["parse_error"] = str(e)
+        LOG.error("[verify] JSON parse error: %s", e)
+        # Conservative fallback: keep all candidates
+        return candidates, {"verifier": ver_diag, "fallback": True}
+
+    # --- If verifier returned indices, map to objects
+    def _map_indices(seq: List[Any]) -> List[Dict[str, Any]]:
+        if not seq:
+            return []
+        if isinstance(seq[0], int):
+            out = []
+            for idx in seq:
+                if isinstance(idx, int) and 0 <= idx < len(candidates):
+                    out.append(candidates[idx])
+            return out
+        return seq  # assume already objects
+
+    kept_objs = _map_indices(kept_raw)
+    rej_objs = _map_indices(rej_raw)
+
+    # If only kept was provided (list or dict.keep), infer rejected by diff
+    if rej_raw == [] and ver_diag["schema"] in {"dict", "list"}:
+        kept_keys = {
+            (
+                d.get("type"),
+                d.get("start", d.get("startIndex")),
+                d.get("end", d.get("endIndex")),
+            )
+            for d in kept_objs
+        }
+        for sp in candidates:
+            key = (sp["type"], sp["startIndex"], sp["endIndex"])
+            if key not in kept_keys:
+                rej_objs.append(sp)
+
+    # Normalize + repair text (coerce keys, snap offsets, overwrite text from slice)
+    kept_norm, kept_diag = _validate_and_repair_spans(kept_objs, doc_text)
+    rej_norm, rej_diag = _validate_and_repair_spans(rej_objs, doc_text)
+
+    LOG.info(
+        "[verify] kept=%d | rejected=%d | diag(keep)=%s | diag(rej)=%s",
+        len(kept_norm),
+        len(rej_norm),
+        kept_diag,
+        rej_diag,
+    )
+
+    for i, sp in enumerate(kept_norm[:10]):
+        LOG.debug("[verify][KEPT %d] %s", i, _fmt_span(sp, doc_text))
+    for i, sp in enumerate(rej_norm[:10]):
+        reason = _explain_drop(sp, doc_text, rules)
+        LOG.debug(
+            "[verify][REJ  %d] %s | reason=%s", i, _fmt_span(sp, doc_text), reason
+        )
+
+    # ---- NEW: cap BEFORE overlap policy ----
+    cap = int((rules or {}).get("verify_max", 8))
+    if len(kept_norm) > cap:
+        # simple heuristic: prefer shorter spans first, then Evidence last
+        kept_norm.sort(
+            key=lambda m: (m["type"] == "Evidence", (m["endIndex"] - m["startIndex"]))
+        )
+        kept_norm = kept_norm[:cap]
+
+    # Enforce your overlap policy (e.g., allow short Victim-in-Action; forbid Actor↔Victim)
+    kept_norm = _apply_overlap_policy_permissive(kept_norm)
+
+    # Deterministic order, then cap
+    kept_norm.sort(
+        key=lambda z: (z["startIndex"], z["endIndex"] - z["startIndex"], z["type"])
+    )
+
+    # Use the global arg for the cap
+    s1_verify_max = 8196
+    if len(kept_norm) > s1_verify_max:
+        LOG.warning(
+            "Verifier kept %d spans; capping to %d.", len(kept_norm), s1_verify_max
+        )
+        kept_norm = kept_norm[:s1_verify_max]
+
+    return kept_norm, {
+        "verifier": ver_diag,
+        "kept": len(kept_norm),
+        "rejected": len(rej_norm),
+        "kept_diag": kept_diag,
+        "rej_diag": rej_diag,
+    }
 
 
 _VALID_S2 = {"conspiracy", "non"}
@@ -683,7 +1218,8 @@ def _write_jsonl_zip(
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
         return
 
-    import zipfile, io
+    import io
+    import zipfile
 
     buf = io.StringIO()
     for r in records:
@@ -775,6 +1311,12 @@ def main():
         action="store_true",
         help="Write plain .jsonl even if submission/output path ends with .zip.",
     )
+    ap.add_argument(
+        "--s1-usc",
+        action="store_true",
+        default=True,
+        help="Use Universal Self-Consistency to select the best S1 extraction from SC samples.",
+    )
 
     # token limits
     ap.add_argument(
@@ -794,7 +1336,7 @@ def main():
     ap.add_argument(
         "--s1-sc",
         action="store_true",
-        default=False,
+        default=False,  # TODO: Test with True
         help="Enable S1 self-consistency (multi-sample + merge).",
     )
     ap.add_argument(
@@ -869,27 +1411,96 @@ def main():
     ap.add_argument(
         "--s1-ext-thinking",
         action="store_true",
+        default=False,
         help="Enable Anthropic Extended Thinking for S1.",
     )
     ap.add_argument(
         "--s1-thinking-budget",
         type=int,
-        default=8196,
+        default=4096,
         help="Token budget for S1 Extended Thinking (must be < max tokens).",
     )
     ap.add_argument(
         "--s2-ext-thinking",
         action="store_true",
+        default=False,
         help="Enable Anthropic Extended Thinking for S2.",
     )
     ap.add_argument(
         "--s2-thinking-budget",
         type=int,
-        default=512,
+        default=4096,
         help="Token budget for S2 Extended Thinking.",
+    )
+    # --- ADD THESE ---
+    ap.add_argument(
+        "--log-file",
+        type=pathlib.Path,
+        default=None,
+        help="Optional path to write logs to a file (e.g., outputs/run.log).",
+    )
+    ap.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Set the logging level for console and file.",
+    )
+    # --- Retrieval / ICL selection flags ---
+    ap.add_argument(
+        "--fs-mode",
+        type=str,
+        default="online",
+        choices=["static", "online"],
+        help="Few-shot selection mode: 'online' (per-doc retrieval) or 'static' (current deterministic).",
+    )
+
+    ap.add_argument(
+        "--s1-ret-R",
+        type=int,
+        default=24,
+        help="Retrieve top-R S1 candidates before coverage & trimming to --s1-fs-k.",
+    )
+
+    ap.add_argument(
+        "--s2-ret-R",
+        type=int,
+        default=24,
+        help="Retrieve top-R S2 candidates before balance & trimming to --s2-fs-k.",
+    )
+
+    ap.add_argument(
+        "--embed-mode",
+        type=str,
+        default="jaccard",
+        choices=["jaccard", "titan"],
+        help="Similarity backend for retrieval.",
+    )
+
+    ap.add_argument(
+        "--embed-model-id",
+        type=str,
+        default="amazon.titan-embed-text-v2:0",
+        help="Bedrock embedding model id when --embed-mode=titan.",
+    )
+
+    ap.add_argument(
+        "--embed-region",
+        type=str,
+        default=None,
+        help="Region for embeddings (defaults to --region).",
+    )
+
+    ap.add_argument(
+        "--unc-weight",
+        type=float,
+        default=0.4,
+        help="Weight for uncertainty in blended score; similarity weight is (1-unc-weight).",
     )
 
     args = ap.parse_args()
+    # --- ADD THIS CALL ---
+    setup_logging(args.log_level, args.log_file)
     random.seed(args.seed)
 
     s1_budget = max(0, min(args.s1_thinking_budget, args.s1_max_tokens - 1))
@@ -926,10 +1537,10 @@ def main():
                 tech=("fs_cot" if args.s1_cot else "fs"),
             )
 
-            print("\n======= S1 SYSTEM PROMPT (preview) =======\n")
-            print(sys_prompt_s1)
-            print("\n======= S1 USER PROMPT (preview) =======\n")
-            print(user_prompt_s1)
+            LOG.info("\n======= S1 SYSTEM PROMPT (preview) =======\n")
+            LOG.info(sys_prompt_s1)
+            LOG.info("\n======= S1 USER PROMPT (preview) =======\n")
+            LOG.info(user_prompt_s1)
 
         # S2 preview (uses empty S1 markers just to show structure)
         if args.task in ("s2", "both"):
@@ -946,10 +1557,10 @@ def main():
                 )
             )
 
-            print("\n======= S2 SYSTEM PROMPT (preview) =======\n")
-            print(sys_prompt_s2)
-            print("\n======= S2 USER PROMPT (preview) =======\n")
-            print(user_prompt_s2)
+            LOG.info("\n======= S2 SYSTEM PROMPT (preview) =======\n")
+            LOG.info(sys_prompt_s2)
+            LOG.info("\n======= S2 USER PROMPT (preview) =======\n")
+            LOG.info(user_prompt_s2)
 
     # -------- Run --------
     n = len(rows)
@@ -963,6 +1574,9 @@ def main():
         first10_printed += 1
         doc_id = r.get("_id") or r.get("doc_id") or f"row{i}"
         text = (r.get("text") or "").strip()
+        # 1. Create ONE stateful chat session for this document
+        #    We set keep_thinking_in_history=True so S2 can see S1's thoughts.
+        chat = _get_chat(args.model_id, args.region)
         subreddit = r.get("subreddit")
         if not text:
             continue
@@ -1017,10 +1631,53 @@ def main():
                             if spans_i:
                                 samples.append(spans_i)
 
-                        merged = _merge_sc_spans(samples, top_k=args.s1_verify_max)
+                        merged = []
+                        if args.s1_usc and raws:
+                            # 1) Build USC judge prompts
+                            sys_j = build_s1_usc_system()
+                            usr_j = build_s1_usc_user(text=text, attempts=raws)
+
+                            try:
+                                usc_resp = chat.chat(
+                                    system_prompt=sys_j,
+                                    user_prompt=usr_j,
+                                    max_tokens=min(args.s1_max_tokens, 4096),
+                                    temperature=0.0,
+                                    stop_sequences=["</answer>"],
+                                    enable_extended_thinking=False,
+                                )
+                                usc_ans = (
+                                    usc_resp.get("answer", "")
+                                    if isinstance(usc_resp, dict)
+                                    else str(usc_resp or "")
+                                )
+                                merged = _safe_parse_s1_generation(usc_ans) or []
+                                LOG.debug("[USC] picked %d span(s).", len(merged))
+                            except Exception as e:
+                                LOG.warning(
+                                    "[USC] judge failed: %s — falling back to set-merge.",
+                                    e,
+                                )
+                                merged = _merge_sc_spans(
+                                    samples, top_k=args.s1_verify_max
+                                )
+                        else:
+                            # fallback: your previous merge (if USC off)
+                            merged = _merge_sc_spans(samples, top_k=args.s1_verify_max)
                         if args.s1_verify and merged:
-                            merged = _verify_s1_spans(
-                                chat, text, merged, keep_max=args.s1_verify_max
+                            # Build verifier prompts
+                            v_sys = build_s1_verify_system()
+                            v_user = build_s1_verify_user(text=text, candidates=merged)
+                            # Call new verifier
+                            merged, _ = _verify_s1_spans(
+                                chat=chat,
+                                system_prompt=v_sys,
+                                user_prompt=v_user,
+                                candidates=merged,
+                                doc_text=text,
+                                rules={
+                                    "verify_max": args.s1_verify_max
+                                },  # Pass any specific rules here
                             )
                         s1_spans_for_s2 = merged
                         s1_raw_dump = json.dumps(
@@ -1028,6 +1685,7 @@ def main():
                                 "samples": len(samples),
                                 "merged": merged,
                                 "raw_answers": raws,
+                                "usc_pick": merged,  # after parse (and before verify)
                             },
                             ensure_ascii=False,
                         )
@@ -1055,11 +1713,25 @@ def main():
                         s1_thinking_dump = resp_dict.get("thinking", "")
 
                         s1_spans_for_s2 = _safe_parse_s1_generation(s1_raw_dump)
+                        LOG.info("S1 spans before verification: %s", s1_spans_for_s2)
 
                         # --- ADD THIS BLOCK ---
                         if args.s1_verify and s1_spans_for_s2:
-                            s1_spans_for_s2 = _verify_s1_spans(
-                                chat, text, s1_spans_for_s2, keep_max=args.s1_verify_max
+                            # Build verifier prompts
+                            v_sys = build_s1_verify_system()
+                            v_user = build_s1_verify_user(
+                                text=text, candidates=s1_spans_for_s2
+                            )
+                            # Call new verifier
+                            s1_spans_for_s2, _ = _verify_s1_spans(
+                                chat=chat,
+                                system_prompt=v_sys,
+                                user_prompt=v_user,
+                                candidates=s1_spans_for_s2,
+                                doc_text=text,
+                                rules={
+                                    "verify_max": args.s1_verify_max
+                                },  # Pass any specific rules here
                             )
             except Exception as e:
                 LOG.warning("[S1] generate() failed -> %s", e)
@@ -1077,11 +1749,13 @@ def main():
             )
 
         if first10_printed < 10:
-            lines = [f"[{first10_printed+1}] id={doc_id}"]
+            lines = [f"[{first10_printed}] id={doc_id}"]
             if args.task in ("s1", "both"):
-                lines.append("  S1 raw: " + (s1_raw_dump or "")[:800])
+                lines.append("  S1 raw: " + (s1_raw_dump or ""))
                 # --- ADD THIS ---
-                lines.append(f"  S1 parsed: {len(s1_spans_for_s2)} spans")
+                lines.append(f"  S1 parsed: {len(s1_spans_for_s2)} span(s)")
+                for j, sp in enumerate(s1_spans_for_s2[:3]):
+                    lines.append(f"    - {_fmt_span(sp, text)}")
             tqdm.write("\n".join(lines))
 
         # ---------- S2 ----------
@@ -1089,6 +1763,13 @@ def main():
         s2_thinking_dump = ""  # <-- NEW: variable to store CoT
         s2_label, s2_rationale = None, ""
         if args.task in ("s2", "both"):
+            # --- NEW: Inject clean S1 summary into the chat history ---
+            if chat is not None:
+                s1_summary = json.dumps(s1_spans_for_s2)
+                chat.add_note(
+                    tag="s1_final_results",
+                    payload=f"The final S1 spans are: {s1_summary}",
+                )
             fewshots_s2 = _select_s2_fewshots_for_doc(
                 fs_s2_pool, k=min(args.s2_fs_k, len(fs_s2_pool))
             )
@@ -1187,7 +1868,7 @@ def main():
             if first10_printed < 10:
                 lines = [f"[{first10_printed}] id={doc_id}"]
                 if args.task in ("s2", "both"):
-                    lines.append("  S2 raw: " + (s2_raw_dump or "")[:800])
+                    lines.append("  S2 raw: " + (s2_raw_dump or ""))
                     # --- ADD THIS ---
                     lines.append(f"  S2 parsed: {s2_label}")
                 tqdm.write("\n".join(lines))
@@ -1229,16 +1910,6 @@ def main():
             s2_submit, args.sub_s2, force_jsonl=args.no_zip, name_hint="submission"
         )
         LOG.info("S2 submission -> %s (%d lines)", args.sub_s2, len(s2_submit))
-
-    # -------- Print first 10 raw answers --------
-    if first10_raw:
-        print("\n======= FIRST 10 RAW ANSWERS =======\n")
-        for j, rec in enumerate(first10_raw, 1):
-            print(f"[{j}] id={rec['_id']}")
-            if args.task in ("s1", "both"):
-                print("  S1 raw:", (rec.get("s1_raw") or "")[:800], "\n")
-            if args.task in ("s2", "both"):
-                print("  S2 raw:", (rec.get("s2_raw") or "")[:800], "\n")
 
     elapsed = time.time() - t0
     LOG.info("All done. Elapsed: %.1fs", elapsed)

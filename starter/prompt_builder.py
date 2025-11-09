@@ -107,6 +107,23 @@ def playbook_block() -> str:
 """.strip()
 
 
+# --- add near the top of prompt_builder.py (next to playbook_block) ---
+# 1) preamble keeps the role + theory
+def psycho_theory_preamble() -> str:
+    return """
+<psycholinguistic_preamble version="1.0">
+  <role>You are an expert computational psycholinguist. Align your reasoning with psycholinguistic and evolutionary accounts of conspiratorial rhetoric for SemEval-2026 PsyCoMark Subtask 1 (marker extraction).</role>
+  <marker_definitions>
+    <Actor>Agents alleged to secretly orchestrate events; the conspirators.</Actor>
+    <Action>Deliberate acts attributed to the Actor (what they do). Verb phrase; exclude outcomes/goals.</Action>
+    <Effect>Consequence/goal/purpose of the Action (why/result). Often purpose/result clause.</Effect>
+    <Victim>Entity harmed/targeted by the Action.</Victim>
+    <Evidence>Support claims: links; quoted+attributed material; numeric facts+units+named source.</Evidence>
+  </marker_definitions>
+</psycholinguistic_preamble>
+""".strip()
+
+
 # ---------- Few-shot utilities (S1) ----------
 def _clip_span_to_text(span: dict, text: str) -> Optional[dict]:
     try:
@@ -151,9 +168,9 @@ def build_s1_verifier_prompts(
     *, text: str, candidate_spans: List[Dict]
 ) -> tuple[str, str]:
     """
-    Returns (system, user) prompts. Model should output ONLY:
-      {"keep":[int,int,...], "reject":[int,int,...]}
-    where indices refer to candidate_spans order.
+    Returns (system, user). Model must output ONLY:
+    {"keep":[{"type":"...","start":int,"end":int}], "reject":[{"type":"...","start":int,"end":int}]}
+    with optional "text". Offsets are end-exclusive, 0-indexed, into the provided post text.
     Criteria:
       - text slice at [start:end] MUST match candidate "text" if provided (± trivial whitespace).
       - Label validity: apply Evidence gate (URL/quote+attribution/source OR numbers+units+source),
@@ -185,76 +202,82 @@ def build_s1_verifier_prompts(
 # TODO: Check the span extraction method if it is valid or if we should ask the LLM to handle it
 # --------- S1 builders ----------
 def build_s1_system(
-    priors: dict[str, float] | None = None,
+    priors: dict | None = None,
     conflicts: list[tuple[str, str]] | None = None,
     use_cot: bool = True,
 ) -> str:
-    priors_str = json.dumps(priors or {}, ensure_ascii=False, indent=2)
-    conflict_pairs_str = json.dumps(conflicts or [], ensure_ascii=False)
+    priors_str = json.dumps(priors or {}, ensure_ascii=False, separators=(",", ":"))
+    conflict_pairs_str = json.dumps(
+        conflicts or [], ensure_ascii=False, separators=(",", ":")
+    )
 
     workflow_block = ""
     if use_cot:
         workflow_block = """<workflow>
 1. <thinking>
-   - **Step 1 (Role-by-Role Scan):** Systematically scan the text for potential spans for each role: Actor, Victim, Action, Effect.
-   - **Step 2 (Evidence Gate):** Scan *specifically* for 'Evidence' candidates. Keep ONLY those that strictly match the <evidence_gate> rule (URL, attributed quote, or numeric facts with a named source). Discard all other potential 'Evidence' spans.
-   - **Step 3 (Action/Effect Split):** Review all 'Action' and 'Effect' candidates. Ensure 'Action' is the core verb phrase (what is done) and 'Effect' is the purpose/outcome (often starting with "to", "so that", "in order to"). Adjust boundaries if a span incorrectly merges both.
-   - **Step 4 (Boundary & Length Check):** For all remaining candidates (Steps 1-3), ensure spans are 'token-tight' and at least 3 characters long. Trim any leading/trailing whitespace or punctuation that isn't part of the span.
-   - **Step 5 (Overlap Resolution):** Resolve any spans that overlap according to the <overlap_policy>. Use <statistical_priors> as tie-breakers if ambiguity remains.
+    - Step 1 — Role-by-role scan: collect candidates for Actor, Action, Effect, Victim; then scan explicitly for Evidence.
+    - Step 2 — Evidence gate: keep ONLY Evidence matching <evidence_gate>.
+    - Step 3 — Action vs Effect split: Action = verb phrase (what is done); Effect = purpose/result (often with "to/so that/in order to"). Do not merge them.
+    - Step 4 — Boundary & length: spans must be token-tight and length ≥ 3 chars; include particles only if integral ("set up", "cover up").
+    - Step 5 — Light overlap control per <overlap_policy>. If doubtful, choose the tighter/shorter NP for Victim.
 2. <answer>
-   - Compile the final, validated, and non-overlapping spans into the JSON array.
+    - Output the final JSON array ONLY.
 </workflow>"""
 
-    return f"""<role>
-You are a precision-focused annotator for SemEval-2026 PsyCoMark S1.
-Return exact character offsets for all markers.
-</role>
-
-<marker_definitions>
-- Actor: agent portrayed as initiating/controlling events.
-- Action: deliberate verb phrase describing what is done (exclude outcomes/goals).
-- Effect: consequence/goal/purpose (include introducer like "to"/"so that").
-- Victim: harmed/targeted entity.
-- Evidence: explicit support (URLs, quoted with source, or numeric facts WITH named source).
-</marker_definitions>
-
+    core = f"""
 <rules>
   <output_format>
     Return ONLY a JSON array inside <answer>.
-    Each element:
-    [
-      {{"label":"Actor|Action|Effect|Victim|Evidence","start": <int>,"end": <int>,"text":"<optional verbatim>"}}
-    ]
-    Notes:
-    - "start" and "end" are MANDATORY; end-exclusive; computed over the RAW text.
-    - "text" is OPTIONAL (auditing only); must match text[start:end] if present.
-    - No prose, no extra keys, no trailing commas.
-    - ABSOLUTELY NO prose or explanatory text outside the final <answer> tag. Your response must begin exactly with <answer> or <thinking>.
-    - Offsets are 0-indexed and "end" is end-exclusive. For the text 'The cat', a span for 'cat' is {{"start": 4, "end": 7}}
+    Each element MUST be:
+    {{"type":"Actor|Action|Effect|Victim|Evidence","startIndex":<int>,"endIndex":<int>,"text":"<verbatim>"}}
+    Hard requirements:
+    - 0-indexed, end-exclusive offsets over the provided RAW text.
+    - "text" MUST equal RAW_TEXT[startIndex:endIndex] exactly.
+    - Provide all keys; no extra keys; no trailing commas.
+    - If there are NO spans, output exactly: <answer>[]</answer>
+    - After any <thinking>, immediately produce <answer> with the JSON array and nothing else.
   </output_format>
 
   <span_rules>
-    - Keep spans token-tight; include particles only if integral (“set up”, “cover up”).
+    - Keep spans token-tight; include particles only if integral (e.g., "set up", "cover up").
+    - Prefer minimal spans that still fully express the role.
   </span_rules>
 
   <evidence_gate>
-    Evidence ONLY if: (a) has URL/domain; OR (b) quotation with attribution verb AND concrete source; OR (c) numeric facts WITH units AND a named source.
+    Evidence ONLY if at least ONE holds:
+      (a) Contains a URL/domain,
+      (b) Quoted material WITH attribution verb AND named source,
+      (c) Numeric facts WITH units AND named source.
   </evidence_gate>
 
   <overlap_policy>
-    - Action vs Effect: split verb head (Action) from purpose/result clause (Effect); Effect must include the introducer.
-    - Actor vs Victim: must not overlap; choose the smallest role-true mention.
-    - Evidence may overlap others only if part of a quote/citation.
-    - Ambiguous pairs: {conflict_pairs_str}
+    - Forbid Actor↔Victim overlaps; if uncertain, prefer Actor unless the Victim is clearly superior.
+    - Allow Victim fully inside Action when Victim is a short NP (≤24 chars). Keep both if well-formed.
+    - Action vs Effect: split verb head (Action) from purpose/result (Effect, include introducer "to …").
+    - Evidence may overlap others only when part of a quote/citation per <evidence_gate>.
+    - Ambiguous pairs hint: {conflict_pairs_str}
   </overlap_policy>
 
   <statistical_priors>
 {priors_str}
   </statistical_priors>
+
+  <notes>
+    - Don’t over-mark generic function words.
+    - If a label is absent, output none for that label (do NOT hallucinate spans).
+  </notes>
 </rules>
 
 {workflow_block}
-"""
+""".strip()
+
+    # prepend priming + playbook once; no duplicated role/definitions below
+    try:
+        header = psycho_theory_preamble() + "\n" + playbook_block()
+    except NameError:
+        header = psycho_theory_preamble()
+
+    return header + "\n" + core
 
 
 def build_s1_user(
@@ -390,14 +413,16 @@ def build_s1_user(
     )
 
     tail = (
-        "Provide your reasoning in <thinking> (kept private), then output ONLY the JSON array in <answer>."
+        "Provide a brief <thinking> (kept private), then output ONLY the JSON array in <answer>. "
+        "If no spans exist, output <answer>[]</answer>. "
+        "Begin your final output with <answer>."
         if include_cot
-        else "Provide ONLY the final JSON in <answer>."
+        else "Output ONLY the JSON array in <answer>. If no spans exist, output <answer>[]</answer>. Begin with <answer>."
     )
 
     return f"""{examples}<task>
 <text_to_analyze>
-{_clip_text(text_input, max_chars=max_text_chars)}
+{text_input}
 </text_to_analyze>
 {tail}
 </task>""".strip()
@@ -407,16 +432,48 @@ def build_s1_user(
 
 
 def build_s1_verify_system() -> str:
-    return (
-        "You are a careful span validator for PsyCoMark (S1).\n"
-        "Given a post and candidate spans, keep ONLY spans that are:\n"
-        " - well-formed (non-empty, not just stopwords/punctuation),\n"
-        " - correctly typed (Actor, Action, Effect, Evidence, Victim),\n"
-        " - text-exact substrings of the post,\n"
-        " - non-duplicate (merge exact dupes),\n"
-        " - Action/Effect must be eventive phrases; Evidence must look like a citation/date/measure or source cue."
-        "- Evidence MUST meet the Evidence Gate: (a) has URL/domain; OR (b) quotation with attribution verb AND concrete source name; OR (c) numeric facts WITH units AND a named source. Otherwise reject."
-    )
+    """System prompt for S1 verifier (span validator / scorer)."""
+    core = """
+<role>
+You are validating candidate spans for PsyCoMark S1. Enforce JSON correctness, label plausibility, Action vs Effect split,
+and a calibrated Evidence gate. Prefer boundary-tight, minimal spans that still fully express the role.
+</role>
+
+<validation_criteria>
+  1) JSON validity: keys = {"type","startIndex","endIndex","text"} only; 0-indexed, end-exclusive; text == RAW[start:end].
+  2) Label plausibility: Actor/Action/Effect/Victim/Evidence as per definitions; do not relabel here—reject if wrong.
+  3) Action vs Effect: Action is the verb phrase (what is done); Effect is the purpose/result (include introducers "to/so that/in order to").
+  4) Boundary tightness: trim quotes/punct/whitespace unless integral; length ≥ 3 chars.
+  5) Overlaps: prefer non-overlap, but apply the permissive policy described in <overlap_policy>.
+  6) Evidence gate: see <evidence_gate>.
+</validation_criteria>
+
+<overlap_policy>
+  - Forbid Actor↔Victim only when they are clearly competing spans for the SAME surface; otherwise allow if Victim is a short NP (≤24 chars) nested in Action.
+  - If Actor and Victim boundaries differ by ≤2 chars on both ends (near-tie), allow both to coexist.
+  - Same-label dedup by IoU > 0.5 (keep the tighter/shorter one).
+</overlap_policy>
+
+<evidence_gate>
+  Evidence is valid if ANY of:
+    (a) URL or domain present, OR
+    (b) Quoted material WITH an attribution verb + NAMED source, OR
+    (c) Numeric facts WITH units + NAMED source, OR
+    (d) NAMED source with reporting/attribution verb (e.g., "according to <SOURCE>", "<SOURCE> reported ...").
+</evidence_gate>
+
+<output>
+Return ONLY a JSON array of kept spans inside <answer>. Do NOT invent new spans; either keep or drop candidates.
+</output>
+""".strip()
+
+    # NEW: prime the verifier exactly like S1
+    try:
+        header = psycho_theory_preamble() + "\n" + playbook_block()
+    except NameError:
+        header = psycho_theory_preamble()
+
+    return header + "\n" + core
 
 
 def build_s1_verify_user(*, text: str, candidates: list[dict]) -> str:
@@ -440,7 +497,15 @@ def build_s1_verify_user(*, text: str, candidates: list[dict]) -> str:
                     "endIndex": 0,
                     "text": "exact substring",
                 }
-            ]
+            ],
+            "rejected": [
+                {
+                    "type": "Label",
+                    "startIndex": 0,
+                    "endIndex": 0,
+                    "text": "span that failed validation",
+                }
+            ],
         },
     }
     return (
@@ -450,9 +515,61 @@ def build_s1_verify_user(*, text: str, candidates: list[dict]) -> str:
         "<input>\n"
         f"{json.dumps(blob, ensure_ascii=False)}\n"
         "</input>\n"
-        '<answer>{"kept": []}</answer>\n'
         "</task>"
     )
+
+
+# ---- USC judge for S1 ----
+def build_s1_usc_system() -> str:
+    header = ""
+    try:
+        header = psycho_theory_preamble() + "\n" + playbook_block()
+    except NameError:
+        header = psycho_theory_preamble()
+
+    core = """
+<role>
+You will review multiple EXTRACTION ATTEMPTS of the SAME Reddit text for PsyCoMark Subtask 1.
+Pick the SINGLE best answer that is boundary-tight, label-correct (Actor, Action, Effect, Victim, Evidence),
+and compliant with the overlap policy and evidence gate. Do NOT fuse or edit spans across attempts.
+</role>
+
+<selection_rules>
+  - Prefer minimal, verbatim spans where "text == RAW[startIndex:endIndex]".
+  - Action vs Effect must be split (verb phrase vs purpose/result with introducer "to/so that/in order to").
+  - Evidence must satisfy the evidence gate (URL/domain OR quoted+attributed OR numeric+units+source OR named source with reporting verb).
+  - Allow short Victim (≤24 chars, NP) nested in Action; near-tie Actor↔Victim (±2 chars) may coexist.
+  - Same-label duplicates: prefer the tighter/shorter span.
+</selection_rules>
+
+<output_format>
+Return ONLY ONE JSON array inside <answer>.
+</output_format>
+""".strip()
+
+    return header + "\n" + core
+
+
+def build_s1_usc_user(*, text: str, attempts: list[str]) -> str:
+    """
+    attempts: list of raw JSON arrays (strings) from the S1 generator.
+    """
+    # keep them as-is; USC judge is robust to minor formatting differences
+    attempts_block = "\n\n".join([f"<attempt>\n{a}\n</attempt>" for a in attempts])
+    return f"""
+<text_to_analyze>
+{text}
+</text_to_analyze>
+
+<attempts>
+{attempts_block}
+</attempts>
+
+<instruction>
+Review ALL attempts. Select the single best COMPLETE answer and output ONLY that JSON inside <answer>.
+Begin your final output with <answer>.
+</instruction>
+""".strip()
 
 
 import json
@@ -662,7 +779,7 @@ Your job: classify a Reddit post as "conspiracy" vs "non"{' vs "cant_tell"' if a
 3) Label as <non> when it's newsy/reporting, neutral discussion, or lacks endorsement of hidden-plot intent. Mere mention without endorsement is "non".
 4) Label 'non' even if the post discusses a conspiracy, as long as the author's stance is neutral, reporting, mocking, or debunking.
 {('5) Use <cant_tell> only if evidence is insufficient or text is too ambiguous.' if allow_cant_tell else '')}
-6) {thinking_instr}
+5) {thinking_instr}
 </instructions>
 
 <answer_schema>
