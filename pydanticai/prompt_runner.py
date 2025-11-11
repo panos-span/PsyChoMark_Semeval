@@ -418,9 +418,10 @@ async def run_pipeline_for_doc(
                 allow_cant_tell=allow_cant_tell,
             )
             s2_out = {
-                "id": doc_id,
-                "label": s2_struct.label,
-                "rationale": s2_struct.rationale,
+                "_id": doc_id,
+                "conspiracy": (
+                    "Yes" if str(s2_struct.label).lower() == "conspiracy" else "No"
+                ),
             }
         except Exception as e:
             logging.error("[%s] S2 failed: %s", doc_id, e, exc_info=True)
