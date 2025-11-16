@@ -1,0 +1,11 @@
+uv run pydanticai/prompt_runner.py `
+   data/raw/dev_rehydrated.jsonl `
+   --task both `
+   --fewshot-bank data/fewshots/psycomark_fewshots.json `
+   --priors-json data/derived/psycomark_official_split_20251022_192733/prompt_artifacts.json `
+   --conflicts-json data/derived/psycomark_official_split_20251022_192733/prompt_artifacts.json `
+   --s1-out subs_pydanticai/ `
+   --s2-out subs_pydanticai/ `
+   --repair-window 16 `
+   --log-level INFO `
+   --seed 42 `

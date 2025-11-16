@@ -75,7 +75,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--format",
         choices=["text", "jsonl"],
-        default=None,
+        default="jsonl",
         help="Input format; auto-detected by extension if omitted.",
     )
     p.add_argument(
@@ -202,11 +202,49 @@ def load_input(path: str, fmt: str | None) -> list[dict]:
     return rows
 
 
-def save_jsonl(path: str, items: Iterable[Dict[str, Any]]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+def save_jsonl(file_name: str, zip_name: str, items: Iterable[Dict[str, Any]]) -> None:
+    """Persist items to JSONL inside subs_pydanticai/ and zip that file.
+
+    Robust path handling:
+      - Always creates subs_pydanticai directory.
+      - If caller passes a path with directories, we take only the basename.
+      - If caller accidentally passes a trailing slash (directory), we append .jsonl.
+    """
+    base_dir = "subs_pydanticai"
+    os.makedirs(base_dir, exist_ok=True)
+    # Normalize file_name to ensure it's a file, not a directory path.
+    if file_name.endswith(("/", "\\")):
+        # Strip trailing slashes and add extension if missing
+        file_name = file_name.rstrip("/\\")
+        if not file_name.lower().endswith(".jsonl"):
+            file_name = file_name + ".jsonl"
+    # Only keep the basename so we don't create nested arbitrary directories
+    file_name = os.path.basename(file_name)
+    if not file_name:
+        file_name = "submission.jsonl"
+    jsonl_path = os.path.join(base_dir, file_name)
+    with open(jsonl_path, "w", encoding="utf-8") as f:
         for obj in items:
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    # Zip into the same directory for easier discovery
+    import zipfile
+
+    zip_path = os.path.join(base_dir, os.path.basename(zip_name))
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        zipf.write(jsonl_path, arcname=os.path.basename(jsonl_path))
+
+    # Always write jsonl as submission.jsonl first
+
+    # os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # with open(path, "w", encoding="utf-8") as f:
+    #    for obj in items:
+    #        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    ## Zip the jsonl file
+    # zip_path = path + ".zip"
+    # import zipfile
+    # with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+    #    zipf.write(path, arcname=os.path.basename(path))
 
 
 # -----------------------
@@ -225,7 +263,7 @@ def safe_load_json(path: Optional[str]) -> Any:
         return None
 
 
-def pick_s1_fewshots(bank: Any, k_total: int = 8, seed: int = 7) -> List[dict]:
+def pick_s1_fewshots(bank: Any, k_total: int = 10, seed: int = 42) -> List[dict]:
     """
     Best-effort selection from a flexible fewshot bank.
     Expected S1 schema example:
@@ -246,7 +284,7 @@ def pick_s1_fewshots(bank: Any, k_total: int = 8, seed: int = 7) -> List[dict]:
 
 
 def pick_s2_fewshots(
-    bank: Any, k_total: int = 10, seed: int = 7, allow_cant_tell: bool = False
+    bank: Any, k_total: int = 10, seed: int = 42, allow_cant_tell: bool = False
 ) -> List[dict]:
     """
     Best-effort selection for balanced S2 few-shots.
@@ -375,6 +413,7 @@ async def run_pipeline_for_doc(
                 conflicts=conflicts or [],
                 fewshots=s1_fs,
                 include_cot=include_cot,
+                temperature=0.0,
             )
             # Convert to plain dict for saving
             spans = [
@@ -416,6 +455,7 @@ async def run_pipeline_for_doc(
                 fewshots=s2_fs,
                 include_cot=include_cot,
                 allow_cant_tell=allow_cant_tell,
+                temperature=0.0,
             )
             s2_out = {
                 "_id": doc_id,
@@ -454,7 +494,7 @@ async def main_async(args: argparse.Namespace):
 
     import asyncio
 
-    sem = asyncio.Semaphore(3)  # mild concurrency to keep Bedrock happy
+    sem = asyncio.Semaphore(2)  # mild concurrency to keep Bedrock happy
 
     async def _worker(row):
         async with sem:
@@ -485,10 +525,20 @@ async def main_async(args: argparse.Namespace):
 
     # Save
     if s1_records and args.task in ("s1", "both"):
-        save_jsonl(args.s1_out, s1_records)
+        from datetime import datetime
+
+        save_jsonl(
+            file_name="submission.jsonl",
+            zip_name=f"submission_s1_{datetime.now().strftime('_%Y%m%d_%H%M%S')}.zip",
+            items=s1_records,
+        )
         logging.info("Wrote S1 outputs: %s (%d rows)", args.s1_out, len(s1_records))
     if s2_records and args.task in ("s2", "both"):
-        save_jsonl(args.s2_out, s2_records)
+        save_jsonl(
+            file_name="submission.jsonl",
+            zip_name=f"submission_s2_{datetime.now().strftime('_%Y%m%d_%H%M%S')}.zip",
+            items=s2_records,
+        )
         logging.info("Wrote S2 outputs: %s (%d rows)", args.s2_out, len(s2_records))
 
     # Summary

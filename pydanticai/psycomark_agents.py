@@ -27,7 +27,6 @@ import os
 import re
 from enum import Enum
 from typing import List, Optional, Tuple, Dict, Any
-from dataclasses import dataclass
 from prompt_builder import (
     to_s2_marker,
 )  # utility for normalizing S1 spans into S2 markers
@@ -110,23 +109,6 @@ agent_s1 = Agent(
     model_settings=ModelSettings(temperature=0.0),  # optional, reduces paraphrase
 )
 
-_URL_RE = re.compile(
-    r"""(?i)\b(?:https?://|www\.)[^\s<>"']{3,}|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\b""",
-    re.I,
-)
-_ATTRIB_RE = re.compile(r"""(?i)\b(according to|reported by|as stated by)\b""")
-_QUOTE_RE = re.compile(r"[\"“”‘’']")  # any quote char
-_NUMERIC_UNIT_RE = re.compile(
-    r"(?i)\b\d+(\.\d+)?\s?(%|ppm|km|m|kg|k|million|billion)\b"
-)
-
-
-def _safe_clip(s: str, a: int, b: int) -> Tuple[int, int]:
-    a = max(0, int(a))
-    b = max(a, int(b))
-    L = len(s)
-    return min(a, L), min(b, L)
-
 
 def _extract_raw_text_from_user_prompt(user_prompt: str) -> str:
     """We put the RAW text inside <text_to_analyze>...</text_to_analyze>."""
@@ -134,64 +116,28 @@ def _extract_raw_text_from_user_prompt(user_prompt: str) -> str:
     return m.group(1) if m else user_prompt
 
 
-def _evidence_gate_ok(span_text: str) -> bool:
-    """
-    Evidence valid if ANY of:
-      (a) URL/domain present, OR
-      (b) Quoted material WITH attribution cue, OR
-      (c) Numeric facts WITH units (or %) AND attribution cue.
-    Mirrors the gate in your prompt text. :contentReference[oaicite:1]{index=1}
-    """
-    has_url = bool(_URL_RE.search(span_text))
-    has_quote = bool(_QUOTE_RE.search(span_text))
-    has_attrib = bool(_ATTRIB_RE.search(span_text))
-    has_numeric = bool(_NUMERIC_UNIT_RE.search(span_text))
-    if has_url:
-        return True
-    if has_quote and has_attrib:
-        return True
-    if has_numeric and has_attrib:
-        return True
-    # Also accept pure attribution with a named source (loose but useful).
-    if has_attrib:
-        return True
-    return False
-
-
-def _local_align_search(raw: str, expected: str, s: int, e: int, window: int = 16):
-    if not expected:
-        return None
-    L = len(raw)
-    a = max(0, s - window)
-    b = min(L, e + window)
-    i = raw[a:b].find(expected)
-    if i < 0:
-        return None
-    ss = a + i
-    ee = ss + len(expected)
-    return ss, ee
-
-
-_MARKER_CUE_RE = re.compile(
-    r"(?i)\b(they|the elite|globalists|deep state|big pharma|cover[-\s]?up|plot|scheme|orchestrate|fabricate)\b"
-)
-_PURPOSE_RE = re.compile(r"(?i)\bto\s+[a-z][a-z-]+\b")  # simple "to VERB" cue
-_HAS_VERBISH = re.compile(
-    r"(?i)\b(?:is|are|was|were|be|been|being|do|does|did|has|have|had|can|will|would|should)\b"
-)
-
-
-def _likely_contains_markers(t: str) -> bool:
-    # Any of: marker cues, purpose clause, evidence-like surface cues, or just enough verbs in a long text
-    if _MARKER_CUE_RE.search(t):
-        return True
-    if _PURPOSE_RE.search(t):
-        return True
-    if _URL_RE.search(t) or _QUOTE_RE.search(t) or _ATTRIB_RE.search(t):
-        return True
-    if len(t) > 220 and len(_HAS_VERBISH.findall(t)) >= 3:
-        return True
-    return False
+# def _evidence_gate_ok(span_text: str) -> bool:
+#    """
+#    Evidence valid if ANY of:
+#      (a) URL/domain present, OR
+#      (b) Quoted material WITH attribution cue, OR
+#      (c) Numeric facts WITH units (or %) AND attribution cue.
+#    Mirrors the gate in your prompt text. :contentReference[oaicite:1]{index=1}
+#    """
+#    has_url = bool(_URL_RE.search(span_text))
+#    has_quote = bool(_QUOTE_RE.search(span_text))
+#    has_attrib = bool(_ATTRIB_RE.search(span_text))
+#    has_numeric = bool(_NUMERIC_UNIT_RE.search(span_text))
+#    if has_url:
+#        return True
+#    if has_quote and has_attrib:
+#        return True
+#    if has_numeric and has_attrib:
+#        return True
+#    # Also accept pure attribution with a named source (loose but useful).
+#    if has_attrib:
+#        return True
+#    return False
 
 
 SMART_TO_STRAIGHT = {
@@ -209,200 +155,28 @@ SMART_TO_STRAIGHT = {
     "\u00a0": " ",  # nbsp
 }
 
-_WS_RE = re.compile(r"\s+", re.S)
-_ALNUM_RE = re.compile(r"[A-Za-z0-9]")
-
-
-def _normalize_with_map(text: str) -> Tuple[str, List[int]]:
-    """
-    Normalize text for matching and produce a mapping from normalized
-    indices -> original RAW indices.
-
-    Normalizations:
-      - smart quotes & dashes -> ASCII
-      - collapse all whitespace runs to a single ' ' (space)
-
-    Returns:
-      norm: the normalized string
-      idx_map: list where idx_map[i] gives the RAW index for norm[i]
-    """
-    # 1) map smart chars
-    mapped_chars: List[str] = []
-    mapped_src_idx: List[int] = []
-    for i, ch in enumerate(text):
-        mapped = SMART_TO_STRAIGHT.get(ch, ch)
-        mapped_chars.append(mapped)
-        mapped_src_idx.append(i)
-
-    # 2) collapse whitespace, building final map
-    norm_chars: List[str] = []
-    idx_map: List[int] = []
-    i = 0
-    L = len(mapped_chars)
-    while i < L:
-        ch = mapped_chars[i]
-        if ch.isspace():
-            # collapse run to one space; source index = first raw idx in the run
-            start_raw_i = mapped_src_idx[i]
-            while i < L and mapped_chars[i].isspace():
-                i += 1
-            norm_chars.append(" ")
-            idx_map.append(start_raw_i)
-        else:
-            norm_chars.append(ch)
-            idx_map.append(mapped_src_idx[i])
-            i += 1
-
-    return "".join(norm_chars), idx_map
-
-
-def _is_word_char(ch: str) -> bool:
-    return bool(_ALNUM_RE.fullmatch(ch))
-
-
-def _expand_to_token_edges(raw: str, s: int, e: int) -> Tuple[int, int]:
-    """
-    Expand [s,e) to word/token boundaries without crossing spaces:
-      - move s left until start or previous char is non-alnum
-      - move e right until end or next char is non-alnum
-    """
-    L = len(raw)
-    # expand left
-    while s > 0 and _is_word_char(raw[s]) and _is_word_char(raw[s - 1]):
-        s -= 1
-    # expand right
-    while e < L and _is_word_char(raw[e - 1]) and _is_word_char(raw[e]):
-        e += 1
-    return s, e
-
-
-def _tighten(
-    raw: str, s: int, e: int, target_text: Optional[str] = None
-) -> Tuple[int, int]:
-    """
-    Gentle boundary snap: only expand to token edges if it preserves equality with target_text.
-    If target_text is None, keep (s,e) as-is.
-    """
-    if target_text is None:
-        return s, e
-
-    ns, ne = _expand_to_token_edges(raw, s, e)
-    expanded = raw[ns:ne]
-
-    # preserve only if equality or containment (to avoid mid-word truncation)
-    if expanded == target_text or target_text in expanded or expanded in target_text:
-        return ns, ne
-    return s, e
-
-
-# --- normalization helpers ---
-_SMART = {
-    "“": '"',
-    "”": '"',
-    "„": '"',
-    "‟": '"',
-    "‘": "'",
-    "’": "'",
-    "‚": "'",
-    "‛": "'",
-    "—": "-",
-    "–": "-",
-    "−": "-",
-    "\u00a0": " ",
+# Expand the mapping of “smart” punctuation → straight ASCII
+_SMART_TO_STRAIGHT = {
+    ord("“"): ord('"'),
+    ord("”"): ord('"'),
+    ord("‘"): ord("'"),
+    ord("’"): ord("'"),
+    ord("‚"): ord("'"),
+    ord("‛"): ord("'"),
+    ord("«"): ord('"'),
+    ord("»"): ord('"'),
+    ord("–"): ord("-"),
+    ord("—"): ord("-"),
+    ord("−"): ord("-"),
+    ord("…"): ord("."),  # we'll collapse runs anyway
 }
 
-
-def _norm_text(s: str) -> str:
-    s2 = "".join(_SMART.get(ch, ch) for ch in s)
-    # collapse runs of whitespace to a single space
-    return re.sub(r"\s+", " ", s2).strip()
+# Collapse *all* whitespace kinds (spaces, NBSP, thin spaces, ZWSP sequences) to a single normal space
+# Includes: \xA0 (NBSP), \u2000–\u200B (en/em/thin/ZWSP), \u202F (NNBSP)
+_NORMALIZE_SPACE_RE = re.compile(r"[\s\u00A0\u2000-\u200B\u202F]+")
 
 
-def _norm_equal(a: str, b: str) -> bool:
-    return _norm_text(a) == _norm_text(b)
-
-
-def _build_norm_map(raw: str) -> tuple[str, list[int]]:
-    """
-    Return (norm, idx_map) where norm is normalized RAW,
-    and idx_map[norm_idx] -> raw_idx for the start of each normalized char.
-    Collapses whitespace runs to one space and normalizes quotes/dashes.
-    """
-    idx_map = []
-    out = []
-    i = 0
-    L = len(raw)
-    while i < L:
-        ch = raw[i]
-        ch = _SMART.get(ch, ch)
-        if ch.isspace():
-            # collapse a whitespace run
-            while i < L and raw[i].isspace():
-                i += 1
-            out.append(" ")
-            # map this single space to the first raw index after the run-start
-            idx_map.append(
-                i - 1
-            )  # last whitespace pos; consistent since we’ll remap window later
-            continue
-        out.append(ch)
-        idx_map.append(i)
-        i += 1
-    return "".join(out), idx_map
-
-
-_WORD = re.compile(r"\w")
-
-
-def _tighten_to_word(raw: str, s: int, e: int, *, want: str) -> tuple[int, int]:
-    """
-    Snap to token boundaries only when doing so keeps an exact match relationship.
-    Never cut inside a word if avoidable.
-    """
-    # if already matching want exactly, keep tight
-    if raw[s:e] == want:
-        return s, e
-    # expand left if we cut a word
-    sl, sr = s, e
-    if s > 0 and _WORD.match(raw[s]) and _WORD.match(raw[s - 1]):
-        # expand left to word start
-        while sl > 0 and _WORD.match(raw[sl - 1]):
-            sl -= 1
-        if _norm_equal(raw[sl:sr], want) or _norm_equal(raw[sl:sr], _norm_text(want)):
-            s = sl
-    # expand right if we cut a word
-    if e < len(raw) and _WORD.match(raw[e - 1]) and _WORD.match(raw[e]):
-        while sr < len(raw) and _WORD.match(raw[sr]):
-            sr += 1
-        if _norm_equal(raw[s:sr], want) or _norm_equal(raw[s:sr], _norm_text(want)):
-            e = sr
-    return s, e
-
-
-import re
-from typing import Optional, Tuple
-
-_SMART_TO_STRAIGHT = str.maketrans(
-    {
-        "“": '"',
-        "”": '"',
-        "„": '"',
-        "‟": '"',
-        "‘": "'",
-        "’": "'",
-        "‚": "'",
-        "‛": "'",
-        "—": "-",
-        "–": "-",
-        "−": "-",
-    }
-)
-
-_WS_RE = re.compile(r"\s+")
-_WORD_RE = re.compile(r"\w")
-
-
-def _normalize_for_match(s: str) -> Tuple[str, List[int]]:
+def _normalize_for_match(s: str) -> tuple[str, list[int]]:
     """
     Returns (norm, idx_map) where:
       - norm: s with smart quotes/dashes normalized and whitespace runs collapsed to ' '.
@@ -411,72 +185,89 @@ def _normalize_for_match(s: str) -> Tuple[str, List[int]]:
     if not s:
         return "", []
 
-    # 1) translate smart quotes/dashes → straight
     t = s.translate(_SMART_TO_STRAIGHT)
 
-    # 2) collapse whitespace while tracking indices back to RAW
-    norm_chars: List[str] = []
-    idx_map: List[int] = []
+    norm_chars: list[str] = []
+    idx_map: list[int] = []
+
     i, L = 0, len(t)
     while i < L:
         ch = t[i]
-        if ch.isspace():
-            j = i + 1
-            while j < L and t[j].isspace():
-                j += 1
-            # emit single space mapped to the first RAW index of the run
+        # Collapse any whitespace-like cluster (incl. NBSP / thin / ZWSP) to a single ' '
+        if _NORMALIZE_SPACE_RE.match(t, i):
+            m = _NORMALIZE_SPACE_RE.match(t, i)
             norm_chars.append(" ")
-            idx_map.append(i)
-            i = j
+            idx_map.append(i)  # map collapsed space to the first char of the run
+            i = m.end()
         else:
             norm_chars.append(ch)
             idx_map.append(i)
             i += 1
+
     return "".join(norm_chars), idx_map
 
 
 def _find_best_span(
-    raw: str, snippet: str, hint: Optional[Tuple[int, int]] = None
+    raw: str, snippet: str = None, *, nth: int = 0
 ) -> Optional[Tuple[int, int]]:
     """
-    Locate `snippet` in RAW using:
-      0) Accept hint only if it hard-matches RAW exactly.
+    Locate the nth occurrence of `snippet` in RAW using:
       1) Exact match.
       2) Case-insensitive match (only if same-length exact RAW slice).
       3) Normalized (quotes+whitespace) match with reversible mapping to RAW.
+
+    Returns (start, end) in RAW or None.
     """
     if not snippet:
         return None
 
-    # 0) accept trusted hint only if exact
-    if hint:
-        s, e = hint
-        if 0 <= s < e <= len(raw) and raw[s:e] == snippet:
-            return s, e
+    # 1) exact — iterate to nth
+    start = 0
+    for k in range(nth + 1):
+        i = raw.find(snippet, start)
+        if i < 0:
+            break
+        if k == nth:
+            return i, i + len(snippet)
+        start = i + 1  # advance at least 1 char
 
-    # 1) exact
-    i = raw.find(snippet)
-    if i >= 0:
-        return i, i + len(snippet)
-
-    # 2) case-insensitive (guarded)
+    # 2) case-insensitive (guarded) — iterate to nth
     lr, ls = raw.lower(), snippet.lower()
-    i = lr.find(ls)
-    if i >= 0:
+    start = 0
+    for k in range(nth + 1):
+        i = lr.find(ls, start)
+        if i < 0:
+            break
         j = i + len(snippet)
         if lr[i:j] == ls:
-            return i, j
+            if k == nth:
+                return i, j
+        start = i + 1
 
-    # 3) normalized search with reverse map
+    # 3) normalized search with reverse map — iterate to nth
     norm_raw, raw_map = _normalize_for_match(raw)
     norm_snip, _ = _normalize_for_match(snippet)
-    i = norm_raw.find(norm_snip)
-    if i < 0:
+    if not norm_snip:
+        return None
+
+    start = 0
+    hit_idx = None
+    for k in range(nth + 1):
+        i = norm_raw.find(norm_snip, start)
+        if i < 0:
+            hit_idx = None
+            break
+        if k == nth:
+            hit_idx = i
+            break
+        start = i + 1
+
+    if hit_idx is None:
         return None
 
     # map back to RAW
-    s = raw_map[i]
-    end_norm_idx = i + len(norm_snip) - 1
+    s = raw_map[hit_idx]
+    end_norm_idx = hit_idx + len(norm_snip) - 1
     e = raw_map[end_norm_idx] + 1
 
     # safety: compare normalized slices
@@ -488,7 +279,7 @@ def _find_best_span(
 
 
 def create_s1_agent(
-    system_prompt: str, temperature: int = 0.0
+    system_prompt: str, temperature: float = 0.0
 ) -> Agent[S1Deps, S1Output]:
     """
     Fresh agent per document. Binds the same output validator to the new instance.
@@ -540,6 +331,18 @@ def _tighten_gentle(
     return (s, e) if new_norm == tgt_norm else (s0, e0)
 
 
+from collections import defaultdict
+
+
+def _norm_key_text(s: str) -> str:
+    # reuse your normalization so keys are stable across smart quotes / whitespace
+    nx, _ = _normalize_for_match(s or "")
+    return nx
+
+
+_VICTIM_BARE_RE = re.compile(r"^(child|person|people|man|woman)$", re.IGNORECASE)
+
+
 async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Output:
     dbg = True
 
@@ -570,28 +373,39 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
         pv = RAW
         print(f"[loc] len(raw)={len(RAW)} preview='{pv}…'")
 
+    # NEW: track how many times we've already assigned this (label, text)
+    assigned_count = defaultdict(
+        int
+    )  # key: (label, norm_text) -> nth index to use next
+
     seen, cleaned = set(), []
+    action_spans: list[tuple[int, int]] = []  # NEW: track kept Action spans
 
     for i, m in enumerate(spans_in):
         label = m.label
-        snippet = (m.text or "").strip()
+        snippet = m.text or ""
 
-        hint = None
-        if (
-            m.start is not None
-            and m.end is not None
-            and 0 <= m.start < m.end <= len(RAW)
-        ):
-            hint = (m.start, m.end)
+        # choose nth occurrence deterministically
+        key = (label, _norm_key_text(snippet))
+        nth = assigned_count[key]
 
-        # 1) locate-by-text first (robust). Only accept hint if it already hard-matches.
-        hit = _find_best_span(RAW, snippet, hint=hint) if snippet else None
+        # 1) locate-by-text (nth occurrence)
+        hit = _find_best_span(RAW, snippet, nth=nth) if snippet else None
         if not hit:
-            if dbg:
-                print(
-                    f"[s1_verifier_impl] #{i} drop: locate-by-text failed (label={label}, text='{snippet[:80]}')"
-                )
-            continue
+            # optional: fallback to first occurrence if nth not found
+            hit = _find_best_span(RAW, snippet, nth=0) if snippet else None
+            if not hit:
+                if dbg:
+                    print(
+                        f"[s1_verifier_impl] #{i} drop: locate-by-text failed (label={label}, text='{snippet}')"
+                    )
+                continue
+            # if fallback used, don't bump nth; next one will try nth again
+
+        else:
+            # only bump when nth was honored
+            assigned_count[key] += 1
+
         s, e = hit
 
         # 2) gentle boundary snap (preserve equality)
@@ -610,25 +424,52 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
                 print(f"[s1_verifier_impl] #{i} drop: hard equality failed")
             continue
 
-        # 4) evidence gate
-        # if label == S1Label.Evidence and not _evidence_gate_ok(slice_txt):
-        #    if dbg:
-        #        print(f"[s1_verifier_impl] #{i} drop: evidence gate")
-        #    continue
+        # (optional) Evidence gate could be applied here if you want;
+        # left out because your current snippet doesn't include it.
+        # --- NEW: drop embedded bare-noun Victims that sit fully inside an Action span ---
+        if label == S1Label.Victim and _VICTIM_BARE_RE.fullmatch(slice_txt.strip()):
+            if any(s >= a_s and e <= a_e for (a_s, a_e) in action_spans):
+                if dbg:
+                    print(
+                        f"[s1_verifier_impl] #{i} drop: embedded bare-noun Victim inside Action"
+                    )
+                continue
 
-        key = (label, s, e)
-        if key in seen:
+        # de-dup identical offsets
+        k2 = (label, s, e)
+        if k2 in seen:
             if dbg:
                 print(f"[s1_verifier_impl] #{i} drop: duplicate")
             continue
-        seen.add(key)
+        seen.add(k2)
 
         cleaned.append(S1Span(label=label, text=slice_txt, start=s, end=e))
         if dbg:
-            src = "locate_by_text" if (hint is None or (s, e) != hint) else "provided"
             print(
-                f"[s1_verifier_impl] #{i} kept [{src}] {label} ({s},{e})='{slice_txt[:80]}'"
+                f"[s1_verifier_impl] #{i} kept [locate_by_text] {label} ({s},{e})='{slice_txt[:80]}'"
             )
+
+        # NEW: remember kept Actions for subsequent Victim checks
+        if label == S1Label.Action:
+            action_spans.append((s, e))
+
+    # --- NEW (optional, order-robust): prune embedded bare-noun Victims after we know all Actions ---
+    if any(sp.label == S1Label.Action for sp in cleaned):
+        actions = [(sp.start, sp.end) for sp in cleaned if sp.label == S1Label.Action]
+        pruned = []
+        for sp in cleaned:
+            if sp.label == S1Label.Victim and _VICTIM_BARE_RE.fullmatch(
+                sp.text.strip()
+            ):
+                if any(sp.start >= a_s and sp.end <= a_e for (a_s, a_e) in actions):
+                    if dbg:
+                        print(
+                            f"[s1_verifier_impl] prune: embedded bare-noun Victim '{sp.text}'"
+                        )
+                    continue
+            pruned.append(sp)
+        cleaned = pruned
+    # --- END NEW ---
 
     if dbg:
         print(f"[s1_verifier_impl] Final kept spans: {len(cleaned)}")
@@ -637,104 +478,103 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
                 f"[s1_verifier_impl]   #{j} {sp.label} ({sp.start},{sp.end})='{sp.text[:120]}'"
             )
 
-    # No forced ModelRetry here; return what we have (possibly empty)
     return S1Output(spans=cleaned)
 
 
-@agent_s1.output_validator
-async def s1_verifier(ctx: RunContext[S1Deps], output: S1Output) -> S1Output:
-    dbg = True
-    RAW = (getattr(ctx.deps, "raw_text", None) or "").strip()
-    if not RAW:
-        # fail fast instead of stitching from history (prevents cross-doc leakage)
-        raise ModelRetry(
-            "Internal: deps.raw_text missing; re-run with raw_text in S1Deps."
-        )
-
-    spans_in = output.spans or []
-    if dbg:
-        pv = RAW[:120].replace("\n", " ")
-        print(f"[s1_verifier] Received {len(spans_in)} candidate spans")
-        print(f"[loc] len(raw)={len(RAW)} preview='{pv}…'")
-
-    seen, cleaned = set(), []
-    had_non_evidence = any(m.label != S1Label.Evidence for m in spans_in)
-
-    for i, m in enumerate(spans_in):
-        snippet = (m.text or "").strip()
-        if not snippet:
-            if dbg:
-                print(f"[s1_verifier] #{i} drop: empty text")
-            continue
-
-        # Prefer provided offsets if valid, else locate-by-text (robust finder below)
-        if (
-            m.start is not None
-            and m.end is not None
-            and 0 <= m.start < m.end <= len(RAW)
-        ):
-            s, e = m.start, m.end
-            strategy = "provided_offsets"
-        else:
-            hit = _find_best_span(RAW, snippet)  # normalized locate; maps back to RAW
-            if not hit:
-                if dbg:
-                    print(f"[s1_verifier] #{i} drop: unable to locate in RAW")
-                continue
-            s, e = hit
-            strategy = "locate_by_text"
-        if dbg:
-            print(f"[s1_verifier] #{i} -> {strategy} ({s},{e})")
-
-        # gentle tighten: don’t cut mid-token; only snap if still exact-match compatible
-        s, e = _tighten_to_word(RAW, s, e, want=snippet)
-
-        slice_txt = RAW[s:e]
-
-        # HARD equality safety net (normalized)
-        if not _norm_equal(slice_txt, snippet):
-            if dbg:
-                print(f"[s1_verifier] #{i} drop: hard equality failed")
-            continue
-
-        if m.label == S1Label.Evidence and not _evidence_gate_ok(slice_txt):
-            if dbg:
-                print(f"[s1_verifier] #{i} drop: evidence gate")
-            continue
-
-        key = (m.label, s, e)
-        if key in seen:
-            if dbg:
-                print(f"[s1_verifier] #{i} drop: duplicate")
-            continue
-        seen.add(key)
-
-        cleaned.append(S1Span(label=m.label, start=s, end=e, text=slice_txt))
-        if dbg:
-            print(
-                f"[s1_verifier] #{i} kept [{strategy}] {m.label} ({s},{e})='{slice_txt[:80]}'"
-            )
-
-    # Retry only if the model attempted useful (non-Evidence) spans but none survived
-    if spans_in and not cleaned and had_non_evidence:
-        if dbg:
-            print("[s1_verifier] retry: proposed non-Evidence but none valid")
-        raise ModelRetry(
-            "Re-extract non-Evidence spans as verbatim substrings from RAW."
-        )
-
-    # Optional “strong cue” nudge: FAR less aggressive (off by default)
-    # if not cleaned and _likely_contains_markers(RAW):
-    #    raise ModelRetry("Markers likely present; extract verbatim spans; offsets optional.")
-
-    if dbg:
-        print(f"[s1_verifier] Final kept spans: {len(cleaned)}")
-        for j, sp in enumerate(cleaned):
-            print(
-                f"[s1_verifier]   #{j} {sp.label} ({sp.start},{sp.end})='{sp.text[:120]}'"
-            )
-
-    return S1Output(spans=cleaned)
+# @agent_s1.output_validator
+# async def s1_verifier(ctx: RunContext[S1Deps], output: S1Output) -> S1Output:
+#    dbg = True
+#    RAW = (getattr(ctx.deps, "raw_text", None) or "").strip()
+#    if not RAW:
+#        # fail fast instead of stitching from history (prevents cross-doc leakage)
+#        raise ModelRetry(
+#            "Internal: deps.raw_text missing; re-run with raw_text in S1Deps."
+#        )
+#
+#    spans_in = output.spans or []
+#    if dbg:
+#        pv = RAW[:120].replace("\n", " ")
+#        print(f"[s1_verifier] Received {len(spans_in)} candidate spans")
+#        print(f"[loc] len(raw)={len(RAW)} preview='{pv}…'")
+#
+#    seen, cleaned = set(), []
+#    had_non_evidence = any(m.label != S1Label.Evidence for m in spans_in)
+#
+#    for i, m in enumerate(spans_in):
+#        snippet = (m.text or "").strip()
+#        if not snippet:
+#            if dbg:
+#                print(f"[s1_verifier] #{i} drop: empty text")
+#            continue
+#
+#        # Prefer provided offsets if valid, else locate-by-text (robust finder below)
+#        if (
+#            m.start is not None
+#            and m.end is not None
+#            and 0 <= m.start < m.end <= len(RAW)
+#        ):
+#            s, e = m.start, m.end
+#            strategy = "provided_offsets"
+#        else:
+#            hit = _find_best_span(RAW, snippet)  # normalized locate; maps back to RAW
+#            if not hit:
+#                if dbg:
+#                    print(f"[s1_verifier] #{i} drop: unable to locate in RAW")
+#                continue
+#            s, e = hit
+#            strategy = "locate_by_text"
+#        if dbg:
+#            print(f"[s1_verifier] #{i} -> {strategy} ({s},{e})")
+#
+#        # gentle tighten: don’t cut mid-token; only snap if still exact-match compatible
+#        s, e = _tighten_to_word(RAW, s, e, want=snippet)
+#
+#        slice_txt = RAW[s:e]
+#
+#        # HARD equality safety net (normalized)
+#        if not _norm_equal(slice_txt, snippet):
+#            if dbg:
+#                print(f"[s1_verifier] #{i} drop: hard equality failed")
+#            continue
+#
+#        if m.label == S1Label.Evidence and not _evidence_gate_ok(slice_txt):
+#            if dbg:
+#                print(f"[s1_verifier] #{i} drop: evidence gate")
+#            continue
+#
+#        key = (m.label, s, e)
+#        if key in seen:
+#            if dbg:
+#                print(f"[s1_verifier] #{i} drop: duplicate")
+#            continue
+#        seen.add(key)
+#
+#        cleaned.append(S1Span(label=m.label, start=s, end=e, text=slice_txt))
+#        if dbg:
+#            print(
+#                f"[s1_verifier] #{i} kept [{strategy}] {m.label} ({s},{e})='{slice_txt[:80]}'"
+#            )
+#
+#    # Retry only if the model attempted useful (non-Evidence) spans but none survived
+#    if spans_in and not cleaned and had_non_evidence:
+#        if dbg:
+#            print("[s1_verifier] retry: proposed non-Evidence but none valid")
+#        raise ModelRetry(
+#            "Re-extract non-Evidence spans as verbatim substrings from RAW."
+#        )
+#
+#    # Optional “strong cue” nudge: FAR less aggressive (off by default)
+#    # if not cleaned and _likely_contains_markers(RAW):
+#    #    raise ModelRetry("Markers likely present; extract verbatim spans; offsets optional.")
+#
+#    if dbg:
+#        print(f"[s1_verifier] Final kept spans: {len(cleaned)}")
+#        for j, sp in enumerate(cleaned):
+#            print(
+#                f"[s1_verifier]   #{j} {sp.label} ({sp.start},{sp.end})='{sp.text[:120]}'"
+#            )
+#
+#    return S1Output(spans=cleaned)
 
 
 # Convenience: build and run S1 using the same prompt text as your old runner.
@@ -746,8 +586,6 @@ def make_s1_prompts(
     fewshots: list,
     include_cot: bool = True,
     want: int = 8,
-    victim_min: int = 1,
-    conflict_min: int = 1,
     per_example_span_cap: int = 4,
 ) -> Tuple[str, str]:
     """(system,user) exactly as prompt_builder adapters do. :contentReference[oaicite:3]{index=3}"""
@@ -770,6 +608,7 @@ async def run_s1(
     conflicts: list,
     fewshots: list,
     include_cot: bool = True,
+    temperature: float = 0.0,
 ) -> S1Output:
     sys_p, usr_p = make_s1_prompts(
         text=text,
@@ -780,7 +619,7 @@ async def run_s1(
     )
 
     # NEW: build a fresh agent; no clone()
-    agent = create_s1_agent(sys_p)
+    agent = create_s1_agent(sys_p, temperature=temperature)
 
     # Always pass deps so the verifier never falls back to stitched messages
     deps = S1Deps(raw_text=text, doc_id=doc_id)
@@ -804,16 +643,14 @@ class S2Deps(BaseModel):
 
 class S2Output(BaseModel):
     label: str = Field(..., description='One of: "conspiracy", "non""')
-    rationale: str = Field(
-        ..., description="1-2 concise sentences naming decisive cues."
-    )
+    rationale: str = Field(..., description="2 concise sentences naming decisive cues.")
 
     @field_validator("label")
     @classmethod
     def _label_ok(cls, v: str) -> str:
         v2 = (v or "").strip().lower()
         if v2 not in {"conspiracy", "non"}:
-            raise ValueError("label must be conspiracy | non")
+            raise ValueError("label must be conspiracy or non")
         return v2
 
 
@@ -829,19 +666,18 @@ def make_s2_prompts(
     allow_cant_tell: bool = False,
 ) -> Tuple[str, str]:
     """(system,user) identical to your adapter. :contentReference[oaicite:4]{index=4}"""
-    sys_p = build_s2_system(include_cot=include_cot, allow_cant_tell=allow_cant_tell)
+    sys_p = build_s2_system(include_cot=include_cot)
     usr_p = build_s2_user(
         text_input=text,
         s1_output=s1_spans,
         s2_fewshots=fewshots or [],
         include_cot=include_cot,
-        allow_cant_tell=allow_cant_tell,
     )
     return sys_p, usr_p
 
 
 def create_s2_agent(
-    system_prompt: str, temperature: int = 0.0
+    system_prompt: str, temperature: float = 0.0
 ) -> Agent[S2Deps, S2Output]:
     agent = Agent(
         LLM,
@@ -865,6 +701,7 @@ async def run_s2(
     fewshots: Optional[List[dict]] = None,
     include_cot: bool = True,
     allow_cant_tell: bool = False,
+    temperature: float = 0.0,
 ) -> S2Output:
     # Ensure S1 spans are in S2 schema (startIndex/endIndex/text)
     s1_norm = [
@@ -878,7 +715,7 @@ async def run_s2(
         allow_cant_tell=allow_cant_tell,
     )
     # Fresh agent per document (no .clone() needed)
-    agent = create_s2_agent(sys_p)
+    agent = create_s2_agent(sys_p, temperature=temperature)
 
     # Provide deps so the validator has authoritative inputs
     deps = S2Deps(raw_text=text, s1_markers=s1_norm, doc_id=doc_id)

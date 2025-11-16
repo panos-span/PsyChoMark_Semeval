@@ -4,7 +4,7 @@ import json
 import re
 import html
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import List, Dict
 from pathlib import Path as _Path
 
 
@@ -38,40 +38,11 @@ def load_fewshot_bank(path: str | _Path) -> dict:
 def playbook_block() -> str:
     return """
 <psycomark_playbook version="1.0">
-  <narrative_roles>
-    <malevolent_actor features="vague ‘they’; abstract collectives (‘elite’, ‘globalists’, ‘deep state’); hyper-competence/secret coordination"
-                      function="Constructs omnipresent enemy; vilifies out-group"
-                      cues="they; the elite; globalists; deep state; big pharma"/>
-    <victim_us       features="inclusive ‘we/us’; competitive victimhood; moral-emotional framing"
-                      function="Fosters in-group solidarity; moral high ground"
-                      cues="we the people; our way of life; we suffer"/>
-    <savior_campaigner features="authoritative ‘I’; privileged knowledge claims"
-                      function="Legitimizes authority; promises rescue"
-                      cues="I alone can fix; I know the truth"/>
-  </narrative_roles>
-
-  <causality_intent>
-    <action_language features="verbs of secrecy/control/hostility; linear intentional causation"
-                     function="Eliminates randomness; centers intentional harm"
-                     cues="plot; scheme; infiltrate; engineer; manipulate; cover up; weaponize"/>
-    <effect_language features="extreme stakes; high negative affect"
-                     function="Maximizes threat/urgency; fuels engagement"
-                     cues="total control; tyranny; enslavement; destruction; depopulation"/>
-  </causality_intent>
-
-  <epistemic_stance>
-    <rhetoric_of_evidence features="reframe counter-evidence as cover-up/disinformation; cui bono; loaded language; thought-terminating clichés"
-                          function="Self-sealing logic; hermeneutics of suspicion"
-                          cues="who benefits; follow the money; do your own research; connect the dots"/>
-    <certainty_doubt_paradox features="absolute certainty for claim + radical skepticism of institutions; ‘faith in intuition’"
-                             function="Epistemic closure and in-group privilege"
-                             cues="truth is obvious; facts are clear; media is lying; don’t trust experts"/>
-  </epistemic_stance>
-
-  <shortcuts_and_pitfalls>
-    <ts_001>Avoid keyword-only flags; context decides endorsing vs reporting/debunking.</ts_001>
-    <ts_002>Self-sealing must include the reframing move (counter-evidence leads to ‘cover-up’).</ts_002>
-  </shortcuts_and_pitfalls>
+  <cues_actor>vague/collective agents alleging secret coordination: "they", "the elite", "globalists", "deep state", "big pharma".</cues_actor>
+  <cues_action>intentional control/hostility/cover-up verbs: plot, scheme, infiltrate, engineer, manipulate, cover up, weaponize.</cues_action>
+  <cues_effect>extreme stakes or grand outcomes: total control, enslavement, depopulation, tyranny.</cues_effect>
+  <cues_epistemics>self-sealing logic: counter-evidence framed as disinformation; "do your own research"; "connect the dots".</cues_epistemics>
+  <pitfalls>Do not rely on keywords alone; distinguish reporting/debunking from endorsement.</pitfalls>
 </psycomark_playbook>
 """.strip()
 
@@ -93,7 +64,36 @@ def psycho_theory_preamble() -> str:
 """.strip()
 
 
-# TODO: Check the span extraction method if it is valid or if we should ask the LLM to handle it
+def data_profile_block() -> str:
+    return """
+<data_profile>
+  - Domain: Reddit submission statements (first-level comments that summarize a linked post).
+  - Length: typically 160-1000 characters after preprocessing.
+  - Preprocessing: markdown flattened; URLs replaced with [URL]; leading/trailing whitespace stripped; surrounding quote blocks removed.
+  - Markers are defined over this preprocessed text; any indices/spans assume URLs -> [URL].
+  - Content is topic-agnostic: politics, news, science, entertainment, etc.
+</data_profile>
+""".strip()
+
+
+def s2_markers_guidance_block() -> str:
+    return """
+<using_s1_markers>
+  - If <extracted_markers> are provided, treat them as noisy *hints* about Actor, Action, Effect, Victim, and Evidence.
+  - They can be incomplete or partially wrong. NEVER decide solely from markers.
+  - ALWAYS base the final label on:
+      (a) the full RAW text, and
+      (b) the authorial stance: endorsing vs. criticizing conspiratorial claims.
+  - Use markers in your *reasoning and rationale*:
+      - For "conspiracy": you may briefly note how Actor/Action/Effect markers support a coordinated, intentional mechanism.
+      - For "non": you may note that markers pick up roles or claims, but the text distances itself (e.g., reports, debunks, or questions them).
+  - In rationales:
+      - Optionally mention markers when they make the reasoning clearer (e.g., "Markers highlight a vague Actor and a grand Effect, matching conspiratorial framing").
+      - Keep rationales short and focused on stance + mechanism, not on listing every marker.
+</using_s1_markers>
+""".strip()
+
+
 # --------- S1 builders ----------
 def build_s1_system(
     priors: dict | None = None,
@@ -111,30 +111,63 @@ def build_s1_system(
         conflicts or [], ensure_ascii=False, separators=(",", ":")
     )
 
-    header = psycho_theory_preamble() + "\n" + playbook_block()
+    header = (
+        psycho_theory_preamble() + "\n" + playbook_block() + "\n" + data_profile_block()
+    )
 
     rules = f"""
 <rules>
   <evidence_gate>
     Evidence ONLY if at least ONE holds:
-      (a) Contains a URL/domain,
-      (b) Quoted material WITH attribution verb AND named source,
-      (c) Numeric facts WITH units AND named source.
+      (E1) Contains a URL or bare domain/host (e.g., http(s)://…, example.com, @handle).
+      (E2) Quoted material WITH attribution verb AND named source.
+      (E3) Numeric fact WITH unit/rates AND named source.
+      (E4) Named-source attribution clause without a URL/quote (e.g., "the SEC said", "CNN reported", "Reuters: …") — span must include the named source + reporting verb.
+      (E5) Inline citation markers that name a specific outlet or document (e.g., “[SEC 2021]”, “(WHO, 2020)”) — keep the entire marker as the Evidence span.
+
+    Forbidden as Evidence:
+      - Bare numbers without units/source.
+      - Generic attributions without a named source (e.g., "reports say", "it is said").
+      - Organization names alone without an attribution or factual content.
+
+    When selecting Evidence, prefer the smallest span that still includes the qualifying feature(s).
   </evidence_gate>
 
   <span_rules>
     - Keep spans token-tight; include particles only if integral (e.g., "set up", "cover up").
     - Prefer minimal spans that still fully express the role.
+
+    <actor_scope>
+      - An Actor MUST be the agent of a conspiratorial Action.
+      - CUE: vague pronouns or abstract collectives ("they", "the elite", "globalists", "big pharma").
+      - ALLOW: specific people/orgs (e.g., "the CDC", "Bill Gates") as Actors ONLY when they are subjects of intentional conspiratorial Actions.
+      - REJECT: neutral mentions of people/orgs in purely descriptive or reporting contexts.
+    </actor_scope>
+
+    <victim_scope>
+      - A Victim MUST be the entity harmed/targeted by an Action.
+      - Reject substrings that are just part of an Action noun (e.g., "child" from "child trafficking").
+      - Allow Victim inside an Action only if it's a clear NP object (e.g., "our children", "13-year-olds").
+      - CUE: first-person plural and in-group collectives ("we", "us", "our", "the people", "our children", "patriots").
+      - CHECK: Prefer spans functioning as the object/indirect object of an Action.
+    </victim_scope>
+
+    <action_scope>
+      - Action MUST denote intentional agency linked to secrecy/control/hostility/harm.
+      - Reject neutral/descriptive reporting verbs ("announced", "reported", "said", "posted", "went") UNLESS they are part of an alleged scheme/cover-up/intentional harm.
+      - If a clause contains both an intentional verb and a reporting verb, choose the intentional act as Action and relegate attribution to Evidence (per the gate).
+    </action_scope>
   </span_rules>
 
   <action_effect_split>
     - Action = what is done (verb phrase).
     - Effect = consequence/purpose/result (often NP or "to …"/"so that …").
-    - Do not merge Action and Effect.
+    - CUE: Effects are frequently purpose clauses ("to …", "in order to …", "so that …") OR catastrophic/high-stakes noun phrases functioning as the object of an Action ("total control", "enslavement", "the great reset").
+    - Do not merge Action and Effect; split off purpose/result clauses as Effect.
   </action_effect_split>
 
   <overlap_policy>
-    - Forbid Actor ↔ Victim overlaps; if uncertain, prefer Actor unless Victim clearly superior.
+    - Forbid Actor <-> Victim overlaps; if uncertain, prefer Actor unless Victim clearly superior.
     - Allow short Victim NP inside Action; keep both if well-formed.
     - Evidence may overlap others only if part of a quote/citation per <evidence_gate>.
     - Ambiguous pairs hint: {conflict_pairs_str}
@@ -143,6 +176,12 @@ def build_s1_system(
   <statistical_priors>
     {priors_str}
   </statistical_priors>
+  
+  <marker_noise_guidance>
+   - Human marker annotations can be noisy: short or ambiguous spans exist.
+   - In few-shots, trust the label but focus on prototypical uses (clear agents, actions, effects, and explicit evidence).
+  </marker_noise_guidance>
+
 
   <notes>
     - Choose exact substrings first; offsets will be auto-filled from your text.
@@ -158,18 +197,18 @@ def build_s1_system(
 <workflow>
   1) Scan roles: Actor, Action, Effect, Victim; then explicitly scan for Evidence.
   2) Apply <evidence_gate>.
-  3) Enforce Action<->Effect split.
+  3) Enforce <action_effect_split>.
   4) Tighten boundaries; keep particles only if integral.
   5) Apply <overlap_policy>.
 </workflow>""".strip()
 
     output_contract = """
-    <verbatim_rule>
-        Every span's "text" MUST be a verbatim substring of <text_to_analyze>.
-        DO NOT paraphrase, summarize, or invent. Copy exact characters from RAW.
-    </verbatim_rule>
-    <output_contract>Provide verbatim text</output_contract>
-    """.strip()
+<verbatim_rule>
+  Every span's "text" MUST be a verbatim substring of <text_to_analyze>.
+  DO NOT paraphrase, summarize, or invent. Copy exact characters from RAW.
+</verbatim_rule>
+<output_contract>Provide verbatim text</output_contract>
+""".strip()
 
     return (
         header
@@ -229,29 +268,49 @@ def _has_ae_conflict(spans: List[dict]) -> bool:
 
 def _norm_span(m: Dict[str, Any]) -> Dict[str, Any] | None:
     """
-    Normalize incoming span to: {"label","text","start?","end?"}
-      accepts evaluator-style: {"type","startIndex","endIndex","text"?}
-      accepts old: {"label","start","end","text"?}
+    Normalize incoming span.
+
+    Minimal required keys:
+      - "label" (or "type")
+      - "text" (if present)
+
+    Optional keys we *preserve* when available:
+      - "start", "end" (or "startIndex", "endIndex")  [currently unused but allowed]
+      - "why"        (LLM explanation from make_prompt_artifacts)
+      - "context"    (local context window around the span)
     """
     if not isinstance(m, dict):
         return None
+
     label = m.get("label") or m.get("type")
     if not label or str(label) not in _LABELS:
         return None
+
+    out: Dict[str, Any] = {"label": str(label)}
+
+    # core text
     text = m.get("text")
-    start = m.get("start", m.get("startIndex"))
-    end = m.get("end", m.get("endIndex"))
-    out = {"label": str(label)}
     if text is not None:
         out["text"] = str(text)
+
+    # optional offsets (kept if present, but we don't rely on them for matching)
+    start = m.get("start", m.get("startIndex"))
+    end = m.get("end", m.get("endIndex"))
     if start is not None and end is not None:
         try:
             out["start"] = int(start)
             out["end"] = int(end)
         except Exception:
-            # ignore bad indices; validator will locate by text
+            # if bad, just drop them; text is enough for span identity
             out.pop("start", None)
             out.pop("end", None)
+
+    # preserve explanation/context if present (from make_prompt_artifacts)
+    if "why" in m and m["why"] is not None:
+        out["why"] = str(m["why"])
+    if "context" in m and m["context"] is not None:
+        out["context"] = str(m["context"])
+
     return out
 
 
@@ -260,12 +319,12 @@ def build_s1_user(
     text_input: str,
     s1_fewshots: list | None,
     include_cot: bool = True,
-    want: int = 8,  # total few-shots to keep
-    victim_min: int = 1,  # ensure at least one Victim example
-    conflict_min: int = 1,  # ensure at least one Action–Effect example
-    neg_cap: int = 2,  # cap negatives to avoid “all-[]” priming
-    per_example_span_cap: int = 4,  # reduce noisy gold to concise spans
-    max_text_chars: int = 1200,  # clip long few-shot texts
+    want: int = 8,
+    victim_min: int = 1,
+    conflict_min: int = 1,
+    neg_cap: int = 2,
+    per_example_span_cap: int = 4,
+    max_text_chars: int = 1200,
 ) -> str:
     """
     Robust few-shot packer (pydantic-AI ready):
@@ -275,8 +334,8 @@ def build_s1_user(
     - Guarantees at least one Victim example and one Action–Effect example when available.
     - Emits <few_shots>…</few_shots> with JSON spans in current schema.
     """
-    rendered_blocks: List[str] = []
-    raw_structured: List[dict] = []
+    rendered_blocks: list[str] = []
+    raw_structured: list[dict] = []
 
     # --- Normalize incoming few-shots ---
     for ex in s1_fewshots or []:
@@ -315,7 +374,7 @@ def build_s1_user(
     negatives = [e for e in pos_prepped if not e["spans"]]
 
     # Greedy label coverage first
-    kept: List[dict] = []
+    kept: list[dict] = []
     have_labels = set()
     for e in positives:
         labs = {m["label"] for m in e["spans"]}
@@ -339,8 +398,12 @@ def build_s1_user(
         room = min(neg_cap, want - len(kept))
         kept.extend(negatives[:room])
 
-    # Guarantees: at least one Victim and one Action–Effect example (if available)
-    def ensure_victim(items: List[dict]) -> List[dict]:
+    # Guarantees
+    def _has_ae_conflict(spans: list[dict]) -> bool:
+        labs = {m.get("label") for m in spans or []}
+        return "Action" in labs and "Effect" in labs
+
+    def ensure_victim(items: list[dict]) -> list[dict]:
         if any(
             any(m["label"] == "Victim" for m in it.get("spans", [])) for it in items
         ):
@@ -350,7 +413,7 @@ def build_s1_user(
                 return ([e] + items)[:want]
         return items
 
-    def ensure_ae(items: List[dict]) -> List[dict]:
+    def ensure_ae(items: list[dict]) -> list[dict]:
         if any(_has_ae_conflict(it.get("spans", [])) for it in items):
             return items
         for e in positives:
@@ -360,7 +423,6 @@ def build_s1_user(
 
     kept = ensure_victim(kept) if victim_min > 0 else kept
     kept = ensure_ae(kept) if conflict_min > 0 else kept
-
     kept = kept[:want]
 
     # --- Render <few_shots> blocks in the CURRENT schema ---
@@ -369,7 +431,7 @@ def build_s1_user(
         txt = ex.get("text", "")
         block = (
             "<example>\n"
-            "<text>\n" + html.escape(txt) + "\n</text>\n"
+            "<text>" + txt + "</text>\n"
             "<spans>\n"
             + json.dumps(spans, ensure_ascii=False, separators=(",", ":"))
             + "\n</spans>\n"
@@ -384,7 +446,15 @@ def build_s1_user(
     )
 
     cot_hint = (
-        "<thinking>Please follow <workflow> precisely before finalizing.</thinking>"
+        """
+<thinking>
+    - Check roles in order: Actor → Action → Effect → Victim → Evidence.
+    - Apply evidence_gate; reject bare names/places/dates as Evidence.
+    - If Action looks like a neutral report (“reported/announced/went up”), reject unless it implies secrecy/control/harm.
+    - Tighten to token boundaries only if the exact substring remains valid.
+    (Keep this section under 3 bullets, <=40 tokens total. Do NOT copy text from RAW here.)
+</thinking>
+        """.strip()
         if include_cot
         else ""
     )
@@ -431,38 +501,99 @@ def build_s2_prompts_adapter(
 def build_s2_system(
     *,
     include_cot: bool = True,
-    allow_cant_tell: bool = False,
 ) -> str:
     """
-    Pydantic-AI mode:
-      - No JSON/format schema; just label policy and rationale guidance.
+    Pydantic-AI mode for S2 (document-level classification):
+      - No JSON schema here; output type is enforced by the agent.
+      - Single inclusion of theory + playbook (re-uses S1 helpers).
+      - Strong boundary rules to reduce false positives.
+      - Explicit guidance on using S1 markers as *evidence*, not as the label itself.
     """
     labels = ["conspiracy", "non"]
-    if allow_cant_tell:
-        labels.append("cant_tell")
+
+    header = (
+        psycho_theory_preamble() + "\n" + playbook_block() + "\n" + data_profile_block()
+    )
 
     policy = f"""
 <classification_policy>
-  - Choose one label from: {", ".join(labels)}.
-  - Base the decision on conspiracist cues vs. ordinary discourse.
-  - Rationale: 1-2 concise sentences naming decisive cues (no summaries).
-</classification_policy>""".strip()
+  <labels>Choose exactly one: {", ".join(labels)}.</labels>
+
+  <positive_cues_for_conspiracy>
+    - Coordinated, secretive, or omnipotent Actor(s) alleged to direct events (e.g., "deep state", "globalists", "big pharma", named cabals).
+    - Intentional Action of control/cover-up/engineering/weaponization; not mere reporting.
+    - Effects framed as extreme stakes or grand plans (enslavement, depopulation, total control).
+    - Self-sealing epistemics: counter-evidence rebranded as disinformation/cover-up; "do your own research"/"connect the dots".
+    - Narrative glue: multi-event linkage into a single hidden plot (e.g., tying unrelated crises to one cabal).
+  </positive_cues_for_conspiracy>
+
+  <negative_cues_non>
+    - Straight reporting, quotations, or debate without endorsing conspiratorial mechanism.
+    - Ordinary skepticism, policy critique, or corruption claims limited to documented facts without secret coordination claims.
+    - Mere name-dropping of entities or URLs without conspiratorial frame.
+    - Satire/irony where conspiracist content is lampooned or explicitly rejected.
+  </negative_cues_non>
+
+  <ambiguous_and_edge_cases>
+    - Questions-as-accusations ("Is X running Y?") count *only if* the text supplies hidden coordination/intent as the explanation; otherwise treat as non.
+    - Lists of allegations with sources: label depends on whether a hidden coordination mechanism is asserted/assumed.
+    - Reporting-on-conspiracy: if the authorial voice is clearly descriptive/critical, prefer "non".
+    - If evidence is fragmentary and the mechanism is implied but not stated, and you cannot infer intent/coordination from context: treat as "non" (gold labels are noisy—be conservative).
+  </ambiguous_and_edge_cases>
+
+  <using_s1_markers>
+    - S1 spans (Actor/Action/Effect/Victim/Evidence) are noisy clues, not labels.
+    - Always decide the final label from the full document and the authorial stance,
+      even when S1 markers are present.
+    - A doc is "conspiracy" when S1 spans jointly instantiate a conspiratorial *mechanism*:
+        Actor (cabal/agent) + Action (intentional secrecy/control/hostility) -> Effect (grand outcome),
+      optionally supported by Evidence spans.
+    - Isolated Victim/Evidence spans without a coordinated Action+Actor do not suffice.
+  </using_s1_markers>
+
+
+  <tie_breakers>
+    - If cues conflict: require both intentional Action and coordinated Actor for "conspiracy".
+    - If only one is present or stance is unclear: choose "non".
+  </tie_breakers>
+  
+  <annotation_uncertainty>
+   - Gold labels come from multiple crowd annotators (Krippendorff's alpha around 0.58).
+   - Treat borderline cases conservatively: avoid over-interpreting vague language as conspiratorial.
+   - A single suggestive phrase does not suffice: look for a coherent mechanism and stance.
+  </annotation_uncertainty>
+
+  <rationale_guidance>
+    - Provide 1-2 short sentences naming decisive cues (e.g., "alleges secret coordination by X; frames Y as intentional cover-up").
+    - Do not summarize the whole document; cite the cues, not long quotes.
+  </rationale_guidance>
+</classification_policy>
+""".strip()
 
     cot = (
         """
 <workflow>
-  1) Identify conspiracist narrative cues (coordination/omnipotent actors, secret plots, us-vs-them).
-  2) Contrast with ordinary skepticism or factual critique.
-  3) Decide label; compose a brief rationale naming decisive cues.
+  1) Scan for S1-style roles in the doc (Actor, Action, Effect, Victim, Evidence).
+  2) Check if Actor+Action imply hidden coordination/intentionality -> if yes, identify Effect scale.
+  3) Apply boundary rules (reporting vs endorsing; satire; ordinary critique).
+  4) Decide label using <tie_breakers>.
+  5) Write a compact rationale naming the decisive cues (no summaries).
 </workflow>
 """.strip()
         if include_cot
         else ""
     )
 
-    header = psycho_theory_preamble() + "\n" + playbook_block()  # included once here
+    output_contract = """
+<output_contract>
+  - Output the single label only (the agent's output validator handles schema).
+  - Keep rationale concise and focused on cues (when rationale is requested downstream).
+</output_contract>
+""".strip()
 
-    return (header + "\n" + policy + ("\n" + cot if cot else "")).strip()
+    return (
+        header + "\n" + policy + ("\n" + cot if cot else "") + "\n" + output_contract
+    ).strip()
 
 
 def build_s2_user(
@@ -471,7 +602,6 @@ def build_s2_user(
     s1_output: List[dict] | None,
     s2_fewshots: List[dict] | None = None,
     include_cot: bool = False,
-    allow_cant_tell: bool = False,
 ) -> str:
     """
     Pydantic-AI mode:
@@ -483,25 +613,49 @@ def build_s2_user(
     examples_xml = ""
     if s2_fewshots:
         ex_parts = []
-        valid = {"conspiracy", "non"} if allow_cant_tell else {"conspiracy", "non"}
+        valid = {"conspiracy", "non"}
         for ex in s2_fewshots:
             lab = str(ex.get("label", "")).lower()
             if lab not in valid:
                 continue
+
             rationale = ex.get("rationale", "")
             etext = ex.get("text", "")
+
+            # NEW: optional markers per S2 few-shot (aligned S1 spans)
+            markers = ex.get("markers") or []
+            markers_block = ""
+            if markers:
+                try:
+                    markers_json = json.dumps(
+                        markers, ensure_ascii=False, separators=(",", ":")
+                    )
+                    markers_block = f"<markers>{markers_json}</markers>"
+                except Exception:
+                    # If something is off with markers serialization, just skip them
+                    markers_block = ""
+
             ex_parts.append(
                 "<example>"
                 f"<label>{lab}</label>"
                 f"<rationale>{rationale}</rationale>"
                 f"<text>{etext}</text>"
+                f"{markers_block}"
                 "</example>"
             )
+
         if ex_parts:
             examples_xml = "<few_shots>\n" + "\n".join(ex_parts) + "\n</few_shots>"
 
     cot_hint = (
-        "<thinking>Follow <workflow> first; then decide one label and a brief rationale.</thinking>"
+        """
+<thinking>
+    - Do S1-style scan; is there Actor+Action implying hidden coordination? Identify Effect scale.
+    - If only one of Actor/Action is present or stance is reporting/satire -> prefer non.
+    - State 1 cue that decides the label.
+    (Max 2 sentences; do NOT quote the document.)
+</thinking>
+        """.strip()
         if include_cot
         else ""
     )
@@ -574,101 +728,6 @@ def extract_answer_json(x):
             return []
 
     return js
-
-
-def _safe_clip(s: str, a: int, b: int):
-    a = max(0, int(a))
-    b = min(len(s), int(b))
-    return a, max(a, b)
-
-
-def _window_bounds(a: int, b: int, L: int, win: int):
-    lo = max(0, min(a, b) - win)
-    hi = min(L, max(a, b) + win)
-    return lo, hi
-
-
-def _try_local_snap(text: str, start: int, end: int, echo: str, win: int = 16):
-    """
-    If echo doesn't match text[start:end], search a small window around (start,end)
-    for an exact echo, else return original (start,end).
-    """
-    if not echo:
-        return start, end
-    L = len(text)
-    lo, hi = _window_bounds(start, end, L, win)
-    window = text[lo:hi]
-    i = window.find(echo)
-    if i >= 0:
-        s = lo + i
-        return s, s + len(echo)
-    return start, end
-
-
-def validate_and_repair_s1_spans(
-    items: list[dict], text: str, *, win: int = 16, use_tokens: bool = True
-):
-    """
-    Hybrid repair:
-      1) Require ints for start/end and clip to bounds.
-      2) If optional "text" present and mismatches, try a local re-align within ±win chars.
-      3) Optionally snap to token boundaries (only *after* local re-align).
-      4) Drop spans < 3 chars after trimming whitespace.
-    Returns canonical [{"label","start","end"}].
-    """
-    out = []
-    L = len(text)
-
-    # Optional token helpers
-    try:
-        from starter.prompt_sweep_joint import _tokenize_eval, _snap_to_tokens
-    except Exception:
-        _tokenize_eval = _snap_to_tokens = None
-        use_tokens = False
-
-    for m in items or []:
-        lab = (m.get("label") or m.get("type") or "").strip()
-        if lab not in ("Actor", "Action", "Effect", "Victim", "Evidence"):
-            continue
-
-        # ints + clip
-        try:
-            s = int(m.get("start"))
-            e = int(m.get("end"))
-        except Exception:
-            continue
-        s, e = _safe_clip(text, s, e)
-        if e <= s:
-            continue
-
-        echo = m.get("text")
-        # quick mismatch check
-        if isinstance(echo, str):
-            cur = text[s:e]
-            if cur != echo:
-                # attempt small-window relocate
-                s2, e2 = _try_local_snap(text, s, e, echo, win=win)
-                s2, e2 = _safe_clip(text, s2, e2)
-                if e2 > s2:
-                    s, e = s2, e2  # only adopt if found
-
-        # Optional token snapping (lightweight & local)
-        if use_tokens and _tokenize_eval and _snap_to_tokens:
-            toks = _tokenize_eval(text)
-            snapped = _snap_to_tokens({"label": lab, "start": s, "end": e}, toks)
-            if snapped:
-                s, e = int(snapped["start"]), int(snapped["end"])
-                s, e = _safe_clip(text, s, e)
-
-        # drop tiny spans after trim
-        # (compute trimmed span length with surrounding whitespace removed)
-        trimmed = text[s:e].strip()
-        if len(trimmed) < 3:
-            continue
-
-        out.append({"label": lab, "start": s, "end": e})
-
-    return out
 
 
 # ---- Utilities (shared) ----
