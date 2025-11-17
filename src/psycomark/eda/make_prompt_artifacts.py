@@ -476,6 +476,40 @@ def _count_nested(raw_markers: list[dict]) -> int:
     return c
 
 
+def _topup_s1_bank(
+    s1_bank: list[dict],
+    extra_positive_candidates: list[dict],
+    target_k: int,
+    rng_seed: int = 13,
+) -> list[dict]:
+    """
+    Ensure we end up with exactly target_k S1 fewshots by topping up
+    with additional positive candidates (no-marker negatives are already capped).
+
+    - s1_bank: current fewshot list after complex selection + negative trimming.
+    - extra_positive_candidates: pool of additional S1-positive docs (with spans)
+      that we haven't used yet.
+    """
+    if len(s1_bank) >= target_k or not extra_positive_candidates:
+        return s1_bank
+
+    import random
+
+    random.seed(rng_seed)
+    # avoid duplicates
+    used_ids = {ex.get("doc_id") or ex.get("_id") for ex in s1_bank}
+    remaining = [
+        ex
+        for ex in extra_positive_candidates
+        if (ex.get("doc_id") or ex.get("_id")) not in used_ids
+    ]
+    random.shuffle(remaining)
+
+    needed = target_k - len(s1_bank)
+    s1_bank.extend(remaining[:needed])
+    return s1_bank
+
+
 def _complexity_tuple(raw_markers: list[dict]) -> tuple[int, int, int, int, int]:
     # span_count, overlaps, nested, unique_labels, AE_cooccur
     labs = {m.get("label") or m.get("type") for m in (raw_markers or [])}
@@ -700,6 +734,61 @@ def build_s1_diversified_fewshots(
                 label_bank_counts[lab] += 1
 
     # final positive set in target mix
+    def _ensure_role_docs(
+        chosen_docs: list[Doc], role: str, target_docs: int
+    ) -> list[Doc]:
+        """
+        Ensure that at least `target_docs` of the chosen positives contain `role`,
+        by swapping in good candidates from the remaining positives when possible.
+        Does not change the total positive count.
+        """
+
+        def _has_role(d: Doc) -> bool:
+            return any(s.label == role for s in d.spans)
+
+        docs_with_role = [d for d in chosen_docs if _has_role(d)]
+        if len(docs_with_role) >= target_docs:
+            return chosen_docs
+
+        chosen_set = set(chosen_docs)
+        # candidates: positives that have the role but aren't currently chosen
+        candidates = [d for d in positives if d not in chosen_set and _has_role(d)]
+        if not candidates:
+            return chosen_docs
+
+        # prefer high-quality candidates (by mean_span_score) first
+        candidates.sort(
+            key=lambda d: sig.get(id(d), {}).get("mean_span_score", 0.0),
+            reverse=True,
+        )
+
+        # docs we are allowed to drop: those without the role
+        cand_drops = [d for d in chosen_docs if not _has_role(d)]
+        if not cand_drops:
+            return chosen_docs
+
+        # Prefer dropping non-complex docs with lower mean span score
+        def _is_complex(d: Doc) -> bool:
+            return d in complex_pool
+
+        cand_drops.sort(
+            key=lambda d: (
+                _is_complex(d),  # False (normal) first
+                sig.get(id(d), {}).get("mean_span_score", 0.0),
+            )
+        )
+
+        for cand in candidates:
+            if len(docs_with_role) >= target_docs or not cand_drops:
+                break
+            drop = cand_drops.pop(0)
+            if drop in chosen_docs:
+                chosen_docs.remove(drop)
+            chosen_docs.append(cand)
+            docs_with_role.append(cand)
+
+        return chosen_docs
+
     chosen = chosen + normals
     # if still short, attempt strict top-up (with skew) then relaxed top-up (ignore skew)
     if len(chosen) < pos_budget:
@@ -728,6 +817,10 @@ def build_s1_diversified_fewshots(
                 break
             chosen.append(d)
         # no label_bank_counts update needed here for diagnostics
+
+    # --- NEW: gently enforce doc-level Victim/Evidence coverage if possible ---
+    # chosen = _ensure_role_docs(chosen, "Victim", target_docs=2)
+    # chosen = _ensure_role_docs(chosen, "Evidence", target_docs=2)
 
     # ---------- negatives ----------
     hard = _pick_hard_negatives(docs, k=min(1, negatives))
@@ -1104,30 +1197,47 @@ S2_RATIONALE_SYSTEM = f"""
 <task name="rationale_only">
   You are given:
     - RAW document text, and
-    - its GOLD label belongs in {{conspiracy, non}} (do NOT predict or change it).
-    Optionally, you may also receive extracted markers:
-    (Actor, Action, Effect, Victim, Evidence) from a separate S1 system.
+    - its GOLD label in {{conspiracy, non}} (do NOT predict or change it).
+    Optionally, you may also receive extracted S1 markers:
+      Actor, Action, Effect, Victim, Evidence.
 
   Your job:
-    - Write ONE concise rationale (less than 40 words) that justifies WHY the gold label is appropriate.
+    - Write ONE concise rationale (< 40 words) that justifies WHY the gold label is appropriate.
+    - The rationale must be consistent with the gold label, even if the text is noisy or ambiguous.
 
   Using markers (if provided):
     - Treat S1 markers as noisy hints about roles in the narrative, not as ground truth.
-    - You MAY refer to them in the rationale (e.g., vague Actor, hostile Action, grand Effect, explicit Evidence).
-    - Always base the rationale on the full document and authorial stance, even when markers are present.
-    - Markers alone never force a "conspiracy" or "non" decision.
+    - When useful, explicitly refer to them in abstract terms:
+        e.g., "vague Actor", "hostile Action", "grand Effect", "cited Evidence", "Victim framing".
+    - Always base the rationale on the full document and the authorial stance,
+      even when markers highlight conspiratorial-looking spans.
+    - Markers alone never force "conspiracy" or "non"; they are evidence to interpret.
+
+  Handling disagreement between markers and gold label:
+    - If markers suggest a conspiratorial pattern but the gold label is "non",
+      explain that the text reports, questions, or critiques such claims
+      instead of endorsing a hidden mechanism.
+    - If markers are sparse but the gold label is "conspiracy",
+      focus on the strongest cues for Actor+Action+Effect or self-sealing epistemics.
 
   Label-specific guidance:
-    - If label is "conspiracy":
-        Explain how the text communicates a conspiratorial mechanism:
-        at least one lexical cue or phrase that signals Actor, intentional Action,
-        grand/collective Effect, or self-sealing epistemics.
-    - If label is "non":
-        Explain which conspiratorial cues are missing, weak, or framed as critique/debunking.
-        If conspiracy language appears, note that it is reported, questioned, or rejected.
+    - If label == "conspiracy":
+        - Point to how the text communicates a conspiratorial mechanism:
+          at least one cue about a coordinated Actor, intentional Action,
+          grand/collective Effect, or self-sealing epistemics.
+        - You MAY mention that multiple markers (Actor/Action/Effect/Evidence)
+          align to a hidden plot.
+    - If label == "non":
+        - Explain which conspiratorial cues are missing, weak, or framed as critique/debunking.
+        - If conspiracy language or markers appear, note that it is quoted, reported,
+          fictional, or explicitly questioned rather than endorsed.
 
-  Return ONLY JSON:
-  {{"rationale": "<your 1-sentence explanation>"}}
+  Style and format:
+    - Write a single sentence, less than 40 words.
+    - Do NOT quote long fragments of the document.
+    - Do NOT mention "gold label", "markers", or "S1" explicitly; talk in semantic terms.
+    - Return ONLY JSON:
+      {{"rationale": "<your 1-sentence explanation>"}}
 </task>
 """.strip()
 
@@ -1229,205 +1339,230 @@ def align_s1_s2_fewshots_by_doc_id(
     return new_s2, aligned
 
 
+def _score_conspiracy_row(row: dict) -> float:
+    text = (row.get("text") or row.get("doc_text") or "").strip()
+    sig = s2_signals(text)
+    score = 0.0
+    score += 3.0 * sig["cues"]
+    score += min(sig["length"] / 400.0, 1.0)
+    if sig["debunk"]:
+        score -= 4.0
+    score -= 0.5 * sig["qmarks"]
+    return score
+
+
+def _score_non_row(row: dict) -> float:
+    text = (row.get("text") or row.get("doc_text") or "").strip()
+    sig = s2_signals(text)
+    base = min(sig["length"] / 400.0, 1.0)
+    bonus = 0.0
+    if sig["debunk"]:
+        bonus += 2.0
+    if sig["cues"] > 0 and not sig["debunk"]:
+        bonus += 1.0
+    penalty_q = 0.2 * sig["qmarks"]
+    return base + bonus - penalty_q
+
+
+def _build_s2_fewshots_for_rows(
+    rows: list[dict],
+    k: int,
+    *,
+    attach_markers: bool,
+    s1_by_id: dict[str, dict] | None = None,
+    rng_seed: int = 7,
+) -> list[dict]:
+    import random
+    from collections import Counter
+
+    if k <= 0 or not rows:
+        return []
+
+    random.seed(rng_seed)
+
+    cons = [r for r in rows if r.get("label") == "conspiracy"]
+    nonc = [r for r in rows if r.get("label") == "non"]
+
+    cons_sorted = sorted(cons, key=_score_conspiracy_row, reverse=True)
+    nonc_sorted = sorted(nonc, key=_score_non_row, reverse=True)
+
+    target_cons = max(1, k // 2)
+    target_non = k - target_cons
+
+    picked: list[dict] = []
+    picked.extend(cons_sorted[:target_cons])
+    picked.extend(nonc_sorted[:target_non])
+
+    if len(picked) < k:
+        rest = [r for r in rows if r not in picked]
+        random.shuffle(rest)
+        picked.extend(rest[: max(0, k - len(picked))])
+
+    picked = picked[:k]
+    random.shuffle(picked)
+
+    fewshots: list[dict] = []
+    for i, r in enumerate(picked):
+        text = (r.get("text") or r.get("doc_text") or "").strip()
+        gold_label = (r.get("label") or "").strip().lower() or "non"
+        did_str = str(r.get("doc_id") or f"s2_{i}")
+
+        try:
+            item = make_s2_item_with_rationale(
+                text=text,
+                gold_label=gold_label,
+                doc_id=did_str,
+            )
+        except Exception as e:
+            print(f"[fewshot S2] ERROR creating rationale for doc_id={did_str}: {e!r}")
+            fallback_rat = (
+                "The author explicitly endorses a hidden, coordinated conspiracy with vague hostile actors and extreme stakes."
+                if gold_label == "conspiracy"
+                else "The text reports or analyses without endorsing a hidden, coordinated conspiracy mechanism."
+            )
+            item = {
+                "text": text,
+                "label": gold_label,
+                "rationale": fallback_rat,
+            }
+
+        if attach_markers and s1_by_id:
+            s1_ex = s1_by_id.get(did_str)
+            if s1_ex:
+                markers = s1_ex.get("spans") or s1_ex.get("markers") or []
+                if markers:
+                    item["markers"] = markers
+
+        item["task"] = "s2"
+        item["doc_id"] = did_str
+        fewshots.append(item)
+
+    print(
+        "[report] _build_s2_fewshots_for_rows: "
+        f"label_counts={Counter(fs['label'] for fs in fewshots)} | "
+        f"n={len(fewshots)} | attach_markers={attach_markers}"
+    )
+
+    return fewshots
+
+
 def build_s2_fewshots_with_llm_pydantic(
     train_docclf_jsonl: str,
     *,
-    k: int = 6,
+    k: int = 8,
     rng_seed: int = 7,
     s1_bank: list[dict] | None = None,
-    aligned_k: int = 2,
 ) -> list[dict]:
-    # --- Normalize numeric args defensively ---
+    """
+    Hybrid S2 fewshots:
+      - some from docs that appear in S1 fewshot bank (with markers attached),
+      - some from the rest of S2 train (no markers).
+
+    This teaches the model how to use S1 markers when present,
+    without restricting all S2 fewshots to the tiny S1-overlap subset.
+    """
+    import json
+    import random
+    from collections import Counter
+
     try:
         k_int = int(k)
     except Exception:
-        print(f"[debug S2-k] could not cast k={k!r} (type={type(k)}), defaulting to 8")
+        print(
+            f"[debug S2-k-type] k={k!r} (type={type(k)}) was not int-castable; falling back to 8"
+        )
         k_int = 8
 
-    try:
-        aligned_k = int(aligned_k)
-    except Exception:
-        print(
-            f"[debug S2-aligned_k] could not cast aligned_k={aligned_k!r} "
-            f"(type={type(aligned_k)}), defaulting to 2"
-        )
-        aligned_k = 2
-
     random.seed(rng_seed)
-    rows: list[dict] = []
 
-    # DEBUG counters for ID keys in S2 file
-    id_key_counts = {"doc_id": 0, "_id": 0, "id": 0}
+    # --- map S1 fewshot doc_ids -> examples (for markers) ---
+    s1_by_id: dict[str, dict] = {}
+    if s1_bank:
+        for ex in s1_bank:
+            did = ex.get("doc_id") or ex.get("_id")
+            if did is None:
+                continue
+            did_str = str(did)
+            spans = ex.get("spans") or ex.get("markers") or []
+            if not spans:
+                continue
+            if did_str not in s1_by_id:
+                s1_by_id[did_str] = ex
 
+    print(f"[debug S2-hybrid] S1 fewshot docs with spans={len(s1_by_id)}")
+
+    # --- load all S2 rows ---
+    all_rows: list[dict] = []
     with open(train_docclf_jsonl, "r", encoding="utf-8") as f:
         for line in f:
-            try:
-                obj = json.loads(line)
-            except Exception:
+            line = line.strip()
+            if not line:
                 continue
-
-            # debug: raw id-like keys
-            for key in id_key_counts:
-                if key in obj:
-                    id_key_counts[key] += 1
-
-            text = (obj.get("text") or "").strip()
+            obj = json.loads(line)
+            text = (obj.get("text") or obj.get("doc_text") or "").strip()
             if not text:
                 continue
 
-            # NEW: normalize doc_id here
             did = obj.get("doc_id") or obj.get("_id")
-            if did is not None:
-                obj["doc_id"] = did
+            if did is None:
+                continue
+            did_str = str(did)
 
-            # Normalize label: prefer `label`, fallback to `doc_label`
-            lab = obj.get("label") or obj.get("doc_label")
-            if not lab:
+            label = (obj.get("label") or obj.get("doc_label") or "").strip().lower()
+            if label not in {"conspiracy", "non"}:
                 continue
 
-            lab = str(lab).strip().lower()
+            obj["doc_id"] = did_str
+            obj["label"] = label
+            all_rows.append(obj)
 
-            # --- Hard override: Pizzagate / Comet Pizza should be "conspiracy" ---
-            low = text.lower()
-            if any(
-                kw in low
-                for kw in (
-                    "pizzagate",
-                    "comet pizza",
-                    "comet ping pong",
-                )
-            ):
-                lab = "conspiracy"
+    print(f"[debug S2-hybrid] total S2 rows loaded={len(all_rows)}")
+    if not all_rows:
+        print("[warn S2-hybrid] No S2 rows; S2 fewshot bank will be empty.")
+        return []
 
-            if lab not in {"conspiracy", "non"}:
-                continue
-
-            obj["label"] = lab
-            rows.append(obj)
-
-    # DEBUG: S2 load summary
-    from collections import Counter  # already imported at top, but safe
-
-    rows_with_doc_id = sum(1 for r in rows if r.get("doc_id") is not None)
-    label_dist = Counter(r.get("label") for r in rows)
-    print(
-        f"[debug S2-load] loaded {len(rows)} rows from {train_docclf_jsonl} | "
-        f"with_doc_id={rows_with_doc_id} | id_key_counts={id_key_counts}"
-    )
-    print(f"[debug S2-load] label distribution before scoring: {dict(label_dist)}")
-
-    # --- 1) Try to pick up to `aligned_k` docs that overlap with S1 fewshots by doc_id ---
-    aligned_rows: list[dict] = []
-    aligned_ids: set[str] = set()
-
-    if s1_bank and aligned_k > 0:
-        # doc_ids that appear in the S1 fewshots
-        s1_ids = [
-            str(ex.get("doc_id")) for ex in s1_bank if ex.get("doc_id") is not None
-        ]
-        s1_ids = [i for i in s1_ids if i]  # drop empties
-        s1_unique = set(s1_ids)
-
-        print(
-            f"[debug S2-align-pre] s1_bank={len(s1_bank)} | "
-            f"S1 with doc_id={len(s1_ids)} | unique_s1_ids={len(s1_unique)}"
-        )
-
-        if s1_ids:
-            # map doc_id -> first matching row in rows
-            rows_by_id: dict[str, dict] = {}
-            for r in rows:
-                did = str(r.get("doc_id") or "")
-                if did and did not in rows_by_id:
-                    rows_by_id[did] = r
-
-            overlap_ids = s1_unique & set(rows_by_id.keys())
-            print(
-                f"[debug S2-align-pre] S2 rows_with_doc_id={len(rows_by_id)} | "
-                f"overlap_ids={len(overlap_ids)}"
-            )
-            if overlap_ids:
-                print(
-                    f"[debug S2-align-pre] sample overlap_ids="
-                    f"{sorted(list(overlap_ids))[:5]}"
-                )
-
-            for did in s1_ids:
-                if len(aligned_rows) >= aligned_k:
-                    break
-                if did in rows_by_id:
-                    r = rows_by_id[did]
-                    lab = r.get("label")
-                    if lab in {"conspiracy", "non"}:
-                        aligned_rows.append(r)
-                        aligned_ids.add(did)
-
-        print(
-            f"[debug S2-align-pre] aligned_rows={len(aligned_rows)} | "
-            f"aligned_ids_sample={sorted(list(aligned_ids))[:5]}"
-        )
-
-    # --- 2) Remaining pool for ordinary scoring (exclude already aligned) ---
-    remaining_rows = [r for r in rows if str(r.get("doc_id") or "") not in aligned_ids]
-
-    # Split by gold label
-    cons = [r for r in remaining_rows if r.get("label") == "conspiracy"]
-    nonc = [r for r in remaining_rows if r.get("label") == "non"]
-
-    def _score_conspiracy(r: dict) -> float:
-        sig = s2_signals(r.get("text", ""))
-        # strong cues + decent length, penalize a lot of "??"
-        return sig["cues"] * 3 + min(sig["length"] / 400.0, 1.0) - 0.3 * sig["qmarks"]
-
-    def _score_non(r: dict) -> float:
-        sig = s2_signals(r.get("text", ""))
-        hard = sig["cues"] > 0  # non-conspiracy but with conspiratorial language
-        base = min(sig["length"] / 400.0, 1.0)
-        return base + (1.5 if hard else 0.0)
-
-    # how many more we need beyond the aligned ones
-    print(
-        f"[debug S2-k-type] k={k!r} (type={type(k)}) | "
-        f"aligned_rows={len(aligned_rows)}"
-    )
-    # how many more we need beyond the aligned ones
-    remaining_k = max(0, k_int - len(aligned_rows))
-
-    if cons and nonc and remaining_k > 0:
-        half = remaining_k // 2
-        cons_sorted = sorted(cons, key=_score_conspiracy, reverse=True)
-        nonc_sorted = sorted(nonc, key=_score_non, reverse=True)
-        sample_rest = (
-            cons_sorted[: min(half, len(cons_sorted))]
-            + nonc_sorted[: min(remaining_k - half, len(nonc_sorted))]
-        )
-        random.shuffle(sample_rest)
-    else:
-        sample_rest = remaining_rows[:remaining_k]
-
-    sample = aligned_rows + sample_rest
-    random.shuffle(sample)
-
-    out: list[dict] = []
-    for i, r in enumerate(sample):
-        t = r.get("text", "")
-        gold = r.get("label", "non")
-        try:
-            item = make_s2_item_with_rationale(t, gold, doc_id=str(r.get("doc_id", i)))
-            # keep doc_id around; useful later for debugging
-            if "doc_id" in r:
-                item["doc_id"] = r["doc_id"]
-        except Exception as e:
-            print(f"[fewshot] ERROR building S2 item: {e!r}")
-            continue
-        out.append(item)
+    # --- split into overlap vs non-overlap with S1 fewshots ---
+    overlap_rows = [r for r in all_rows if r["doc_id"] in s1_by_id]
+    non_overlap_rows = [r for r in all_rows if r["doc_id"] not in s1_by_id]
 
     print(
-        f"[debug S2-final] fewshot_k={k} | aligned_rows_used={len(aligned_rows)} | "
-        f"total_sampled={len(out)}"
+        f"[debug S2-hybrid] overlap_rows={len(overlap_rows)} "
+        f"| non_overlap_rows={len(non_overlap_rows)}"
     )
 
-    return out
+    # how many marker-rich fewshots?
+    marker_k = min(len(overlap_rows), max(3, k_int // 2))
+    plain_k = max(0, k_int - marker_k)
+
+    print(f"[debug S2-hybrid] marker_k={marker_k} | plain_k={plain_k} | k={k_int}")
+
+    few_marker = _build_s2_fewshots_for_rows(
+        overlap_rows,
+        marker_k,
+        attach_markers=True,
+        s1_by_id=s1_by_id,
+        rng_seed=rng_seed,
+    )
+
+    few_plain = _build_s2_fewshots_for_rows(
+        non_overlap_rows,
+        plain_k,
+        attach_markers=False,
+        s1_by_id=None,
+        rng_seed=rng_seed + 1,
+    )
+
+    fewshots = few_marker + few_plain
+    random.shuffle(fewshots)
+
+    label_counts = Counter(fs["label"] for fs in fewshots)
+    with_markers = sum(1 for fs in fewshots if fs.get("markers"))
+    print(
+        "[report] S2 fewshots (hybrid): "
+        f"label_counts={dict(label_counts)} | n={len(fewshots)} | with_markers={with_markers}"
+    )
+
+    return fewshots[:k_int]
 
 
 def _dedupe_s2_fewshots(examples: list[dict]) -> list[dict]:
@@ -1616,6 +1751,92 @@ def main():
             f"[report] S1 complex mode: examples={len(s1_bank)} | max_spans/ex={max_sp} | avg_spans/ex={avg_sp:.1f}"
         )
 
+    # --- Post-filter only in NON-complex mode; complex mode keeps dense spans ---
+    if not args.s1_complex:
+        before_ex = len(s1_bank)
+        before_sp = sum(len(ex.get("spans", [])) for ex in s1_bank)
+        s1_bank = _apply_s1_post_filter(s1_bank, drop_empty_docs=True)
+        # optional soft cap when not complex
+        if args.s1_max_spans_per_ex > 0:
+            for ex in s1_bank:
+                if len(ex["spans"]) > args.s1_max_spans_per_ex:
+                    ex["spans"] = ex["spans"][: args.s1_max_spans_per_ex]
+        after_ex = len(s1_bank)
+        after_sp = sum(len(ex.get("spans", [])) for ex in s1_bank)
+        ae_docs = sum(
+            1
+            for ex in s1_bank
+            if {"Action", "Effect"} <= {s["label"] for s in ex.get("spans", [])}
+        )
+        victim_docs = sum(
+            1
+            for ex in s1_bank
+            if any(s["label"] == "Victim" for s in ex.get("spans", []))
+        )
+        print(
+            f"[report] S1 post-filter: ex {before_ex}->{after_ex} | spans {before_sp}->{after_sp} | AE in {ae_docs} | Victim in {victim_docs}"
+        )
+    else:
+        # light filter: keep docs but drop obviously bad spans
+        s1_bank = _apply_s1_post_filter(s1_bank, drop_empty_docs=False)
+        max_sp = max((len(ex.get("spans", [])) for ex in s1_bank), default=0)
+        avg_sp = sum(len(ex.get("spans", [])) for ex in s1_bank) / max(1, len(s1_bank))
+        print(
+            f"[report] S1 complex mode: examples={len(s1_bank)} | max_spans/ex={max_sp} | avg_spans/ex={avg_sp:.1f}"
+        )
+
+    # --- LIMIT explicit "no markers" examples and then TOP UP back to s1_k ---
+    max_neg_for_prompts = 2
+    negatives = [ex for ex in s1_bank if not ex.get("spans")]
+    if len(negatives) > max_neg_for_prompts:
+        keep_ids = {id(ex) for ex in negatives[:max_neg_for_prompts]}
+        trimmed_bank = []
+        for ex in s1_bank:
+            if ex.get("spans") or id(ex) in keep_ids:
+                trimmed_bank.append(ex)
+        print(
+            f"[report] S1 negatives trimmed: kept {max_neg_for_prompts} explicit no-marker examples "
+            f"from {len(negatives)}"
+        )
+        s1_bank = trimmed_bank
+
+    # Tag remaining no-marker examples explicitly
+    for ex in s1_bank:
+        if not ex.get("spans"):
+            ex["no_markers"] = True
+
+    # --- TOP UP S1 back to args.s1_k with extra positive docs (with spans) ---
+    if len(s1_bank) < args.s1_k:
+        extra_pool: list[dict] = []
+        for d in _load_s1_docs(args.s1_train_jsonl):
+            if not d.spans:
+                continue
+            extra_pool.append(
+                {
+                    "text": d.text,
+                    "spans": [{"label": s.label, "text": s.text} for s in d.spans],
+                    "doc_id": getattr(d, "doc_id", None),
+                }
+            )
+
+        used_ids = {str(ex.get("doc_id")) for ex in s1_bank if ex.get("doc_id")}
+        extra_pool = [
+            ex
+            for ex in extra_pool
+            if not ex.get("doc_id") or str(ex["doc_id"]) not in used_ids
+        ]
+        random.shuffle(extra_pool)
+
+        needed = max(0, args.s1_k - len(s1_bank))
+        topup = extra_pool[:needed]
+        s1_bank.extend(topup)
+        print(
+            f"[report] S1 top-up: added {len(topup)} extra positives | "
+            f"final_n={len(s1_bank)} (target={args.s1_k})"
+        )
+
+    print(f"[report] S1 fewshots final: n={len(s1_bank)} (target={args.s1_k})")
+
     s2_bank: list[dict] = []
     if args.build_s2_fewshots and args.s2_train_docclf:
         print(
@@ -1626,7 +1847,6 @@ def main():
             k=8,
             rng_seed=7,
             s1_bank=s1_bank,
-            aligned_k=2,  # force up to 2 aligned docs
         )
 
         # 1) dedupe

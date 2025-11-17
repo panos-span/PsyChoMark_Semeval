@@ -45,6 +45,104 @@ from pydantic_ai.models.bedrock import BedrockConverseModel
 # Bedrock provider/model (pydantic-ai)
 from pydantic_ai.providers.bedrock import BedrockProvider
 
+# ---------------------------------------------------------------------------
+# Prompt caching wrapper for Bedrock Converse
+# ---------------------------------------------------------------------------
+
+
+# class _CachingBedrockClient:
+#    """
+#    Thin wrapper around the real boto3 Bedrock client.
+#
+#    It intercepts converse(**params) and, when enabled, injects a
+#    cachePoint block into the 'system' content array so that the
+#    static system prompt (instructions + few-shots) is cached.
+#
+#    This relies on Bedrock's prompt caching for Converse API:
+#      - https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
+#    """
+#
+#    def __init__(self, client, enable_cache: bool = True, cache_type: str = "default"):
+#        self._client = client
+#        self._enable_cache = enable_cache
+#        self._cache_type = cache_type
+#
+#    def converse(self, **params):
+#        # If caching is disabled, just delegate
+#        if not self._enable_cache:
+#            return self._client.converse(**params)
+#
+#        model_id = params.get("modelId", "") or ""
+#
+#        # Very light guard: only try to cache on Claude/Nova-like model IDs
+#        # and when the account actually has prompt caching enabled.
+#        # You can tighten/loosen this as needed.
+#        if not any(k in model_id for k in ("anthropic", "claude", "nova")):
+#            return self._client.converse(**params)
+#
+#        system = params.get("system")
+#        if isinstance(system, list) and system:
+#            # Check if we already added a cachePoint
+#            has_cachepoint = any(
+#                isinstance(block, dict) and "cachePoint" in block for block in system
+#            )
+#            if not has_cachepoint:
+#                # Append a cachePoint block so that all preceding system content
+#                # (our giant instructions + fewshots) becomes the cached prefix.
+#                system = list(system) + [{"cachePoint": {"type": self._cache_type}}]
+#                params["system"] = system
+#
+#        # You could also cache tools here, if you start using Bedrock tools:
+#        # tool_config = params.get("toolConfig")
+#        # ...
+#
+#        return self._client.converse(**params)
+#
+#    def __getattr__(self, name):
+#        # Delegate all other attributes/methods to the real client
+#        return getattr(self._client, name)
+#
+#
+# class CachingBedrockConverseModel(BedrockConverseModel):
+#    """
+#    Drop-in replacement for BedrockConverseModel that wraps the underlying
+#    boto3 client with _CachingBedrockClient.
+#
+#    This means pydantic-ai still builds the same Converse params; the only
+#    difference is that just before hitting Bedrock we insert a cachePoint
+#    in the system content (when enabled).
+#    """
+#
+#    def __init__(
+#        self,
+#        model_id: str,
+#        provider: BedrockProvider,
+#        *,
+#        enable_cache: bool | None = None,
+#        cache_type: str = "default",
+#    ):
+#        # Normal BedrockConverseModel setup
+#        super().__init__(model_id, provider=provider)
+#
+#        # Env toggle so you can easily disable if needed:
+#        #   BEDROCK_PROMPT_CACHE=0 -> disabled
+#        if enable_cache is None:
+#            from os import getenv
+#
+#            enable_cache = getenv("BEDROCK_PROMPT_CACHE", "1") not in (
+#                "0",
+#                "false",
+#                "False",
+#            )
+#
+#        # Wrap the boto3 client
+#        real_client = self.client
+#        self.client = _CachingBedrockClient(
+#            real_client,
+#            enable_cache=enable_cache,
+#            cache_type=cache_type,
+#        )
+
 
 # ===========================================================================
 # Bedrock model wiring
@@ -59,6 +157,9 @@ BEDROCK_MODEL_ID = os.getenv(
 
 _provider = BedrockProvider(region_name=AWS_REGION)
 LLM = BedrockConverseModel(BEDROCK_MODEL_ID, provider=_provider)
+# LLM = CachingBedrockConverseModel(
+#    BEDROCK_MODEL_ID, provider=_provider, cache_type="default", enable_cache=True
+# )
 
 
 # ===========================================================================
