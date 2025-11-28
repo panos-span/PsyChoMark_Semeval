@@ -25,25 +25,35 @@ from __future__ import annotations
 
 import os
 import re
+import asyncio
 from enum import Enum
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Literal
 from prompt_builder import (
     to_s2_marker,
 )  # utility for normalizing S1 spans into S2 markers
 from prompt_builder import (
     build_s1_system,
+    build_s1_system_aot,
     build_s1_user,
     build_s2_system,
     build_s2_user,
 )
+import chromadb
+from chromadb import Collection
+from chromadb.utils import embedding_functions
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 # pydantic-ai core
-from pydantic_ai import Agent, ModelRetry, RunContext, ModelSettings
+from pydantic_ai import Agent, RunContext, ModelSettings
 from pydantic_ai.models.bedrock import BedrockConverseModel
+from loguru import logger
+from collections import Counter
+import json
 
 # Bedrock provider/model (pydantic-ai)
 from pydantic_ai.providers.bedrock import BedrockProvider
+
+_SC_SEMAPHORE = asyncio.Semaphore(3)  # limit concurrent Bedrock calls
 
 # ---------------------------------------------------------------------------
 # Prompt caching wrapper for Bedrock Converse
@@ -163,6 +173,88 @@ LLM = BedrockConverseModel(BEDROCK_MODEL_ID, provider=_provider)
 
 
 # ===========================================================================
+# 0. RAG Utilities (Bedrock Titan Integration)
+# ===========================================================================
+
+
+class BedrockTitanEmbeddingFunction(embedding_functions.EmbeddingFunction):
+    """
+    ChromaDB-compatible wrapper for Amazon Titan Text v2.
+    """
+
+    def __init__(self, region_name: str = AWS_REGION):
+        import boto3
+
+        self.bedrock = boto3.client(
+            service_name="bedrock-runtime", region_name=region_name
+        )
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        # Titan v2 supports batching, but let's loop to be safe/simple regarding limits
+        embeddings = []
+        for text in input:
+            try:
+                body = json.dumps(
+                    {
+                        "inputText": text[:8000],  # Titan limit
+                        "dimensions": 1024,
+                        "normalize": True,
+                    }
+                )
+                response = self.bedrock.invoke_model(
+                    body=body,
+                    modelId="amazon.titan-embed-text-v2:0",
+                    accept="application/json",
+                    contentType="application/json",
+                )
+                response_body = json.loads(response.get("body").read())
+                embeddings.append(response_body.get("embedding"))
+            except Exception as e:
+                logger.error(f"[Embedder] Error: {e}")
+                embeddings.append([0.0] * 1024)  # Fallback zero vector
+        return embeddings
+
+
+def get_rag_collection(path: str, name: str) -> Collection:
+    """Initializes Chroma client and returns the collection."""
+    client = chromadb.PersistentClient(path=path)
+    ef = BedrockTitanEmbeddingFunction()
+    return client.get_collection(name=name, embedding_function=ef)
+
+
+def retrieve_fewshots(
+    collection: Collection, query_text: str, k: int = 8, filters: dict = None
+) -> List[dict]:
+    """
+    Performs dynamic retrieval.
+    Returns a list of dicts formatted for prompt_builder.
+    """
+    try:
+        results = collection.query(query_texts=[query_text], n_results=k, where=filters)
+
+        examples = []
+        if results["documents"]:
+            for i in range(len(results["documents"][0])):
+                doc_text = results["documents"][0][i]
+                meta = results["metadatas"][0][i]
+
+                # Reconstruct the example object
+                ex = {"text": doc_text, **meta}
+
+                # Deserialize JSON fields stored as strings in Chroma
+                if "spans_json" in ex:
+                    ex["spans"] = json.loads(ex.pop("spans_json"))
+                if "markers_json" in ex:
+                    ex["markers"] = json.loads(ex.pop("markers_json"))
+
+                examples.append(ex)
+        return examples
+    except Exception as e:
+        logger.error(f"[RAG] Retrieval failed: {e}")
+        return []
+
+
+# ===========================================================================
 # S1 — structured output types + agent
 # ===========================================================================
 # 1) define deps for S1
@@ -186,6 +278,12 @@ class S1Span(BaseModel):
     start: int | None = Field(None, description="0-indexed, inclusive")
     end: int | None = Field(None, description="0-indexed, end-exclusive")
 
+    # [NEW] Add support for the "Why" rationale your new artifacts teach
+    why: Optional[str] = Field(
+        None, description="Brief forensic reason for this label (if generated)."
+    )
+    context: Optional[str] = Field(None, description="Local context snippet.")
+
     @field_validator("end")
     @classmethod
     def _end_after_start(cls, v, info):
@@ -197,6 +295,57 @@ class S1Span(BaseModel):
 
 class S1Output(BaseModel):
     spans: List[S1Span] = Field(default_factory=list)
+
+
+class MarkerSummary(BaseModel):
+    """
+    Compact, S2-friendly summary for one marker label.
+
+    We want:
+      - a salience estimate (how central this marker is),
+      - a conspiratoriality estimate (does it carry conspiratorial framing),
+      - up to 3 short bullets with concrete cues.
+    """
+
+    label: S1Label
+    salience: Literal["none", "low", "medium", "high"] = "low"
+    conspiratoriality: Literal["none", "possible", "strong"] = "none"
+    bullets: List[str] = Field(
+        default_factory=list,
+        description="Up to 3 short bullets (<15 words each) naming key cues.",
+    )
+
+    @field_validator("bullets")
+    @classmethod
+    def cap_bullets(cls, v: List[str]) -> List[str]:
+        # Hard cap at 3 bullets; truncate silently if more are produced.
+        return v[:3]
+
+
+class S1ReviewOutput(BaseModel):
+    """
+    Output of the S1 self-consistency reviewer:
+      - spans: final merged spans
+      - summary: list[MarkerSummary], one per label that actually appears.
+    """
+
+    spans: List[S1Span] = Field(default_factory=list)
+    summary: List[MarkerSummary] = Field(default_factory=list)
+
+
+class S1ReviewDeps(BaseModel):
+    """
+    Deps provided to the reviewer agent:
+      - raw_text: authoritative source for offset sanity
+      - candidate_sets: k S1 outputs, as lists of dicts
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    raw_text: str
+    doc_id: Optional[str] = None
+    candidate_sets: List[List[Dict[str, Any]]] = Field(
+        default_factory=list, description="K candidate span sets from S1 runs."
+    )
 
 
 # We create a single Agent instance and update its system prompt per run.
@@ -404,6 +553,80 @@ def create_s1_agent(
     return agent
 
 
+def create_s1_reviewer_agent(
+    system_prompt: str, temperature: float = 0.0
+) -> Agent[S1ReviewDeps, S1ReviewOutput]:
+    """
+    Fresh S1 reviewer agent; same pattern as create_s1_agent but different output_type.
+    """
+    agent = Agent(
+        LLM,
+        output_type=S1ReviewOutput,
+        system_prompt=system_prompt,
+        deps_type=S1ReviewDeps,
+        retries=4,
+        output_retries=4,
+        model_settings=ModelSettings(temperature=temperature),
+    )
+    return agent
+
+
+def make_s1_review_prompts(
+    *,
+    text: str,
+    candidate_sets: List[List[Dict[str, Any]]],
+) -> Tuple[str, str]:
+    """
+    Upgraded Reviewer: Acts as a Critic/Refiner over K AoT candidates.
+    """
+    # Reuse base system to keep definitions aligned
+    base_system = build_s1_system(priors=None, conflicts=None, use_cot=True)
+
+    # Inject the Critic-Refiner Rubric
+    review_block = """
+<critic_refiner_mandate>
+  You are an expert Forensic Reviewer (Critic & Refiner).
+  You have received K candidate extraction sets from independent analysis runs.
+  
+  Your Goal: Synthesize a single, high-fidelity JSON output.
+
+  <critique_rubric>
+    For every extracted span in the candidates, apply this filter:
+    1. **Hallucination Check:** Is the text strictly present in the RAW document? (Reject if not).
+    2. **Definition Check:** Does it actually fit the specific Role definition? (e.g., Reject neutral actors).
+    3. **Boundary Accuracy:** Is the span precise? 
+       - REJECT: "the shadowy figures" (includes unnecessary determiner)
+       - ACCEPT: "shadowy figures"
+    4. **Consensus Signal:** If multiple candidates found this span, it is likely valid. If only one found it, scrutinize its 'why' rationale deeply.
+  </critique_rubric>
+
+  <refinement_strategy>
+    - Aggressively MERGE duplicates (prioritize the tightest valid boundary).
+    - RESOLVE conflicts (e.g., if one run says 'Action' and another 'Effect', use the Context to decide).
+    - PRESERVE the best 'why' rationale from the candidates or synthesize a better one.
+  </refinement_strategy>
+</critic_refiner_mandate>
+
+<summary_style>
+  (Keep the existing summary style instructions here...)
+</summary_style>
+""".strip()
+
+    system_prompt = base_system + "\n\n" + review_block
+
+    user_prompt = f"""
+<text_to_analyze>
+{text}
+</text_to_analyze>
+
+<candidate_marker_sets>
+{json.dumps(candidate_sets, ensure_ascii=False, separators=(",", ":"))}
+</candidate_marker_sets>
+""".strip()
+
+    return system_prompt, user_prompt
+
+
 _WORD_RE = re.compile(r"\w")
 
 
@@ -450,7 +673,7 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
     # authoritative RAW
     RAW = getattr(ctx.deps, "raw_text", "") or ""
     if not RAW:
-        print(
+        logger.warning(
             "[s1_verifier_impl] Warning: deps.raw_text missing; reconstructing from history"
         )
         try:
@@ -470,9 +693,9 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
 
     spans_in = output.spans or []
     if dbg:
-        print(f"[s1_verifier_impl] Received {len(spans_in)} candidate spans")
+        logger.debug(f"[s1_verifier_impl] Received {len(spans_in)} candidate spans")
         pv = RAW
-        print(f"[loc] len(raw)={len(RAW)} preview='{pv}…'")
+        logger.debug(f"[loc] len(raw)={len(RAW)} preview='{pv}…'")
 
     # NEW: track how many times we've already assigned this (label, text)
     assigned_count = defaultdict(
@@ -497,7 +720,7 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
             hit = _find_best_span(RAW, snippet, nth=0) if snippet else None
             if not hit:
                 if dbg:
-                    print(
+                    logger.debug(
                         f"[s1_verifier_impl] #{i} drop: locate-by-text failed (label={label}, text='{snippet}')"
                     )
                 continue
@@ -512,7 +735,7 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
         # 2) gentle boundary snap (preserve equality)
         ts, te = _tighten_gentle(RAW, s, e, want_text=snippet)
         if (ts, te) != (s, e) and dbg:
-            print(f"[s1_verifier_impl] #{i} tightened -> ({ts},{te})")
+            logger.debug(f"[s1_verifier_impl] #{i} tightened -> ({ts},{te})")
         s, e = ts, te
 
         slice_txt = RAW[s:e]
@@ -522,7 +745,7 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
         snip_norm, _ = _normalize_for_match(snippet)
         if snippet and raw_norm != snip_norm:
             if dbg:
-                print(f"[s1_verifier_impl] #{i} drop: hard equality failed")
+                logger.debug(f"[s1_verifier_impl] #{i} drop: hard equality failed")
             continue
 
         # (optional) Evidence gate could be applied here if you want;
@@ -531,7 +754,7 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
         if label == S1Label.Victim and _VICTIM_BARE_RE.fullmatch(slice_txt.strip()):
             if any(s >= a_s and e <= a_e for (a_s, a_e) in action_spans):
                 if dbg:
-                    print(
+                    logger.debug(
                         f"[s1_verifier_impl] #{i} drop: embedded bare-noun Victim inside Action"
                     )
                 continue
@@ -540,13 +763,13 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
         k2 = (label, s, e)
         if k2 in seen:
             if dbg:
-                print(f"[s1_verifier_impl] #{i} drop: duplicate")
+                logger.debug(f"[s1_verifier_impl] #{i} drop: duplicate")
             continue
         seen.add(k2)
 
         cleaned.append(S1Span(label=label, text=slice_txt, start=s, end=e))
         if dbg:
-            print(
+            logger.debug(
                 f"[s1_verifier_impl] #{i} kept [locate_by_text] {label} ({s},{e})='{slice_txt[:80]}'"
             )
 
@@ -564,7 +787,7 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
             ):
                 if any(sp.start >= a_s and sp.end <= a_e for (a_s, a_e) in actions):
                     if dbg:
-                        print(
+                        logger.debug(
                             f"[s1_verifier_impl] prune: embedded bare-noun Victim '{sp.text}'"
                         )
                     continue
@@ -573,9 +796,9 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
     # --- END NEW ---
 
     if dbg:
-        print(f"[s1_verifier_impl] Final kept spans: {len(cleaned)}")
+        logger.debug(f"[s1_verifier_impl] Final kept spans: {len(cleaned)}")
         for j, sp in enumerate(cleaned):
-            print(
+            logger.debug(
                 f"[s1_verifier_impl]   #{j} {sp.label} ({sp.start},{sp.end})='{sp.text[:120]}'"
             )
 
@@ -701,33 +924,254 @@ def make_s1_prompts(
     return sys_p, usr_p
 
 
+# --- New AoT Schema ---
+class S1AoTOutput(BaseModel):
+    """
+    Algorithm of Thought output schema.
+    Captures the reasoning steps separate from the final extraction.
+    """
+
+    strategy: List[str] = Field(
+        ..., description="Step-by-step execution trace (Actor scan, Action scan, etc.)"
+    )
+    final_spans: List[S1Span] = Field(
+        ..., description="The final validated list of markers."
+    )
+
+
+# --- AoT Agent Factory ---
+def create_s1_aot_agent(
+    system_prompt: str, temperature: float = 0.0
+) -> Agent[S1Deps, S1AoTOutput]:
+    """
+    Creates an agent that thinks in steps (AoT) but validates offsets strictly.
+    """
+    agent = Agent(
+        LLM,
+        output_type=S1AoTOutput,
+        system_prompt=system_prompt,
+        deps_type=S1Deps,
+        retries=4,
+        output_retries=4,
+        model_settings=ModelSettings(temperature=temperature),
+    )
+
+    # We bind the SAME heavy-duty validator, but adapt the input/output structure
+    @agent.output_validator
+    async def _bound_aot_validator(
+        ctx: RunContext[S1Deps], output: S1AoTOutput
+    ) -> S1AoTOutput:
+        # 1. Unwrap: Pretend this is a standard S1Output for the validator
+        temp_standard = S1Output(spans=output.final_spans)
+
+        # 2. Validate: Run the offset-snapping and text-matching logic
+        validated_standard = await s1_verifier_impl(ctx, temp_standard)
+
+        # 3. Rewrap: Put the fixed spans back into the AoT object
+        output.final_spans = validated_standard.spans
+        return output
+
+    return agent
+
+
 async def run_s1(
     *,
     doc_id: str,
     text: str,
     priors: dict,
     conflicts: list,
-    fewshots: list,
+    fewshots: list | None = None,
+    rag_collection: Optional[Collection] = None,
     include_cot: bool = True,
+    use_aot: bool = True,  # <--- NEW ARGUMENT
     temperature: float = 0.0,
 ) -> S1Output:
-    sys_p, usr_p = make_s1_prompts(
-        text=text,
-        priors=priors,
-        conflicts=conflicts,
-        fewshots=fewshots,
-        include_cot=include_cot,
+
+    # [Dynamic Retrieval Logic remains the same...]
+    if rag_collection and not fewshots:
+        fewshots = retrieve_fewshots(rag_collection, text, k=8)
+
+    if use_aot:
+        # --- AoT Branch ---
+        # Note: AoT prompt does not use 'fewshots' in the system instructions
+        # usually, but you can inject them if your build_s1_system_aot supports it.
+        # Assuming build_s1_system_aot handles the core instructions:
+        sys_p = build_s1_system_aot(priors=priors, conflicts=conflicts)
+
+        # We reuse build_s1_user for the user message, as the <text_to_analyze> structure is identical
+        # However, we disable CoT in the user prompt because AoT handles thinking in the JSON schema
+        _, usr_p = make_s1_prompts(
+            text=text,
+            priors={},
+            conflicts=[],
+            fewshots=fewshots or [],
+            include_cot=False,
+        )
+
+        agent = create_s1_aot_agent(sys_p, temperature=temperature)
+        deps = S1Deps(raw_text=text, doc_id=doc_id)
+
+        res = await agent.run(usr_p, deps=deps, message_history=[])
+
+        # Flatten result: discard strategy, return standard S1Output for pipeline compatibility
+        return S1Output(spans=res.output.final_spans)
+
+    else:
+        # --- Standard Branch (Existing Code) ---
+        sys_p, usr_p = make_s1_prompts(
+            text=text,
+            priors=priors,
+            conflicts=conflicts,
+            fewshots=fewshots or [],
+            include_cot=include_cot,
+        )
+        agent = create_s1_agent(sys_p, temperature=temperature)
+        deps = S1Deps(raw_text=text, doc_id=doc_id)
+        res = await agent.run(usr_p, deps=deps, message_history=[])
+        return res.output
+
+
+def _merge_s1_self_consistent(outputs: List[S1Output]) -> S1Output:
+    """
+    Simple self-consistency merge for S1:
+      - key = (label, start, end)
+      - keep spans that appear in >= majority of runs
+      - text taken from the first occurrence (offsets already validated by verifier)
+    """
+    if not outputs:
+        return S1Output(spans=[])
+
+    k = len(outputs)
+    # strict majority: for k=5 -> 3
+    threshold = (k // 2) + 1
+
+    counts: Counter[tuple] = Counter()
+    exemplar: dict[tuple, S1Span] = {}
+
+    for out in outputs:
+        for sp in out.spans or []:
+            key = (sp.label, sp.start, sp.end)
+            counts[key] += 1
+            # remember one exemplar
+            if key not in exemplar:
+                exemplar[key] = sp
+
+    merged_spans: List[S1Span] = []
+    for key, c in counts.items():
+        if c >= threshold:
+            merged_spans.append(exemplar[key])
+
+    # Keep a deterministic ordering: by (label, start, end)
+    merged_spans.sort(key=lambda sp: (str(sp.label), sp.start or 0, sp.end or 0))
+    return S1Output(spans=merged_spans)
+
+
+async def run_s1_self_consistent(
+    *,
+    doc_id: str,
+    text: str,
+    priors: dict,
+    conflicts: list,
+    fewshots: list,
+    rag_collection: Optional[Collection] = None,  # [NEW]
+    include_cot: bool = True,
+    k: int = 5,
+    temperature: float = 0.7,
+    use_aot: bool = True,
+) -> S1ReviewOutput:
+    """
+    Self-consistency for S1 with a reviewer agent:
+
+      1. Run the base S1 extractor k times at non-zero temperature.
+      2. Collect the k outputs as candidate_sets (lists of {label,text,start,end}).
+      3. Call a reviewer agent that:
+          - looks at RAW text + all candidates,
+          - outputs final spans and a per-label marker summary.
+
+    Returns:
+      S1ReviewOutput(spans=[...], summary=[MarkerSummary(...), ...])
+    """
+    if k < 1:
+        k = 1
+
+    # --- Step 1: run base S1 k times (diversity from temperature) ---
+    logger.info(
+        f"[{doc_id}] S1-SC: Starting {k} Proposer runs (temp={temperature}, AoT={use_aot})..."
     )
 
-    # NEW: build a fresh agent; no clone()
-    agent = create_s1_agent(sys_p, temperature=temperature)
+    # --- Wrapper for a single concurrent run ---
+    async def _single_s1_run(index: int) -> Optional[S1Output]:
+        sub_id = f"{doc_id}::run{index+1}"
+        async with _SC_SEMAPHORE:  # Rate limit protection
+            try:
+                logger.debug(f"[{doc_id}] Proposer {index+1}/{k} running...")
+                return await run_s1(
+                    doc_id=sub_id,
+                    text=text,
+                    priors=priors,
+                    conflicts=conflicts,
+                    fewshots=fewshots,
+                    rag_collection=rag_collection,
+                    include_cot=include_cot,
+                    use_aot=use_aot,
+                    temperature=temperature,
+                )
+            except Exception as e:
+                logger.warning(f"[{doc_id}] ⚠️ Proposer {index+1} failed: {e}")
+                return None
 
-    # Always pass deps so the verifier never falls back to stitched messages
-    deps = S1Deps(raw_text=text, doc_id=doc_id)
+    # --- Step 1: Concurrent Execution ---
+    # asyncio.gather runs all tasks in parallel
+    results = await asyncio.gather(*[_single_s1_run(i) for i in range(k)])
 
-    # history=[] guarantees a clean context per call
-    res = await agent.run(usr_p, deps=deps, message_history=[])
-    return res.output
+    # Filter out failures
+    runs = [r for r in results if r is not None]
+
+    if not runs:
+        logger.error(f"[{doc_id}] S1-SC: All Proposer runs failed.")
+        return S1ReviewOutput(spans=[], summary=[])
+
+    # --- Step 2: build candidate_sets for the reviewer ---
+    candidate_sets: List[List[Dict[str, Any]]] = []
+    total_spans = 0
+    for out in runs:
+        span_dicts: List[Dict[str, Any]] = []
+        for sp in out.spans or []:
+            span_dicts.append(
+                {
+                    "label": (
+                        sp.label.value if hasattr(sp.label, "value") else str(sp.label)
+                    ),
+                    "text": sp.text,
+                    "start": sp.start,
+                    "end": sp.end,
+                    "why": getattr(sp, "why", None),  # Include why for reviewer
+                }
+            )
+        candidate_sets.append(span_dicts)
+        total_spans += len(span_dicts)
+
+    logger.info(
+        f"[{doc_id}] Reviewer: Critiquing {len(runs)} sets containing {total_spans} raw spans..."
+    )
+
+    # --- Step 3: call reviewer agent to merge + summarize ---
+    sys_p, usr_p = make_s1_review_prompts(text=text, candidate_sets=candidate_sets)
+    reviewer = create_s1_reviewer_agent(system_prompt=sys_p, temperature=0.0)
+
+    deps = S1ReviewDeps(
+        raw_text=text,
+        doc_id=doc_id,
+        candidate_sets=candidate_sets,
+    )
+
+    res = await reviewer.run(usr_p, deps=deps, message_history=[])
+
+    final_count = len(res.output.spans)
+    logger.success(
+        f"[{doc_id}] Reviewer: Consensus reached. Refined {total_spans} raw spans -> {final_count} final markers."
+    )
+    return res.output  # S1ReviewOutput
 
 
 # ===========================================================================
@@ -739,6 +1183,7 @@ class S2Deps(BaseModel):
     model_config = ConfigDict(extra="ignore")
     raw_text: str
     s1_markers: List[Dict[str, Any]] = []
+    marker_summary: Optional[Dict[str, Any]] = None
     doc_id: Optional[str] = None
 
 
@@ -765,6 +1210,7 @@ def make_s2_prompts(
     fewshots: Optional[List[dict]],
     include_cot: bool = True,
     allow_cant_tell: bool = False,
+    marker_summary: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[str, str]:
     """(system,user) identical to your adapter. :contentReference[oaicite:4]{index=4}"""
     sys_p = build_s2_system(include_cot=include_cot)
@@ -773,6 +1219,7 @@ def make_s2_prompts(
         s1_output=s1_spans,
         s2_fewshots=fewshots or [],
         include_cot=include_cot,
+        marker_summary=marker_summary,
     )
     return sys_p, usr_p
 
@@ -800,29 +1247,142 @@ async def run_s2(
     text: str,
     s1_output_spans: List[dict],  # [{"type","startIndex","endIndex","text"}] preferred
     fewshots: Optional[List[dict]] = None,
+    rag_collection: Optional[Collection] = None,  # [NEW]
     include_cot: bool = True,
     allow_cant_tell: bool = False,
     temperature: float = 0.0,
+    marker_summary: Optional[Dict[str, Any]] = None,
 ) -> S2Output:
+    # [NEW] Dynamic Retrieval Logic
+    if rag_collection and not fewshots:
+        # S2 benefits from fewer, highly specific examples (k=5 is often better than 8)
+        fewshots = retrieve_fewshots(rag_collection, text, k=8)
     # Ensure S1 spans are in S2 schema (startIndex/endIndex/text)
     s1_norm = [
         to_s2_marker(m, text) for m in (s1_output_spans or [])
     ]  # :contentReference[oaicite:5]{index=5}
+
+    # --- Logging Inputs for S2 ---
+    # We log at DEBUG level for the full markers list to avoid clutter,
+    # but INFO for the summary since it's the "Narrative".
+    logger.debug(
+        f"[{doc_id}] S2 Input Markers: {json.dumps(s1_norm, ensure_ascii=False)}"
+    )
+    if marker_summary:
+        logger.info(
+            f"[{doc_id}] S2 Input Summary: {json.dumps(marker_summary, ensure_ascii=False)}"
+        )
+
+    # ----------------------------------
     sys_p, usr_p = make_s2_prompts(
         text=text,
         s1_spans=s1_norm,
         fewshots=fewshots,
         include_cot=include_cot,
         allow_cant_tell=allow_cant_tell,
+        marker_summary=marker_summary,
     )
     # Fresh agent per document (no .clone() needed)
     agent = create_s2_agent(sys_p, temperature=temperature)
 
     # Provide deps so the validator has authoritative inputs
-    deps = S2Deps(raw_text=text, s1_markers=s1_norm, doc_id=doc_id)
+    deps = S2Deps(
+        raw_text=text, s1_markers=s1_norm, doc_id=doc_id, marker_summary=marker_summary
+    )
 
     # Always run with a clean history for deterministic behavior
     res = await agent.run(usr_p, deps=deps, message_history=[])
     # If 'cant_tell' was disallowed in prompting, the model shouldn't return it;
     # the validator still accepts it, but your caller can downweight/repair if needed.
     return res.output
+
+
+async def run_s2_self_consistent(
+    *,
+    doc_id: str,
+    text: str,
+    s1_output_spans: List[dict],
+    fewshots: Optional[List[dict]] = None,
+    rag_collection: Optional[Collection] = None,  # [NEW]
+    include_cot: bool = True,
+    allow_cant_tell: bool = False,
+    k: int = 5,
+    temperature: float = 0.7,
+    marker_summary: Optional[Dict[str, Any]] = None,
+) -> S2Output:
+    """
+    Self-consistency for S2:
+      - Run S2 k times at non-zero temperature.
+      - Majority vote over labels.
+      - Rationale taken from the first run with the winning label.
+    """
+    if k <= 1:
+        return await run_s2(
+            doc_id=doc_id,
+            text=text,
+            s1_output_spans=s1_output_spans,
+            fewshots=fewshots,
+            rag_collection=rag_collection,  # Pass RAG collection
+            include_cot=include_cot,
+            allow_cant_tell=allow_cant_tell,
+            temperature=temperature,
+            marker_summary=marker_summary,
+        )
+
+    logger.info(f"[{doc_id}] S2-SC: Casting {k} votes (temp={temperature})...")
+
+    # --- Wrapper for a single concurrent run ---
+    async def _single_s2_run(index: int) -> Optional[S2Output]:
+        async with _SC_SEMAPHORE:  # Rate limit protection
+            try:
+                return await run_s2(
+                    doc_id=f"{doc_id}::sc{index+1}",
+                    text=text,
+                    s1_output_spans=s1_output_spans,
+                    fewshots=fewshots,
+                    rag_collection=rag_collection,
+                    include_cot=include_cot,
+                    allow_cant_tell=allow_cant_tell,
+                    temperature=temperature,
+                    marker_summary=marker_summary,
+                )
+            except Exception as e:
+                logger.warning(f"[{doc_id}] S2 Run {index+1} failed: {e}")
+                return None
+
+    # --- Concurrent Execution ---
+    results = await asyncio.gather(*[_single_s2_run(i) for i in range(k)])
+    runs = [r for r in results if r is not None]
+
+    if not runs:
+        logger.error(f"[{doc_id}] S2-SC: All runs failed. Defaulting to 'non'.")
+        return S2Output(label="non", rationale="All SC runs failed.")
+
+    # TODO: Enhance voting logic if needed with multi Agent debate
+    labels = [r.label for r in runs]
+    label_counts = Counter(labels)
+    logger.info(f"[{doc_id}] S2-SC Results: {dict(label_counts)}")
+    top_label, top_count = label_counts.most_common(1)[0]
+
+    # Tie-break: if counts tie (e.g., 2 vs 2), bias conservatively toward "non"
+    # (or just keep first majority if you prefer).
+    # Here we implement "non" bias for exact ties:
+    max_count = max(label_counts.values())
+    candidates = [lab for lab, c in label_counts.items() if c == max_count]
+    if len(candidates) > 1:
+        logger.info(f"[{doc_id}] Tie detected {candidates}. Bias -> non.")
+        if "non" in candidates:
+            top_label = "non"
+        else:
+            # deterministic: pick lexicographically
+            top_label = sorted(candidates)[0]
+
+    logger.success(f"[{doc_id}] S2 Final: {top_label}")
+
+    # Rationale: take first run that produced the chosen label
+    chosen_rationale = next(
+        (r.rationale for r in runs if r.label == top_label),
+        runs[0].rationale,
+    )
+
+    return S2Output(label=top_label, rationale=chosen_rationale)

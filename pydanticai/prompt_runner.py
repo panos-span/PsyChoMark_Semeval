@@ -15,7 +15,7 @@ Usage (examples):
   # JSONL with {"id","text"} rows
   python prompt_runner.py data/dev.jsonl --format jsonl --s1-out s1.jsonl --s2-out s2.jsonl
 
-  # Run only S1 with custom model and region, disable CoT, disable repair
+  # Run only S1 with custom model and region, disable CoT, disable repair 
   python prompt_runner.py input.txt --task s1 --model-id eu.anthropic.claude-sonnet-4-5-20250929-v1:0 \
       --region eu-central-1 --no-cot --no-repair
 
@@ -32,11 +32,12 @@ import os
 import sys
 import json
 import argparse
-import logging
+from loguru import logger
 import random
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pathlib
 from tqdm.auto import tqdm
+from collections import defaultdict
 
 # -----------------------
 # CLI & Environment setup
@@ -44,6 +45,9 @@ from tqdm.auto import tqdm
 
 # --- Make repo root importable ---
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+# Global buffer: Key = doc_id, Value = list of formatted log strings
+LOG_BUFFERS = defaultdict(list)
 
 
 # ---------- .env loader (no deps) ----------
@@ -96,6 +100,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional fewshot bank JSON file (schema-agnostic best-effort).",
     )
     p.add_argument(
+        "--rag-dir", default=None, help="Path to ChromaDB directory for Dynamic RAG."
+    )
+    p.add_argument(
+        "--use-aot",
+        action="store_true",
+        default=True,
+        help="Enable Algorithm of Thought (AoT) for S1 extraction (Scan->Verify->Output).",
+    )
+    p.add_argument(
         "--priors-json", default=None, help="Optional priors JSON file for S1."
     )
     p.add_argument(
@@ -135,15 +148,63 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable local-align repair (validator still enforces equality).",
     )
     p.add_argument(
-        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+        "--log-level", default="DEBUG", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
+    p.add_argument(
+        "--s1-k",
+        type=int,
+        default=1,
+        help="Self-consistency samples for S1 (k). If >1, run S1 k times and majority-vote spans.",
+    )
+    p.add_argument(
+        "--s1-temp",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for S1 (used when s1-k>1).",
+    )
+    p.add_argument(
+        "--s2-k",
+        type=int,
+        default=1,
+        help="Self-consistency samples for S2 (k). If >1, run S2 k times and majority-vote labels.",
+    )
+    p.add_argument(
+        "--s2-temp",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for S2 (used when s2-k>1).",
+    )
+
     return p
 
 
+def buffered_sink(message):
+    """
+    Custom Loguru sink.
+    If a 'doc_id' context exists, buffer the message.
+    Otherwise, print it immediately (global logs).
+    """
+    record = message.record
+    # Retrieve doc_id from the context set by logger.contextualize
+    doc_id = record["extra"].get("doc_id")
+
+    if doc_id:
+        LOG_BUFFERS[doc_id].append(message)
+    else:
+        # If no doc_id context (e.g., startup messages), write to stderr immediately
+        sys.stderr.write(message)
+
+
 def configure_logging(level: str):
-    logging.basicConfig(
-        level=getattr(logging, level),
-        format="%(asctime)s - %(levelname)s - %(message)s",
+    logger.remove()  # Remove default handler
+
+    # Add our buffering sink
+    logger.add(
+        buffered_sink,
+        level=level,
+        # A nice compact format
+        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>",
+        colorize=True,
     )
 
 
@@ -259,7 +320,7 @@ def safe_load_json(path: Optional[str]) -> Any:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        logging.warning("Failed to load %s: %s", path, e)
+        logger.warning(f"Failed to load {path}: {e}")
         return None
 
 
@@ -357,7 +418,7 @@ def repair_s1_spans_with_local_align(
         s = int(m.get("start", 0))
         e = int(m.get("end", 0))
         t = m.get("text", "")
-        label = m.get("label", m.get("type"))
+        # label = m.get("label", m.get("type"))
         s = max(0, min(s, len(raw_text)))
         e = max(s, min(e, len(raw_text)))
         echo = raw_text[s:e]
@@ -365,7 +426,10 @@ def repair_s1_spans_with_local_align(
             hit = local_align_search(raw_text, t, s, e, window)
             if hit:
                 s, e = hit
-        fixed.append({"label": label, "start": s, "end": e, "text": raw_text[s:e]})
+        new_m = m.copy()
+        new_m.update({"startIndex": s, "endIndex": e, "text": raw_text[s:e]})
+        fixed.append(new_m)
+        # fixed.append({"label": label, "start": s, "end": e, "text": raw_text[s:e]})
     return fixed
 
 
@@ -385,39 +449,75 @@ async def run_pipeline_for_doc(
     priors: Optional[dict],
     conflicts: Optional[list],
     fewshot_bank: Optional[Any],
+    # [NEW] RAG Collections
+    s1_rag: Any = None,
+    s2_rag: Any = None,
+    use_aot: bool = True,  # <--- NEW ARG
     task: str,
     agents_mod,
+    s1_k: int,
+    s1_temp: float,
+    s2_k: int,
+    s2_temp: float,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
     Returns (s1_record, s2_record) as JSON-serializable dicts (or None on failure).
     """
     src_text = text
     if not src_text.strip():
-        logging.warning("[%s] Empty text after trim; skipping.", doc_id)
+        logger.warning(f"[{doc_id}] Empty text after trim; skipping.")
         return None, None
 
     # Few-shots (best-effort)
-    s1_fs = pick_s1_fewshots(fewshot_bank, k_total=8)
-    s2_fs = pick_s2_fewshots(fewshot_bank, k_total=10, allow_cant_tell=allow_cant_tell)
+    s1_fs = None if s1_rag else pick_s1_fewshots(fewshot_bank, k_total=8)
+    s2_fs = (
+        None
+        if s2_rag
+        else pick_s2_fewshots(fewshot_bank, k_total=10, allow_cant_tell=allow_cant_tell)
+    )
 
     # ---------------- S1 ----------------
     s1_out = None
     s1_spans_for_s2: List[Dict[str, Any]] = []
+    s1_summary_for_s2: Dict[str, Any] = {}
 
     if task in ("s1", "both"):
         try:
-            s1_struct = await agents_mod.run_s1(
-                doc_id=doc_id,
-                text=src_text,
-                priors=priors or {},
-                conflicts=conflicts or [],
-                fewshots=s1_fs,
-                include_cot=include_cot,
-                temperature=0.0,
-            )
+            # Choose between vanilla and self-consistent S1
+            if s1_k > 1:
+                # Self-consistent S1
+                s1_struct = await agents_mod.run_s1_self_consistent(
+                    doc_id=doc_id,
+                    text=src_text,
+                    priors=priors or {},
+                    conflicts=conflicts or [],
+                    fewshots=s1_fs,
+                    rag_collection=s1_rag,
+                    include_cot=include_cot,
+                    k=s1_k,
+                    temperature=s1_temp,
+                )
+            else:
+                base_s1_struct = await agents_mod.run_s1(
+                    doc_id=doc_id,
+                    text=src_text,
+                    priors=priors or {},
+                    conflicts=conflicts or [],
+                    fewshots=s1_fs,
+                    rag_collection=s1_rag,
+                    include_cot=include_cot,
+                    use_aot=use_aot,  # <--- PASS IT HERE
+                    temperature=s1_temp,
+                )
+                # Wrap into a minimal S1ReviewOutput-like object
+                s1_struct = base_s1_struct
+                s1_struct.summary = []  # type: ignore[attr-defined]
+
             # Convert to plain dict for saving
-            spans = [
-                {
+            # [UPDATE] Persist forensic 'why' and 'context' fields
+            spans = []
+            for s in s1_struct.spans or []:
+                item = {
                     "type": (
                         s.label.value if hasattr(s.label, "value") else str(s.label)
                     ),
@@ -425,8 +525,11 @@ async def run_pipeline_for_doc(
                     "endIndex": int(s.end),
                     "text": s.text,
                 }
-                for s in (s1_struct.spans or [])
-            ]
+                if getattr(s, "why", None):
+                    item["why"] = s.why
+                if getattr(s, "context", None):
+                    item["context"] = s.context
+                spans.append(item)
 
             # Optional local-align repair
             if do_repair and spans:
@@ -434,11 +537,36 @@ async def run_pipeline_for_doc(
                     src_text, spans, window=repair_window
                 )
 
-            s1_out = {"_id": doc_id, "markers": spans}  # <-- exact submission shape
+            # Convert MarkerSummary -> dict[label -> {salience, conspiratoriality, bullets}]
+            marker_summary: Dict[str, Dict[str, Any]] = {}
+            for ms in getattr(s1_struct, "summary", []) or []:
+                lbl = ms.label.value if hasattr(ms.label, "value") else str(ms.label)
+                marker_summary[lbl] = {
+                    "salience": ms.salience,
+                    "conspiratoriality": ms.conspiratoriality,
+                    "bullets": list(ms.bullets or []),
+                }
+
+            # For s1_out (submission) we only want 'type', 'startIndex', 'endIndex', 'text' fields for markers
+            # (no 'why' or 'context')
+            s1_out = {
+                "_id": doc_id,
+                "markers": [
+                    {
+                        "type": m["type"],
+                        "startIndex": m["startIndex"],
+                        "endIndex": m["endIndex"],
+                        "text": m["text"],
+                    }
+                    for m in spans
+                ],
+            }  # <-- exact submission shape
+
             s1_spans_for_s2 = spans
+            s1_summary_for_s2 = marker_summary
 
         except Exception as e:
-            logging.error("[%s] S1 failed: %s", doc_id, e, exc_info=True)
+            logger.exception(f"[{doc_id}] S1 failed: {e}")
             s1_out = {"id": doc_id, "error": f"S1 failed: {e}"}
 
     # ---------------- S2 ----------------
@@ -448,15 +576,31 @@ async def run_pipeline_for_doc(
             # If we didn't just run S1, attempt to keep S2 going with empty spans
             s1_spans_for_s2 = s1_spans_for_s2 or []
 
-            s2_struct = await agents_mod.run_s2(
-                doc_id=doc_id,
-                text=src_text,
-                s1_output_spans=s1_spans_for_s2,
-                fewshots=s2_fs,
-                include_cot=include_cot,
-                allow_cant_tell=allow_cant_tell,
-                temperature=0.0,
-            )
+            if s2_k > 1:
+                # Self-consistent S2
+                s2_struct = await agents_mod.run_s2_self_consistent(
+                    doc_id=doc_id,
+                    text=src_text,
+                    s1_output_spans=s1_spans_for_s2,
+                    fewshots=s2_fs,
+                    include_cot=include_cot,
+                    allow_cant_tell=allow_cant_tell,
+                    k=s2_k,
+                    temperature=s2_temp,
+                    marker_summary=s1_summary_for_s2 or None,
+                )
+            else:
+                s2_struct = await agents_mod.run_s2(
+                    doc_id=doc_id,
+                    text=src_text,
+                    s1_output_spans=s1_spans_for_s2,
+                    fewshots=s2_fs,
+                    include_cot=include_cot,
+                    allow_cant_tell=allow_cant_tell,
+                    temperature=s2_temp,
+                    marker_summary=s1_summary_for_s2 or None,
+                )
+
             s2_out = {
                 "_id": doc_id,
                 "conspiracy": (
@@ -464,7 +608,7 @@ async def run_pipeline_for_doc(
                 ),
             }
         except Exception as e:
-            logging.error("[%s] S2 failed: %s", doc_id, e, exc_info=True)
+            logger.exception(f"[{doc_id}] S2 failed: {e}")
             s2_out = {"id": doc_id, "error": f"S2 failed: {e}"}
 
     return s1_out, s2_out
@@ -488,6 +632,19 @@ async def main_async(args: argparse.Namespace):
     conflicts = safe_load_json(args.conflicts_json) or []
     fewshot_bank = safe_load_json(args.fewshot_bank)
 
+    # Initialize RAG Collections
+    s1_collection = None
+    s2_collection = None
+    if args.rag_dir:
+        try:
+            logger.info(f"Loading RAG artifacts from {args.rag_dir}...")
+            s1_collection = agents_mod.get_rag_collection(args.rag_dir, "s1_markers")
+            s2_collection = agents_mod.get_rag_collection(args.rag_dir, "s2_examples")
+            logger.info("RAG initialized.")
+        except Exception as e:
+            logger.error(f"Failed to init RAG: {e}")
+            sys.exit(1)
+
     # Process docs
     s1_records: List[Dict[str, Any]] = []
     s2_records: List[Dict[str, Any]] = []
@@ -497,30 +654,61 @@ async def main_async(args: argparse.Namespace):
     sem = asyncio.Semaphore(2)  # mild concurrency to keep Bedrock happy
 
     async def _worker(row):
-        async with sem:
-            return await run_pipeline_for_doc(
-                doc_id=row["id"],
-                text=row["text"],
-                allow_cant_tell=args.allow_cant_tell,
-                include_cot=not args.no_cot,
-                do_repair=not args.no_repair,
-                repair_window=args.repair_window,
-                priors=priors,
-                conflicts=conflicts,
-                fewshot_bank=fewshot_bank,
-                task=args.task,
-                agents_mod=agents_mod,
-            )
+        doc_id = row["id"]
+        # Contextualize: All logs inside this block get extra={"doc_id": doc_id}
+        with logger.contextualize(doc_id=doc_id):
+            async with sem:
+                res = await run_pipeline_for_doc(
+                    doc_id=doc_id,
+                    text=row["text"],
+                    allow_cant_tell=args.allow_cant_tell,
+                    include_cot=not args.no_cot,
+                    do_repair=not args.no_repair,
+                    repair_window=args.repair_window,
+                    priors=priors,
+                    conflicts=conflicts,
+                    fewshot_bank=fewshot_bank,
+                    s1_rag=s1_collection,
+                    s2_rag=s2_collection,
+                    task=args.task,
+                    agents_mod=agents_mod,
+                    s1_k=args.s1_k,
+                    s1_temp=args.s1_temp,
+                    s2_k=args.s2_k,
+                    s2_temp=args.s2_temp,
+                    use_aot=args.use_aot,  # Ensure this is passed if you added it to run_pipeline_for_doc
+                )
+                # Return doc_id so we know which buffer to flush
+                return doc_id, res
 
     tasks = [_worker(r) for r in rows]
     # Progress bar over completed documents
     with tqdm(total=len(tasks), desc="Processing docs", unit="doc") as pbar:
+        # as_completed yields futures as they finish (not in order of submission)
         for fut in asyncio.as_completed(tasks):
-            s1_out, s2_out = await fut
-            if s1_out is not None:
-                s1_records.append(s1_out)
-            if s2_out is not None:
-                s2_records.append(s2_out)
+            try:
+                finished_doc_id, (s1_out, s2_out) = await fut
+
+                # --- FLUSH LOGS ATOMICALLY ---
+                if finished_doc_id in LOG_BUFFERS:
+                    # Header for readability
+                    tqdm.write(f"\n--- Logs for {finished_doc_id} ---")
+                    for log_msg in LOG_BUFFERS[finished_doc_id]:
+                        # Write raw message (ANSI codes preserved)
+                        tqdm.write(log_msg, end="")
+                    # Clear memory
+                    del LOG_BUFFERS[finished_doc_id]
+                # -----------------------------
+
+                if s1_out is not None:
+                    s1_records.append(s1_out)
+                if s2_out is not None:
+                    s2_records.append(s2_out)
+
+            except Exception as e:
+                # Fallback for worker crashes
+                tqdm.write(f"Worker crashed: {e}")
+
             pbar.update(1)
 
     # Save
@@ -532,21 +720,18 @@ async def main_async(args: argparse.Namespace):
             zip_name=f"submission_s1_{datetime.now().strftime('_%Y%m%d_%H%M%S')}.zip",
             items=s1_records,
         )
-        logging.info("Wrote S1 outputs: %s (%d rows)", args.s1_out, len(s1_records))
+        logger.info(f"Wrote S1 outputs: {args.s1_out} ({len(s1_records)} rows)")
     if s2_records and args.task in ("s2", "both"):
         save_jsonl(
             file_name="submission.jsonl",
             zip_name=f"submission_s2_{datetime.now().strftime('_%Y%m%d_%H%M%S')}.zip",
             items=s2_records,
         )
-        logging.info("Wrote S2 outputs: %s (%d rows)", args.s2_out, len(s2_records))
+        logger.info(f"Wrote S2 outputs: {args.s2_out} ({len(s2_records)} rows)")
 
     # Summary
-    logging.info(
-        "Done. Docs processed: %d | S1: %d | S2: %d",
-        len(rows),
-        len(s1_records),
-        len(s2_records),
+    logger.info(
+        f"Done. Docs processed: {len(rows)} | S1: {len(s1_records)} | S2: {len(s2_records)}"
     )
 
 

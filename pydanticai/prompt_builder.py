@@ -79,17 +79,19 @@ def data_profile_block() -> str:
 def s2_markers_guidance_block() -> str:
     return """
 <using_s1_markers>
-  - If <extracted_markers> are provided, treat them as noisy *hints* about Actor, Action, Effect, Victim, and Evidence.
-  - They can be incomplete or partially wrong. NEVER decide solely from markers.
-  - ALWAYS base the final label on:
-      (a) the full RAW text, and
-      (b) the authorial stance: endorsing vs. criticizing conspiratorial claims.
-  - Use markers in your *reasoning and rationale*:
-      - For "conspiracy": you may briefly note how Actor/Action/Effect markers support a coordinated, intentional mechanism.
-      - For "non": you may note that markers pick up roles or claims, but the text distances itself (e.g., reports, debunks, or questions them).
-  - In rationales:
-      - Optionally mention markers when they make the reasoning clearer (e.g., "Markers highlight a vague Actor and a grand Effect, matching conspiratorial framing").
-      - Keep rationales short and focused on stance + mechanism, not on listing every marker.
+  - S1 markers highlight candidate roles (Actor, Action, Effect, Victim, Evidence).
+  - They are often triggered by:
+      * ordinary political actions,
+      * local crimes or incidents,
+      * or reported conspiracy claims.
+  - NEVER treat the mere presence of markers as evidence that the document is "conspiracy".
+  - A document is "conspiracy" ONLY if, in the full text:
+      (a) a hidden, coordinated Actor is alleged,
+      (b) an intentional, covert Action is described,
+      (c) and Effects are framed as large-scale or grand stakes,
+      (d) AND the authorial stance endorses or strongly leans toward this mechanism.
+  - When markers appear in texts that merely report, mock, or question conspiracies,
+    you must choose "non".
 </using_s1_markers>
 """.strip()
 
@@ -100,11 +102,112 @@ def build_s1_system(
     conflicts: list[tuple[str, str]] | None = None,
     use_cot: bool = True,
 ) -> str:
+    priors_str = json.dumps(priors or {}, ensure_ascii=False, separators=(",", ":"))
+    conflict_pairs_str = json.dumps(
+        conflicts or [], ensure_ascii=False, separators=(",", ":")
+    )
+
+    header = (
+        psycho_theory_preamble() + "\n" + playbook_block() + "\n" + data_profile_block()
+    )
+
+    # [IMPROVEMENT] Mandate the generation of the 'why' field
+    rationale_instruction = """
+<forensic_mandate>
+  You are a forensic psycholinguist. Your goal is not just to extract spans, but to justify them.
+  For EVERY extracted span, you must populate the "why" field in the output JSON.
+  
+  Criteria for a valid "why":
+  1. CITE THE TRIGGER. Explicitly quote the specific word or phrase in the text that triggers the label (e.g., "The verb 'scheme' implies malicious intent").
+  2. NO TAUTOLOGIES. Never say "It fits the definition." Explain *how* it fits.
+  3. BE PRECISE. If labeling 'Actor', specify if they are 'Specific' or 'Vague/Collective'.
+</forensic_mandate>
+""".strip()
+
+    rules = f"""
+<rules>
+  <evidence_gate>
+    Evidence ONLY if at least ONE holds:
+      (E1) Contains a URL or bare domain/host.
+      (E2) Quoted material WITH attribution verb AND named source.
+      (E3) Numeric fact WITH unit/rates AND named source.
+      (E4) Named-source attribution clause (e.g., "CNN reported").
+      (E5) Inline citation markers (e.g., "[12]").
+    REJECT bare numbers or generic "reports say".
+  </evidence_gate>
+
+  <span_rules>
+    <actor_scope>
+      - CUE: Vague pronouns ("they") or abstract collectives ("the elite", "Big Pharma").
+      - REJECT: Neutral mentions of people/orgs unless they are agents of a conspiratorial Action.
+    </actor_scope>
+
+    <action_scope>
+      - CUE: Intentional agency linked to secrecy, control, or harm ("plot", "engineer", "suppress").
+      - REJECT: Neutral reporting verbs ("announced") unless part of a cover-up.
+    </action_scope>
+
+    <effect_scope>
+      - CUE: Purpose clauses ("to enslave") or high-stakes outcomes ("total control").
+      - ACTION-EFFECT SPLIT: Keep 'Action' as the verb phrase, 'Effect' as the outcome.
+    </effect_scope>
+  </span_rules>
+
+  <overlap_policy>
+    - Ambiguous pairs hint: {conflict_pairs_str}
+    - Prioritize Actor over Victim if ambiguous.
+  </overlap_policy>
+
+  <statistical_priors>
+    {priors_str}
+  </statistical_priors>
+</rules>
+""".strip()
+
+    workflow = ""
+    if use_cot:
+        workflow = """
+<workflow>
+  1) Scan the text for roles: Actor → Action → Effect → Victim → Evidence.
+  2) For each candidate, formulate a mental "forensic rationale" (why does this fit?).
+  3) If you cannot formulate a rationale based on specific cues, drop the span.
+  4) Apply <evidence_gate> strictness.
+  5) Format output with verbatim text and your rationale.
+</workflow>""".strip()
+
+    output_contract = """
+<output_contract>
+  Return a JSON object with a "spans" list. 
+  Each span must have: {label, text, start, end, why, context}.
+  "text" and "context" must be verbatim substrings from the RAW text.
+</output_contract>
+""".strip()
+
+    return (
+        header
+        + "\n\n"
+        + rationale_instruction
+        + "\n"
+        + rules
+        + ("\n" + workflow if workflow else "")
+        + "\n"
+        + output_contract
+    ).strip()
+
+
+# ---------------------------------------------------------------------
+# NEW: AoT System Prompt Builder
+# ---------------------------------------------------------------------
+
+
+def build_s1_system_aot(
+    priors: dict | None = None,
+    conflicts: list[tuple[str, str]] | None = None,
+) -> str:
     """
-    Pydantic-AI mode:
-      - No JSON schema / <answer> formatting rules (handled by output_type).
-      - Single inclusion of theory + playbook.
-      - Domain guidance only (Evidence gate, Action↔Effect split, overlap policy, priors).
+    Algorithm of Thought (AoT) System Prompt.
+    Forces a 4-step scan strategy to boost Macro-F1 on rare classes.
+    Incorporates statistical priors to guide the model.
     """
     priors_str = json.dumps(priors or {}, ensure_ascii=False, separators=(",", ":"))
     conflict_pairs_str = json.dumps(
@@ -115,108 +218,60 @@ def build_s1_system(
         psycho_theory_preamble() + "\n" + playbook_block() + "\n" + data_profile_block()
     )
 
+    # The Core Algorithm Instruction
+    algorithm_block = """
+<algorithm_of_thought>
+  To ensure high Macro-F1 (detecting rare classes), you must follow this SEARCH ALGORITHM:
+
+  1. **ACTOR SCAN**: Scan the text specifically for entities (people, groups, vague "they") that are alleged to be *conspiring* or acting in secret.
+  2. **ACTION SCAN**: Look for verbs of manipulation, secrecy, or malevolent control attached to those Actors.
+  3. **EFFECT/VICTIM SCAN**: Look for the *outcomes* (grand scale, negative) and the *targets* (the innocent, the public).
+  4. **EVIDENCE SCAN**: Look for "epistemic" markers (links, "do your research", appeals to authority).
+
+  For each step, list candidate spans in your thought trace, then verify them against definitions.
+  Only after completing the scan, populate the `final_spans` list.
+</algorithm_of_thought>
+""".strip()
+
     rules = f"""
 <rules>
   <evidence_gate>
     Evidence ONLY if at least ONE holds:
-      (E1) Contains a URL or bare domain/host (e.g., http(s)://…, example.com, @handle).
+      (E1) Contains a URL or bare domain/host.
       (E2) Quoted material WITH attribution verb AND named source.
       (E3) Numeric fact WITH unit/rates AND named source.
-      (E4) Named-source attribution clause without a URL/quote (e.g., "the SEC said", "CNN reported", "Reuters: …") — span must include the named source + reporting verb.
-      (E5) Inline citation markers that name a specific outlet or document (e.g., “[SEC 2021]”, “(WHO, 2020)”) — keep the entire marker as the Evidence span.
-
-    Forbidden as Evidence:
-      - Bare numbers without units/source.
-      - Generic attributions without a named source (e.g., "reports say", "it is said").
-      - Organization names alone without an attribution or factual content.
-
-    When selecting Evidence, prefer the smallest span that still includes the qualifying feature(s).
+      (E4) Named-source attribution clause.
+      (E5) Inline citation markers.
   </evidence_gate>
 
   <span_rules>
-    - Keep spans token-tight; include particles only if integral (e.g., "set up", "cover up").
-    - Prefer minimal spans that still fully express the role.
-
-    <actor_scope>
-      - An Actor MUST be the agent of a conspiratorial Action.
-      - CUE: vague pronouns or abstract collectives ("they", "the elite", "globalists", "big pharma").
-      - ALLOW: specific people/orgs (e.g., "the CDC", "Bill Gates") as Actors ONLY when they are subjects of intentional conspiratorial Actions.
-      - REJECT: neutral mentions of people/orgs in purely descriptive or reporting contexts.
-    </actor_scope>
-
-    <victim_scope>
-      - A Victim MUST be the entity harmed/targeted by an Action.
-      - Reject substrings that are just part of an Action noun (e.g., "child" from "child trafficking").
-      - Allow Victim inside an Action only if it's a clear NP object (e.g., "our children", "13-year-olds").
-      - CUE: first-person plural and in-group collectives ("we", "us", "our", "the people", "our children", "patriots").
-      - CHECK: Prefer spans functioning as the object/indirect object of an Action.
-    </victim_scope>
-
-    <action_scope>
-      - Action MUST denote intentional agency linked to secrecy/control/hostility/harm.
-      - Reject neutral/descriptive reporting verbs ("announced", "reported", "said", "posted", "went") UNLESS they are part of an alleged scheme/cover-up/intentional harm.
-      - If a clause contains both an intentional verb and a reporting verb, choose the intentional act as Action and relegate attribution to Evidence (per the gate).
-    </action_scope>
+    <actor_scope>CUE: Vague pronouns ("they") or abstract collectives.</actor_scope>
+    <action_scope>CUE: Intentional agency linked to secrecy/control/harm.</action_scope>
+    <effect_scope>CUE: Purpose clauses ("to enslave") or high-stakes outcomes.</effect_scope>
   </span_rules>
 
-  <action_effect_split>
-    - Action = what is done (verb phrase).
-    - Effect = consequence/purpose/result (often NP or "to …"/"so that …").
-    - CUE: Effects are frequently purpose clauses ("to …", "in order to …", "so that …") OR catastrophic/high-stakes noun phrases functioning as the object of an Action ("total control", "enslavement", "the great reset").
-    - Do not merge Action and Effect; split off purpose/result clauses as Effect.
-  </action_effect_split>
-
   <overlap_policy>
-    - Forbid Actor <-> Victim overlaps; if uncertain, prefer Actor unless Victim clearly superior.
-    - Allow short Victim NP inside Action; keep both if well-formed.
-    - Evidence may overlap others only if part of a quote/citation per <evidence_gate>.
     - Ambiguous pairs hint: {conflict_pairs_str}
+    - Prioritize Actor over Victim if ambiguous.
   </overlap_policy>
 
   <statistical_priors>
+    Use these priors as soft guidance for likelihood of certain labels in ambiguous contexts:
     {priors_str}
   </statistical_priors>
-  
-  <marker_noise_guidance>
-   - Human marker annotations can be noisy: short or ambiguous spans exist.
-   - In few-shots, trust the label but focus on prototypical uses (clear agents, actions, effects, and explicit evidence).
-  </marker_noise_guidance>
-
-
-  <notes>
-    - Choose exact substrings first; offsets will be auto-filled from your text.
-    - Don't over-mark generic function words.
-    - If a label is absent, output none for that label.
-  </notes>
 </rules>
 """.strip()
 
-    workflow = ""
-    if use_cot:
-        workflow = """
-<workflow>
-  1) Scan roles: Actor, Action, Effect, Victim; then explicitly scan for Evidence.
-  2) Apply <evidence_gate>.
-  3) Enforce <action_effect_split>.
-  4) Tighten boundaries; keep particles only if integral.
-  5) Apply <overlap_policy>.
-</workflow>""".strip()
-
     output_contract = """
-<verbatim_rule>
-  Every span's "text" MUST be a verbatim substring of <text_to_analyze>.
-  DO NOT paraphrase, summarize, or invent. Copy exact characters from RAW.
-</verbatim_rule>
-<output_contract>Provide verbatim text</output_contract>
+<output_contract>
+  Your output must follow the `AoTResponse` schema:
+  1. `strategy`: A list of analysis steps showing your work.
+  2. `final_spans`: The final cleaned list of spans with `why` rationales.
+</output_contract>
 """.strip()
 
     return (
-        header
-        + "\n"
-        + rules
-        + ("\n" + workflow if workflow else "")
-        + "\n"
-        + output_contract
+        header + "\n\n" + algorithm_block + "\n" + rules + "\n" + output_contract
     ).strip()
 
 
@@ -501,14 +556,11 @@ def build_s2_prompts_adapter(
 def build_s2_system(
     *,
     include_cot: bool = True,
+    allow_cant_tell: bool = False,  # Kept for compat
+    policy_text: str = None,
+    boundary_note: str = None,
+    prompt_arts: dict = None,
 ) -> str:
-    """
-    Pydantic-AI mode for S2 (document-level classification):
-      - No JSON schema here; output type is enforced by the agent.
-      - Single inclusion of theory + playbook (re-uses S1 helpers).
-      - Strong boundary rules to reduce false positives.
-      - Explicit guidance on using S1 markers as *evidence*, not as the label itself.
-    """
     labels = ["conspiracy", "non"]
 
     header = (
@@ -519,81 +571,51 @@ def build_s2_system(
 <classification_policy>
   <labels>Choose exactly one: {", ".join(labels)}.</labels>
 
+  <core_task>
+    You will receive a <marker_summary> (the "Plot") and the RAW text.
+    Your job is to determine the AUTHOR'S STANCE toward that Plot.
+    
+    The logic is simple:
+    1. Does the text describe a secret plot by powerful actors? (Check Markers)
+    2. If YES, does the author BELIEVE it? (Check Stance)
+       - YES (Endorsement/Warning/Outrage) -> LABEL: conspiracy
+       - NO (Debunking/Reporting/Mocking) -> LABEL: non
+  </core_task>
+
   <positive_cues_for_conspiracy>
-    - Coordinated, secretive, or omnipotent Actor(s) alleged to direct events (e.g., "deep state", "globalists", "big pharma", named cabals).
-    - Intentional Action of control/cover-up/engineering/weaponization; not mere reporting.
-    - Effects framed as extreme stakes or grand plans (enslavement, depopulation, total control).
-    - Self-sealing epistemics: counter-evidence rebranded as disinformation/cover-up; "do your own research"/"connect the dots".
-    - Narrative glue: multi-event linkage into a single hidden plot (e.g., tying unrelated crises to one cabal).
+    - **Endorsement:** The author treats the plot as a hidden truth ("We must wake up", "They are hiding this").
+    - **Cheater Detection:** Anger directed at rule-breakers ("The elite are cheating us").
+    - **Epistemic Closure:** "Do your own research", "Mainstream media lies".
   </positive_cues_for_conspiracy>
 
   <negative_cues_non>
-    - Straight reporting, quotations, or debate without endorsing conspiratorial mechanism.
-    - Ordinary skepticism, policy critique, or corruption claims limited to documented facts without secret coordination claims.
-    - Mere name-dropping of entities or URLs without conspiratorial frame.
-    - Satire/irony where conspiracist content is lampooned or explicitly rejected.
+    - **Reporting:** "Users on X are claiming that..." (Attribution to others).
+    - **Debunking:** "There is no evidence for..."
+    - **Mockery:** "Look at this crazy theory."
+    - **Just Asking Questions:** If the text asks questions *without* providing the conspiratorial answer, default to "non".
   </negative_cues_non>
 
-  <ambiguous_and_edge_cases>
-    - Questions-as-accusations ("Is X running Y?") count *only if* the text supplies hidden coordination/intent as the explanation; otherwise treat as non.
-    - Lists of allegations with sources: label depends on whether a hidden coordination mechanism is asserted/assumed.
-    - Reporting-on-conspiracy: if the authorial voice is clearly descriptive/critical, prefer "non".
-    - If evidence is fragmentary and the mechanism is implied but not stated, and you cannot infer intent/coordination from context: treat as "non" (gold labels are noisy—be conservative).
-  </ambiguous_and_edge_cases>
-
   <using_s1_markers>
-    - S1 spans (Actor/Action/Effect/Victim/Evidence) are noisy clues, not labels.
-    - Always decide the final label from the full document and the authorial stance,
-      even when S1 markers are present.
-    - A doc is "conspiracy" when S1 spans jointly instantiate a conspiratorial *mechanism*:
-        Actor (cabal/agent) + Action (intentional secrecy/control/hostility) -> Effect (grand outcome),
-      optionally supported by Evidence spans.
-    - Isolated Victim/Evidence spans without a coordinated Action+Actor do not suffice.
+    - The <marker_summary> synthesizes the extracted roles into a narrative.
+    - IF the summary says "No coherent narrative": The text is likely "non" unless it uses subtle dog-whistles.
+    - IF the summary describes a Grand Plot: Check the text for ENDORSEMENT.
+      * Example: Summary says "Gates poisoning water". Text says "Idiots think Gates poisoning water." -> Label: NON.
   </using_s1_markers>
 
-
-  <tie_breakers>
-    - If cues conflict: require both intentional Action and coordinated Actor for "conspiracy".
-    - If only one is present or stance is unclear: choose "non".
-  </tie_breakers>
-  
-  <annotation_uncertainty>
-   - Gold labels come from multiple crowd annotators (Krippendorff's alpha around 0.58).
-   - Treat borderline cases conservatively: avoid over-interpreting vague language as conspiratorial.
-   - A single suggestive phrase does not suffice: look for a coherent mechanism and stance.
-  </annotation_uncertainty>
-
   <rationale_guidance>
-    - Provide 1-2 short sentences naming decisive cues (e.g., "alleges secret coordination by X; frames Y as intentional cover-up").
-    - Do not summarize the whole document; cite the cues, not long quotes.
+    - Your rationale must explicitly name the STANCE. 
+    - Format: "Author [endorses/reports/debunks] the claim that [Mechanism]."
   </rationale_guidance>
 </classification_policy>
 """.strip()
 
-    cot = (
-        """
-<workflow>
-  1) Scan for S1-style roles in the doc (Actor, Action, Effect, Victim, Evidence).
-  2) Check if Actor+Action imply hidden coordination/intentionality -> if yes, identify Effect scale.
-  3) Apply boundary rules (reporting vs endorsing; satire; ordinary critique).
-  4) Decide label using <tie_breakers>.
-  5) Write a compact rationale naming the decisive cues (no summaries).
-</workflow>
-""".strip()
-        if include_cot
-        else ""
-    )
-
     output_contract = """
 <output_contract>
-  - Output the single label only (the agent's output validator handles schema).
-  - Keep rationale concise and focused on cues (when rationale is requested downstream).
+  Select the label that best fits the authorial intent.
 </output_contract>
 """.strip()
 
-    return (
-        header + "\n" + policy + ("\n" + cot if cot else "") + "\n" + output_contract
-    ).strip()
+    return (header + "\n" + policy + "\n" + output_contract).strip()
 
 
 def build_s2_user(
@@ -602,27 +624,37 @@ def build_s2_user(
     s1_output: List[dict] | None,
     s2_fewshots: List[dict] | None = None,
     include_cot: bool = False,
+    marker_summary: Dict[str, List[str]] | None = None,
 ) -> str:
     """
-    Pydantic-AI mode:
-      - Embed RAW text and normalized S1 markers as evidence.
-      - Few-shots contain {label, rationale} only (compact).
+    Updated to render 'marker_summary' in few-shot examples.
     """
+    import json
+
     raw = text_input or ""
 
+    # -------- Few-shot examples (with markers AND summary) --------
     examples_xml = ""
     if s2_fewshots:
-        ex_parts = []
+        ex_parts: List[str] = []
         valid = {"conspiracy", "non"}
         for ex in s2_fewshots:
             lab = str(ex.get("label", "")).lower()
             if lab not in valid:
                 continue
 
-            rationale = ex.get("rationale", "")
-            etext = ex.get("text", "")
+            rationale = str(ex.get("rationale", "") or "").strip()
+            if not rationale:
+                if lab == "conspiracy":
+                    rationale = (
+                        "The author endorses a hidden, coordinated conspiracy..."
+                    )
+                else:
+                    rationale = "The author does not endorse a hidden conspiracy..."
 
-            # NEW: optional markers per S2 few-shot (aligned S1 spans)
+            etext = (ex.get("text") or ex.get("doc_text") or "").strip()
+
+            # 1. Markers
             markers = ex.get("markers") or []
             markers_block = ""
             if markers:
@@ -632,34 +664,40 @@ def build_s2_user(
                     )
                     markers_block = f"<markers>{markers_json}</markers>"
                 except Exception:
-                    # If something is off with markers serialization, just skip them
                     markers_block = ""
 
+            # 2. [NEW] Marker Summary (Narrative)
+            summary_block = ""
+            msum = ex.get("marker_summary")
+            if msum:
+                if isinstance(msum, (dict, list)):
+                    msum = json.dumps(msum, ensure_ascii=False)
+                summary_block = f"<marker_summary>{msum}</marker_summary>"
+
             ex_parts.append(
-                "<example>"
-                f"<label>{lab}</label>"
-                f"<rationale>{rationale}</rationale>"
-                f"<text>{etext}</text>"
-                f"{markers_block}"
+                "<example>\n"
+                f"<label>{lab}</label>\n"
+                f"{markers_block}\n"
+                f"{summary_block}\n"
+                f"<rationale>{rationale}</rationale>\n"
+                f"<text>{etext}</text>\n"
                 "</example>"
             )
 
         if ex_parts:
             examples_xml = "<few_shots>\n" + "\n".join(ex_parts) + "\n</few_shots>"
 
-    cot_hint = (
-        """
+    # -------- Light CoT hint --------
+    cot_hint = ""
+    if include_cot:
+        cot_hint = """
 <thinking>
-    - Do S1-style scan; is there Actor+Action implying hidden coordination? Identify Effect scale.
-    - If only one of Actor/Action is present or stance is reporting/satire -> prefer non.
-    - State 1 cue that decides the label.
-    (Max 2 sentences; do NOT quote the document.)
+  - Read the full document and infer the AUTHOR'S stance.
+  - Only label "conspiracy" if both mechanism and endorsement are present.
 </thinking>
-        """.strip()
-        if include_cot
-        else ""
-    )
+""".strip()
 
+    # -------- Current document's S1 markers --------
     markers_xml = "<extracted_markers>[]</extracted_markers>"
     if s1_output:
         markers_xml = (
@@ -667,6 +705,19 @@ def build_s2_user(
             + json.dumps(s1_output, ensure_ascii=False, separators=(",", ":"))
             + "\n</extracted_markers>"
         )
+
+    # Current document's summary
+    summary_xml = "<marker_summary>[]</marker_summary>"
+    if marker_summary:
+        try:
+            val = (
+                json.dumps(marker_summary, ensure_ascii=False)
+                if isinstance(marker_summary, (dict, list))
+                else str(marker_summary)
+            )
+            summary_xml = f"<marker_summary>\n{val}\n</marker_summary>"
+        except Exception:
+            summary_xml = "<marker_summary>[]</marker_summary>"
 
     return f"""
 {examples_xml}
@@ -676,6 +727,7 @@ def build_s2_user(
 </text_to_analyze>
 
 {markers_xml}
+{summary_xml}
 """.strip()
 
 
@@ -733,18 +785,34 @@ def extract_answer_json(x):
 # ---- Utilities (shared) ----
 def to_s2_marker(m: dict, txt: str) -> dict:
     """
-    Normalize an S1-style span (label/start/end[/text]) into the S2 schema:
-      {"type","startIndex","endIndex","text"}
-    - Clips to bounds
-    - Recomputes 'text' slice from offsets (ignores any echoed text)
+    Normalize an S1-style span into the S2 schema while PRESERVING metadata.
+
+    Preserves: 'why', 'context', and any other keys in 'm'.
+    Updates: 'text' (re-sliced), 'startIndex', 'endIndex', 'type'.
     """
+    # 1. Calculate strictly bound offsets
     s = int(m.get("start", m.get("startIndex", 0)))
     e = int(m.get("end", m.get("endIndex", s)))
     s = max(0, min(s, len(txt)))
     e = max(s, min(e, len(txt)))
-    return {
-        "type": (m.get("type") or m.get("label")),
-        "startIndex": s,
-        "endIndex": e,
-        "text": txt[s:e],
-    }
+
+    # 2. Start with a COPY of the input to keep 'why', 'context', etc.
+    out = m.copy()
+
+    # 3. Update/Overwrite with normalized S2 fields
+    out.update(
+        {
+            "type": (m.get("type") or m.get("label")),
+            "startIndex": s,
+            "endIndex": e,
+            "text": txt[s:e],  # Enforce text matches offsets exactly
+        }
+    )
+
+    # 4. (Optional) cleanup legacy S1 keys to avoid confusion,
+    # but keep 'why' and 'context'
+    out.pop("start", None)
+    out.pop("end", None)
+    out.pop("label", None)
+
+    return out

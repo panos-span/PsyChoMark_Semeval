@@ -9,3 +9,20 @@ uv run pydanticai/prompt_runner.py `
    --repair-window 16 `
    --log-level INFO `
    --seed 42 `
+
+uv run pydanticai/prompt_runner.py `
+  "data/raw/dev_rehydrated.jsonl" `
+  --task both `
+  --fewshot-bank "data/fewshots/psycomark_fewshots_f1_022_17_11_2025.json" `
+  --priors-json "data/derived/psycomark_official_split_20251022_192733/prompt_artifacts.json" `
+  --conflicts-json "data/derived/psycomark_official_split_20251022_192733/prompt_artifacts.json" `
+  --s1-out "subs_pydanticai/s1_predictions.jsonl" `
+  --s2-out "subs_pydanticai/s2_predictions.jsonl" `
+  --repair-window 64 `
+  --log-level INFO `
+  --seed 42 `
+  --use-aot `
+  --s1-k 3 `
+  --s1-temp 0.7 `
+  --s2-k 3 `
+  --s2-temp 0.7
