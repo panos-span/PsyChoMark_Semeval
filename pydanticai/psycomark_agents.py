@@ -37,6 +37,8 @@ from prompt_builder import (
     build_s1_user,
     build_s2_system,
     build_s2_user,
+    build_s2_system_rex,
+    build_s2_user_rex,
 )
 import chromadb
 from chromadb import Collection
@@ -322,6 +324,15 @@ class MarkerSummary(BaseModel):
         return v[:3]
 
 
+class SummaryOnlyOutput(BaseModel):
+    summary: List[MarkerSummary] = Field(default_factory=list)
+    # [NEW] Explicit Stance Analysis field
+    authorial_stance: str = Field(
+        ...,
+        description="1 sentence analyzing if the author ENDORSES or DISTANCES themselves from the markers.",
+    )
+
+
 class S1ReviewOutput(BaseModel):
     """
     Output of the S1 self-consistency reviewer:
@@ -553,11 +564,81 @@ def create_s1_agent(
     return agent
 
 
+# --- [NEW] Verifier Wrapper for the Reviewer ---
+async def s1_review_verifier_impl(
+    ctx: RunContext[S1ReviewDeps], output: S1ReviewOutput
+) -> S1ReviewOutput:
+    """
+    Wraps the standard S1 verifier to validate the Reviewer's output.
+    Ensures the 'merged' spans actually exist in the raw text.
+    """
+    # 1. Create a dummy S1Deps to reuse the heavy-duty verifier logic
+    # (Both deps classes have 'raw_text' and 'doc_id')
+    temp_deps = S1Deps(raw_text=ctx.deps.raw_text, doc_id=ctx.deps.doc_id)
+
+    # 2. Mock a context for the verifier
+    # We create a new context with the adapted deps
+    from pydantic_ai.models import ModelResponse
+
+    # We can't easily mock the full RunContext, so we'll just extract the logic we need.
+    # REFACTOR: We call the internal logic of s1_verifier_impl by checking the raw text manually here
+    # or by refactoring s1_verifier_impl.
+    # EASIER PATH: Let's just run the core cleaning logic here directly.
+
+    RAW = ctx.deps.raw_text
+    spans_in = output.spans
+
+    # Reuse the shared helper _find_best_span from this file
+    cleaned = []
+    seen = set()
+    from collections import defaultdict
+
+    assigned_count = defaultdict(int)  # simplistic nth tracking for reviewer
+
+    for m in spans_in:
+        label = m.label
+        snippet = m.text or ""
+
+        # Locate in RAW
+        hit = _find_best_span(
+            RAW, snippet, nth=0
+        )  # Default to first hit for reviewer output
+        if not hit:
+            # Try to recover: Reviewer might have hallucinated a char.
+            # If standard locate fails, we drop it (Strict High Precision).
+            continue
+
+        s, e = hit
+
+        # Deduplicate
+        key = (label, s, e)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Snap text to RAW to be safe
+        text_in_raw = RAW[s:e]
+
+        cleaned.append(
+            S1Span(
+                label=label,
+                text=text_in_raw,
+                start=s,
+                end=e,
+                why=m.why,
+                context=m.context,
+            )
+        )
+
+    return S1ReviewOutput(spans=cleaned, summary=output.summary)
+
+
+# --- [UPDATED] Reviewer Agent Factory ---
 def create_s1_reviewer_agent(
     system_prompt: str, temperature: float = 0.0
 ) -> Agent[S1ReviewDeps, S1ReviewOutput]:
     """
-    Fresh S1 reviewer agent; same pattern as create_s1_agent but different output_type.
+    Fresh S1 reviewer agent with VALIDATION attached.
     """
     agent = Agent(
         LLM,
@@ -568,6 +649,14 @@ def create_s1_reviewer_agent(
         output_retries=4,
         model_settings=ModelSettings(temperature=temperature),
     )
+
+    # Attach the verifier! This is the "Extra Agent" logic.
+    @agent.output_validator
+    async def _bound_review_validator(
+        ctx: RunContext[S1ReviewDeps], output: S1ReviewOutput
+    ) -> S1ReviewOutput:
+        return await s1_review_verifier_impl(ctx, output)
+
     return agent
 
 
@@ -577,51 +666,82 @@ def make_s1_review_prompts(
     candidate_sets: List[List[Dict[str, Any]]],
 ) -> Tuple[str, str]:
     """
-    Upgraded Reviewer: Acts as a Critic/Refiner over K AoT candidates.
+    Upgraded Reviewer: Includes "Boundary Specialist" heuristics to resolve minor overlaps.
     """
-    # Reuse base system to keep definitions aligned
     base_system = build_s1_system(priors=None, conflicts=None, use_cot=True)
 
-    # Inject the Critic-Refiner Rubric
-    review_block = """
-<critic_refiner_mandate>
-  You are an expert Forensic Reviewer (Critic & Refiner).
-  You have received K candidate extraction sets from independent analysis runs.
+    adjudicator_block = """
+<adjudication_protocol>
+  You are an expert **Forensic Adjudicator**. Your job is to resolve disagreements between multiple extraction runs.
   
-  Your Goal: Synthesize a single, high-fidelity JSON output.
+  **Input Format:**
+  You will receive candidates **GROUPED BY LABEL**.
+  
+  **Phase 1: Cluster & Vote**
+  - Identify spans referring to the same entity (e.g. "the deep state", "deep state").
+  - If a cluster has support from ≥ 2 runs, **KEEP IT**.
+  - If a cluster has support from 1 run, check the 'Why'. If valid, **KEEP IT** (High Recall).
 
-  <critique_rubric>
-    For every extracted span in the candidates, apply this filter:
-    1. **Hallucination Check:** Is the text strictly present in the RAW document? (Reject if not).
-    2. **Definition Check:** Does it actually fit the specific Role definition? (e.g., Reject neutral actors).
-    3. **Boundary Accuracy:** Is the span precise? 
-       - REJECT: "the shadowy figures" (includes unnecessary determiner)
-       - ACCEPT: "shadowy figures"
-    4. **Consensus Signal:** If multiple candidates found this span, it is likely valid. If only one found it, scrutinize its 'why' rationale deeply.
-  </critique_rubric>
+  **Phase 2: Boundary Resolution (The Specialist)**
+  When Runs disagree on the exact boundaries (e.g. Run 1: "the cabal", Run 2: "cabal"), apply these RULES to pick the winner:
+  
+  1. **The Determiner Rule (Actors/Victims):**
+     - REJECT leading determiners (a, an, the) unless part of a proper name.
+     - *Example:* "the elite" vs "elite" -> WINNER: "elite".
+     
+  2. **The Completeness Rule (Actions):**
+     - PREFER the span that includes the full verb phrase but excludes the subject/object if possible.
+     - *Example:* "plotting" vs "is plotting" -> WINNER: "plotting".
+     - *Example:* "plotting against us" vs "plotting" -> WINNER: "plotting" (Keep it tight).
+     
+  3. **The Punctuation Rule:**
+     - REJECT trailing punctuation.
+     - *Example:* "corruption." vs "corruption" -> WINNER: "corruption".
 
-  <refinement_strategy>
-    - Aggressively MERGE duplicates (prioritize the tightest valid boundary).
-    - RESOLVE conflicts (e.g., if one run says 'Action' and another 'Effect', use the Context to decide).
-    - PRESERVE the best 'why' rationale from the candidates or synthesize a better one.
-  </refinement_strategy>
-</critic_refiner_mandate>
+  **Phase 3: Imputation**
+  - If a selected span has `why: null`, you MUST write a forensic rationale for it based on the context. Never output null.
+</adjudication_protocol>
 
-<summary_style>
-  (Keep the existing summary style instructions here...)
-</summary_style>
+<output_formatting>
+  Return the final list. **The 'text' field must be an EXACT substring of the raw text.**
+</output_formatting>
 """.strip()
 
-    system_prompt = base_system + "\n\n" + review_block
+    system_prompt = base_system + "\n\n" + adjudicator_block
+
+    # Python-Side Grouping (Label-First)
+    grouped_candidates = defaultdict(list)
+    for run_idx, span_set in enumerate(candidate_sets):
+        for span in span_set:
+            lbl = span.get("label", "Unknown")
+            span_entry = {
+                "text": span.get("text"),
+                "run_id": run_idx + 1,
+                "why": span.get("why"),
+            }
+            grouped_candidates[lbl].append(span_entry)
+
+    candidates_str = ""
+    for label in sorted(grouped_candidates.keys()):
+        candidates_str += f"\n=== Candidates for LABEL: {label} ===\n"
+        # Sort by text length so "elite" and "the elite" are close
+        spans_in_group = grouped_candidates[label]
+        spans_in_group.sort(key=lambda x: x["text"])
+
+        for cand in spans_in_group:
+            rationale = cand["why"] or "MISSING"
+            candidates_str += (
+                f"- \"{cand['text']}\" (Run {cand['run_id']}) | Why: {rationale}\n"
+            )
 
     user_prompt = f"""
 <text_to_analyze>
 {text}
 </text_to_analyze>
 
-<candidate_marker_sets>
-{json.dumps(candidate_sets, ensure_ascii=False, separators=(",", ":"))}
-</candidate_marker_sets>
+<grouped_candidates>
+{candidates_str}
+</grouped_candidates>
 """.strip()
 
     return system_prompt, user_prompt
@@ -767,7 +887,18 @@ async def s1_verifier_impl(ctx: RunContext[S1Deps], output: S1Output) -> S1Outpu
             continue
         seen.add(k2)
 
-        cleaned.append(S1Span(label=label, text=slice_txt, start=s, end=e))
+        # [CRITICAL UPDATE] Ensure 'why' is passed through, even if None
+        # The Reviewer will fix None values later.
+        cleaned.append(
+            S1Span(
+                label=label,
+                text=slice_txt,
+                start=s,
+                end=e,
+                why=m.why,  # Pass through original rationale
+                context=m.context,
+            )
+        )
         if dbg:
             logger.debug(
                 f"[s1_verifier_impl] #{i} kept [locate_by_text] {label} ({s},{e})='{slice_txt[:80]}'"
@@ -1154,6 +1285,9 @@ async def run_s1_self_consistent(
     logger.info(
         f"[{doc_id}] Reviewer: Critiquing {len(runs)} sets containing {total_spans} raw spans..."
     )
+    logger.debug(
+        f"[{doc_id}] Candidate Sets: {json.dumps(candidate_sets, ensure_ascii=False)}"
+    )
 
     # --- Step 3: call reviewer agent to merge + summarize ---
     sys_p, usr_p = make_s1_review_prompts(text=text, candidate_sets=candidate_sets)
@@ -1170,6 +1304,9 @@ async def run_s1_self_consistent(
     final_count = len(res.output.spans)
     logger.success(
         f"[{doc_id}] Reviewer: Consensus reached. Refined {total_spans} raw spans -> {final_count} final markers."
+    )
+    logger.debug(
+        f"[{doc_id}] Final Spans: {json.dumps([sp.dict() for sp in res.output.spans], ensure_ascii=False)}"
     )
     return res.output  # S1ReviewOutput
 
@@ -1211,17 +1348,31 @@ def make_s2_prompts(
     include_cot: bool = True,
     allow_cant_tell: bool = False,
     marker_summary: Optional[Dict[str, List[str]]] = None,
+    strategy: str = "standard",  # <--- NEW ARG
 ) -> Tuple[str, str]:
-    """(system,user) identical to your adapter. :contentReference[oaicite:4]{index=4}"""
-    sys_p = build_s2_system(include_cot=include_cot)
-    usr_p = build_s2_user(
-        text_input=text,
-        s1_output=s1_spans,
-        s2_fewshots=fewshots or [],
-        include_cot=include_cot,
-        marker_summary=marker_summary,
-    )
-    return sys_p, usr_p
+
+    if strategy == "rex":
+        # ReX-GoT Strategy (Single Prompt)
+        sys_p = build_s2_system_rex()
+        usr_p = build_s2_user_rex(
+            text_input=text,
+            s1_output=s1_spans,
+            marker_summary=marker_summary,
+            fewshots=fewshots,  # ReX now accepts fewshots
+        )
+        return sys_p, usr_p
+
+    else:
+        # Standard
+        sys_p = build_s2_system(include_cot=include_cot)
+        usr_p = build_s2_user(
+            text_input=text,
+            s1_output=s1_spans,
+            s2_fewshots=fewshots or [],
+            include_cot=include_cot,
+            marker_summary=marker_summary,
+        )
+        return sys_p, usr_p
 
 
 def create_s2_agent(
@@ -1252,11 +1403,14 @@ async def run_s2(
     allow_cant_tell: bool = False,
     temperature: float = 0.0,
     marker_summary: Optional[Dict[str, Any]] = None,
+    strategy: str = "standard",
 ) -> S2Output:
-    # [NEW] Dynamic Retrieval Logic
+
+    # [UPDATED] Dynamic Retrieval Logic for ReX vs Standard
     if rag_collection and not fewshots:
-        # S2 benefits from fewer, highly specific examples (k=5 is often better than 8)
-        fewshots = retrieve_fewshots(rag_collection, text, k=8)
+        # ReX uses fewer but more targeted examples due to verbose prompt
+        k_val = 6 if strategy == "rex" else 8
+        fewshots = retrieve_fewshots(rag_collection, text, k=k_val)
     # Ensure S1 spans are in S2 schema (startIndex/endIndex/text)
     s1_norm = [
         to_s2_marker(m, text) for m in (s1_output_spans or [])
@@ -1281,9 +1435,12 @@ async def run_s2(
         include_cot=include_cot,
         allow_cant_tell=allow_cant_tell,
         marker_summary=marker_summary,
+        strategy=strategy,
     )
     # Fresh agent per document (no .clone() needed)
-    agent = create_s2_agent(sys_p, temperature=temperature)
+    # ReX benefits from slight creativity for reasoning
+    temp = 0.2 if strategy == "rex" else temperature
+    agent = create_s2_agent(sys_p, temperature=temp)
 
     # Provide deps so the validator has authoritative inputs
     deps = S2Deps(
@@ -1309,6 +1466,7 @@ async def run_s2_self_consistent(
     k: int = 5,
     temperature: float = 0.7,
     marker_summary: Optional[Dict[str, Any]] = None,
+    strategy: str = "rex",
 ) -> S2Output:
     """
     Self-consistency for S2:
@@ -1327,9 +1485,10 @@ async def run_s2_self_consistent(
             allow_cant_tell=allow_cant_tell,
             temperature=temperature,
             marker_summary=marker_summary,
+            strategy=strategy,
         )
 
-    logger.info(f"[{doc_id}] S2-SC: Casting {k} votes (temp={temperature})...")
+    logger.info(f"[{doc_id}] S2-SC ({strategy}): Launching {k} concurrent votes...")
 
     # --- Wrapper for a single concurrent run ---
     async def _single_s2_run(index: int) -> Optional[S2Output]:
@@ -1345,6 +1504,7 @@ async def run_s2_self_consistent(
                     allow_cant_tell=allow_cant_tell,
                     temperature=temperature,
                     marker_summary=marker_summary,
+                    strategy=strategy,
                 )
             except Exception as e:
                 logger.warning(f"[{doc_id}] S2 Run {index+1} failed: {e}")

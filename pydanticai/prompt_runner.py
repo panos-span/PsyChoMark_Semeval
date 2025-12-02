@@ -108,6 +108,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable Algorithm of Thought (AoT) for S1 extraction (Scan->Verify->Output).",
     )
+    # p.add_argument(
+    #    "--use-pbp",
+    #    action="store_true",
+    #    default=False,
+    #    help="Use Principle-Based Prompting (LangGraph) for S2.",
+    # )
+    p.add_argument(
+        "--s2-strategy",
+        choices=["standard", "rex", "graph"],
+        default="graph",
+        help="S2 Strategy. 'standard'=Baseline, 'rex'=Single-Prompt ReX, 'graph'=Multi-Agent ReX (Recommended).",
+    )
+
     p.add_argument(
         "--priors-json", default=None, help="Optional priors JSON file for S1."
     )
@@ -453,6 +466,8 @@ async def run_pipeline_for_doc(
     s1_rag: Any = None,
     s2_rag: Any = None,
     use_aot: bool = True,  # <--- NEW ARG
+    # use_pbp: bool,  # <--- NEW ARG
+    s2_strategy: str,
     task: str,
     agents_mod,
     s1_k: int,
@@ -576,8 +591,26 @@ async def run_pipeline_for_doc(
             # If we didn't just run S1, attempt to keep S2 going with empty spans
             s1_spans_for_s2 = s1_spans_for_s2 or []
 
-            if s2_k > 1:
-                # Self-consistent S2
+            # [NEW] Branching Logic for Principle-Based Prompting
+            # if use_pbp:
+            #    from psycomark_graph import run_s2_pbp
+
+            #    # PBP uses the Graph logic. It currently ignores SC (k) logic for simplicity,
+            #    # but you could wrap run_s2_pbp in a loop if desired.
+            #    # It heavily relies on 'fewshots' to generate the principles.
+            #    s2_struct = await run_s2_pbp(
+            #        doc_id=doc_id, text=src_text, fewshots=s2_fs or []
+            #    )
+            if s2_strategy == "graph":
+                # Multi-Agent ReX Graph (Recommended)
+                from psycomark_graph import run_s2_graph
+
+                s2_struct = await run_s2_graph(
+                    doc_id=doc_id,
+                    text=src_text,
+                    marker_summary=s1_summary_for_s2 or None,
+                )
+            elif s2_k > 1:
                 s2_struct = await agents_mod.run_s2_self_consistent(
                     doc_id=doc_id,
                     text=src_text,
@@ -588,6 +621,7 @@ async def run_pipeline_for_doc(
                     k=s2_k,
                     temperature=s2_temp,
                     marker_summary=s1_summary_for_s2 or None,
+                    strategy=s2_strategy,
                 )
             else:
                 s2_struct = await agents_mod.run_s2(
@@ -599,6 +633,7 @@ async def run_pipeline_for_doc(
                     allow_cant_tell=allow_cant_tell,
                     temperature=s2_temp,
                     marker_summary=s1_summary_for_s2 or None,
+                    strategy=s2_strategy,
                 )
 
             s2_out = {
@@ -677,6 +712,8 @@ async def main_async(args: argparse.Namespace):
                     s2_k=args.s2_k,
                     s2_temp=args.s2_temp,
                     use_aot=args.use_aot,  # Ensure this is passed if you added it to run_pipeline_for_doc
+                    # use_pbp=args.use_pbp,  # Pass new flag
+                    s2_strategy=args.s2_strategy,
                 )
                 # Return doc_id so we know which buffer to flush
                 return doc_id, res

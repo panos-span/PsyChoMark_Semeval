@@ -128,39 +128,75 @@ def build_s1_system(
 <rules>
   <evidence_gate>
     Evidence ONLY if at least ONE holds:
-      (E1) Contains a URL or bare domain/host.
+      (E1) Contains a URL or bare domain/host (e.g., http(s)://…, example.com, @handle).
       (E2) Quoted material WITH attribution verb AND named source.
       (E3) Numeric fact WITH unit/rates AND named source.
-      (E4) Named-source attribution clause (e.g., "CNN reported").
-      (E5) Inline citation markers (e.g., "[12]").
-    REJECT bare numbers or generic "reports say".
+      (E4) Named-source attribution clause without a URL/quote (e.g., "the SEC said", "CNN reported", "Reuters: …") — span must include the named source + reporting verb.
+      (E5) Inline citation markers that name a specific outlet or document (e.g., “[SEC 2021]”, “(WHO, 2020)”) — keep the entire marker as the Evidence span.
+
+    Forbidden as Evidence:
+      - Bare numbers without units/source.
+      - Generic attributions without a named source (e.g., "reports say", "it is said").
+      - Organization names alone without an attribution or factual content.
+
+    When selecting Evidence, prefer the smallest span that still includes the qualifying feature(s).
   </evidence_gate>
 
   <span_rules>
+    - Keep spans token-tight; include particles only if integral (e.g., "set up", "cover up").
+    - Prefer minimal spans that still fully express the role.
+
     <actor_scope>
+      - An Actor MUST be the agent of a conspiratorial Action.
       - CUE: Vague pronouns ("they") or abstract collectives ("the elite", "Big Pharma").
-      - REJECT: Neutral mentions of people/orgs unless they are agents of a conspiratorial Action.
+      - ALLOW: specific people/orgs (e.g., "the CDC", "Bill Gates") as Actors ONLY when they are subjects of intentional conspiratorial Actions.
+      - REJECT: neutral mentions of people/orgs in purely descriptive or reporting contexts.
     </actor_scope>
 
-    <action_scope>
-      - CUE: Intentional agency linked to secrecy, control, or harm ("plot", "engineer", "suppress").
-      - REJECT: Neutral reporting verbs ("announced") unless part of a cover-up.
-    </action_scope>
+    <victim_scope>
+      - A Victim MUST be the entity harmed/targeted by an Action.
+      - Reject substrings that are just part of an Action noun (e.g., "child" from "child trafficking").
+      - Allow Victim inside an Action only if it's a clear NP object (e.g., "our children", "13-year-olds").
+      - CUE: first-person plural and in-group collectives ("we", "us", "our", "the people", "our children", "patriots").
+      - CHECK: Prefer spans functioning as the object/indirect object of an Action.
+    </victim_scope>
 
-    <effect_scope>
-      - CUE: Purpose clauses ("to enslave") or high-stakes outcomes ("total control").
-      - ACTION-EFFECT SPLIT: Keep 'Action' as the verb phrase, 'Effect' as the outcome.
-    </effect_scope>
+    <action_scope>
+      - Action MUST denote intentional agency linked to secrecy/control/hostility/harm.
+      - Reject neutral/descriptive reporting verbs ("announced", "reported", "said", "posted", "went") UNLESS they are part of an alleged scheme/cover-up/intentional harm.
+      - If a clause contains both an intentional verb and a reporting verb, choose the intentional act as Action and relegate attribution to Evidence (per the gate).
+    </action_scope>
   </span_rules>
 
+  <action_effect_split>
+    - Action = what is done (verb phrase).
+    - Effect = consequence/purpose/result (often NP or "to …"/"so that …").
+    - CUE: Effects are frequently purpose clauses ("to …", "in order to …", "so that …") OR catastrophic/high-stakes noun phrases functioning as the object of an Action ("total control", "enslavement", "the great reset").
+    - Do not merge Action and Effect; split off purpose/result clauses as Effect.
+  </action_effect_split>
+
   <overlap_policy>
-    - Ambiguous pairs hint: {conflict_pairs_str}
-    - Prioritize Actor over Victim if ambiguous.
+    - Forbid Actor <-> Victim overlaps; if uncertain, prefer Actor unless Victim clearly superior.
+    - Allow short Victim NP inside Action; keep both if well-formed.
+    - Evidence may overlap others only if part of a quote/citation per <evidence_gate>.
+    - Ambiguous pairs hint: "Effect vs Victim", "Action vs Effect", "Action vs Victim", "Action vs Evidence", "Actor vs Evidence"
   </overlap_policy>
 
   <statistical_priors>
     {priors_str}
   </statistical_priors>
+  
+  <marker_noise_guidance>
+   - Human marker annotations can be noisy: short or ambiguous spans exist.
+   - In few-shots, trust the label but focus on prototypical uses (clear agents, actions, effects, and explicit evidence).
+  </marker_noise_guidance>
+
+
+  <notes>
+    - Choose exact substrings first; offsets will be auto-filled from your text.
+    - Don't over-mark generic function words.
+    - If a label is absent, output none for that label.
+  </notes>
 </rules>
 """.strip()
 
@@ -168,14 +204,18 @@ def build_s1_system(
     if use_cot:
         workflow = """
 <workflow>
-  1) Scan the text for roles: Actor → Action → Effect → Victim → Evidence.
-  2) For each candidate, formulate a mental "forensic rationale" (why does this fit?).
-  3) If you cannot formulate a rationale based on specific cues, drop the span.
-  4) Apply <evidence_gate> strictness.
-  5) Format output with verbatim text and your rationale.
+  1) Scan roles: Actor, Action, Effect, Victim; then explicitly scan for Evidence.
+  2) Apply <evidence_gate>.
+  3) Enforce <action_effect_split>.
+  4) Tighten boundaries; keep particles only if integral.
+  5) Apply <overlap_policy>.
 </workflow>""".strip()
 
     output_contract = """
+<verbatim_rule>
+  Every span's "text" MUST be a verbatim substring of <text_to_analyze>.
+  DO NOT paraphrase, summarize, or invent. Copy exact characters from RAW.
+</verbatim_rule>
 <output_contract>
   Return a JSON object with a "spans" list. 
   Each span must have: {label, text, start, end, why, context}.
@@ -548,7 +588,6 @@ def build_s2_prompts_adapter(
         s1_output=markers,
         s2_fewshots=fewshots or [],
         include_cot=use_cot,
-        allow_cant_tell=allow_cant_tell,
     )
     return sys_prompt, user_prompt
 
@@ -616,6 +655,135 @@ def build_s2_system(
 """.strip()
 
     return (header + "\n" + policy + "\n" + output_contract).strip()
+
+
+# ... (keep existing imports and functions) ...
+
+# ---------------------------------------------------------------------
+# NEW: ReX-GoT (Reverse Exclusion) Prompting for S2
+# ---------------------------------------------------------------------
+
+
+def build_s2_system_rex() -> str:
+    """
+    Reverse Exclusion Graph-of-Thought (ReX-GoT) System Prompt.
+    Forces the model to explicitly rule out "Non-Conspiracy" explanations
+    (Reporting, Satire) before accepting "Conspiracy".
+    """
+    header = (
+        psycho_theory_preamble() + "\n" + playbook_block() + "\n" + data_profile_block()
+    )
+
+    rex_instructions = """
+<rex_protocol>
+  You are a forensic classifier using **Reverse Exclusion Logic**.
+  Your goal is to determine the Author's Stance (Endorsement vs. Non-Endorsement) by iteratively trying to **EXCLUDE** potential classifications.
+  
+  <class_priors>
+    **CRITICAL CONTEXT**: The 'Conspiracy' class is NOT a rare anomaly. 
+    Historical data shows a balanced distribution:
+    - Conspiracy (Endorsement): ~42%
+    - Non-Conspiracy (Reporting): ~68%
+    
+    Do NOT default to 'Non' just because the text is ambiguous. If the evidence for endorsement exists, predict 'Conspiracy'.
+  </class_priors>
+
+  <classes>
+    A. **Neutral Reporting/Analysis** (Non): The author attributes claims to others ("They say...") or discusses them neutrally.
+    B. **Satire/Debunking/Mockery** (Non): The author mentions the plot only to ridicule or disprove it.
+    C. **Genuine Endorsement** (Conspiracy): The author asserts the plot as true, urgent, or forbidden knowledge.
+  </classes>
+
+  <thought_process>
+    For each class, you must attempt to construct an argument for why the text **IS NOT** that class.
+    
+    1. **Analyze Class A (Reporting)**: "Why is this text NOT just neutral reporting?"
+       - *Successful Exclusion:* "It contains unattributed assertions of fact like 'The cabal controls us'."
+       - *Failed Exclusion:* "It mostly says 'Users claim that...' so it might be reporting."
+       
+    2. **Analyze Class B (Satire/Debunking)**: "Why is this text NOT satire or debunking?"
+       - *Successful Exclusion:* "The tone is deadly serious and urgent."
+       
+    3. **Analyze Class C (Endorsement)**: "Why is this text NOT genuine endorsement?"
+       - *Successful Exclusion:* "The author calls the theory 'ridiculous'."
+       - *Failed Exclusion:* "The text explicitly urges readers to 'wake up' to the truth."
+  </thought_process>
+</rex_protocol>
+
+<output_contract>
+  Select the single class you **COULD NOT** definitively exclude.
+  If multiple remain plausible, prefer 'Non' (Reporting) for safety.
+  Output JSON: {"label": "conspiracy" or "non", "rationale": "reasoning"}
+</output_contract>
+""".strip()
+
+    return header + "\n\n" + rex_instructions
+
+
+def build_s2_user_rex(
+    *,
+    text_input: str,
+    s1_output: List[dict] | None,
+    marker_summary: Dict[str, List[str]] | None = None,
+    fewshots: List[dict] | None = None,  # <--- NEW ARG
+) -> str:
+    import json
+
+    # Format markers for context
+    markers_str = "[]"
+    if s1_output:
+        markers_str = json.dumps(s1_output, ensure_ascii=False)
+
+    summary_str = ""
+    if marker_summary:
+        summary_str = json.dumps(marker_summary, ensure_ascii=False)
+
+    # Format Few-Shots as "Legal Precedents"
+    precedents_str = ""
+    if fewshots:
+        blocks = []
+        for i, ex in enumerate(fewshots):
+            label = ex.get("label", "unknown")
+            txt = ex.get("text", "") or ex.get("doc_text", "")
+            rationale = ex.get("rationale", "")
+            blocks.append(
+                f"""
+<case_{i+1}>
+  <text>{txt}</text>
+  <verdict>{label}</verdict>
+  <reasoning>{rationale}</reasoning>
+</case_{i+1}>"""
+            )
+        precedents_str = (
+            "<legal_precedents>\n" + "\n".join(blocks) + "\n</legal_precedents>"
+        )
+
+    return f"""
+{precedents_str}
+
+<case_file>
+  <text_to_analyze>
+  {text_input}
+  </text_to_analyze>
+
+  <extracted_markers>
+  {markers_str}
+  </extracted_markers>
+  
+  <narrative_summary>
+  {summary_str}
+  </narrative_summary>
+</case_file>
+
+<execution>
+  Apply the Reverse Exclusion Protocol.
+  1. Argument: Why is this NOT Reporting? (Check attribution vs assertion)
+  2. Argument: Why is this NOT Satire/Debunking? (Check tone)
+  3. Argument: Why is this NOT Endorsement? (Check distancing)
+  
+  Conclusion: Final Label.
+</execution>
+""".strip()
 
 
 def build_s2_user(

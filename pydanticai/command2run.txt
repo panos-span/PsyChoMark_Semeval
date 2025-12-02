@@ -18,11 +18,15 @@ uv run pydanticai/prompt_runner.py `
   --conflicts-json "data/derived/psycomark_official_split_20251022_192733/prompt_artifacts.json" `
   --s1-out "subs_pydanticai/s1_predictions.jsonl" `
   --s2-out "subs_pydanticai/s2_predictions.jsonl" `
-  --repair-window 64 `
-  --log-level INFO `
+  --repair-window 32 `
+  --log-level DEBUG `
   --seed 42 `
   --use-aot `
-  --s1-k 3 `
+  --s1-k 1 `
   --s1-temp 0.7 `
-  --s2-k 3 `
-  --s2-temp 0.7
+  --s2-k 1 `
+  --s2-temp 0.7 `
+  --s2-strategy graph `
+
+
+  --use-pbp

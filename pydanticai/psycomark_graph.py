@@ -1,5 +1,5 @@
 import asyncio
-import operator
+import random
 from typing import TypedDict, List, Optional, Any, Dict, Annotated
 from langgraph.graph import StateGraph, END, START
 
@@ -8,242 +8,247 @@ from pydantic_ai import Agent, ModelSettings
 from loguru import logger
 
 # Import shared resources
-from psycomark_agents import LLM, S2Output, S2Deps
+from psycomark_agents import LLM, S2Output
+
+
+# --- 0. Throttling Handler ---
+async def safe_agent_run(agent, prompt, deps=None):
+    """Executes agent.run with exponential backoff for AWS Throttling."""
+    max_retries = 8
+    base_delay = 2.0
+    for attempt in range(max_retries):
+        try:
+            if deps:
+                return await agent.run(prompt, deps=deps)
+            return await agent.run(prompt)
+        except Exception as e:
+            if "ThrottlingException" in str(e) or "Too many tokens" in str(e):
+                if attempt == max_retries - 1:
+                    raise e
+                delay = (base_delay * (2**attempt)) + random.uniform(0.5, 2.0)
+                logger.warning(f" AWS Throttling. Retrying in {delay:.2f}s...")
+                await asyncio.sleep(delay)
+            else:
+                raise e
 
 
 # --- 1. State Definition ---
-# Helper reducer: simply overwrites the old value with the new one
 def overwrite(old, new):
     return new
 
 
-class ClassificationState(TypedDict):
+class ReXState(TypedDict):
     # Inputs
     target_text: str
-    few_shot_str: str
+    marker_summary_str: str  # Narrative summary from S1
 
-    # Internal Reasoning - Annotated to allow updates without "Multiple values" errors
-    generated_principles: Annotated[str, overwrite]
-    skeptic_argument: Annotated[str, overwrite]
+    # Internal Debate (Annotated to allow updates)
+    defense_argument: Annotated[str, overwrite]  # Why it is NOT Conspiracy
+    prosecution_argument: Annotated[str, overwrite]  # Why it is NOT Reporting
 
-    # Outputs
+    # Output
     final_output: Optional[S2Output]
 
 
-# --- 2. Node Agents (Optimized System Prompts) ---
+# --- 2. Node Agents ---
 
 
-# Node A: Legislator
-# Goal: Induce principles of STANCE (Endorsement vs Attribution)
-class LegislatorOutput(BaseModel):
-    principles: str = Field(
-        ...,
-        description="3 distinct forensic principles distinguishing Endorsement from Reporting.",
-    )
-
-
-legislator_agent = Agent(
-    LLM,
-    output_type=LegislatorOutput,
-    system_prompt="You are an expert Forensic Linguist specializing in Stance Detection. Your goal is to identify the subtle linguistic markers that distinguish genuine belief in a conspiracy from mere reporting or analysis.",
-    model_settings=ModelSettings(temperature=0.5),
-)
-
-
-# Node B: Skeptic
-# Goal: High-recall detection of Reporting/Satire markers
-class SkepticOutput(BaseModel):
+# Node A: The Defense (Reporting/Satire Analyst)
+# Mission: Prove 'Non-Conspiracy' by excluding 'Endorsement'.
+class DefenseOutput(BaseModel):
     argument: str = Field(
         ...,
-        description="A rigorous argument for why this text is Non-Conspiracy (Reporting, Satire, or Neutral).",
+        description="Argument for why this text is Reporting/Satire and NOT Endorsement.",
     )
 
 
-skeptic_agent = Agent(
+defense_agent = Agent(
     LLM,
-    output_type=SkepticOutput,
-    system_prompt="You are a rigorous Fact-Checker and Media Analyst. Your job is to prevent False Positives by identifying reporting verbs, attribution, satire, or neutral context.",
+    output_type=DefenseOutput,
+    system_prompt="You are a Skeptical Media Analyst. Your goal is to prove that a text is merely REPORTING on a conspiracy, or Mocking it, rather than endorsing it.",
     model_settings=ModelSettings(temperature=0.3),
 )
 
-# Node C: Judge
-# Goal: Weigh evidence with a presumption of innocence (Non-Conspiracy)
+
+# Node B: The Prosecutor (Conspiracy Analyst)
+# Mission: Prove 'Endorsement' by excluding 'Reporting'.
+class ProsecutionOutput(BaseModel):
+    argument: str = Field(
+        ...,
+        description="Argument for why this text is Genuine Endorsement and NOT just Reporting.",
+    )
+
+
+prosecutor_agent = Agent(
+    LLM,
+    output_type=ProsecutionOutput,
+    system_prompt="You are a Forensic Investigator. Your goal is to identify linguistic proof of GENUINE ENDORSEMENT, ruling out neutral reporting.",
+    model_settings=ModelSettings(temperature=0.3),
+)
+
+# Node C: The Judge (ReX Evaluator)
+# Mission: Decide which exclusion failed.
 judge_agent = Agent(
     LLM,
     output_type=S2Output,
-    system_prompt="You are the Chief Justice of the Stance Detection Court. You evaluate texts to determine if the author GENUINELY ENDORSES a conspiracy theory.",
+    system_prompt="You are a Supreme Court Judge using Reverse Exclusion Logic. You must determine if the 'Non-Conspiracy' explanation can be definitively ruled out.",
     model_settings=ModelSettings(temperature=0.0),
 )
 
-# --- 3. Node Functions (Optimized User Prompts) ---
+# --- 3. Node Functions ---
 
 
-async def legislator_node(state: ClassificationState) -> Dict[str, Any]:
-    examples = state["few_shot_str"]
-    if not examples:
-        return {
-            "generated_principles": "1. Unattributed Assertion (Factuality). 2. Urgent Call to Action. 3. Rejection of Official Epistemology."
-        }
-
-    prompt = f"""
-    <task>
-    Analyze the provided examples of 'Conspiracy' (Endorsement) vs 'Non-Conspiracy' (Reporting/Debunking).
-    
-    Formulate 3 distinct **Stance Principles** that separate these classes. 
-    Focus on:
-    1. **Attribution vs. Assertion**: How do conspiracy texts assert plots as absolute fact, while non-conspiracy texts attribute them to others?
-    2. **Epistemics**: How do authors signal "forbidden knowledge" or "waking up"?
-    3. **Tone**: How does the urgency/anger of a believer differ from the neutrality/mockery of a reporter?
-    </task>
-
-    <examples>
-    {examples}
-    </examples>
-    
-    Output ONLY the 3 principles.
-    """
-    try:
-        result = await legislator_agent.run(prompt)
-        return {"generated_principles": result.output.principles}
-    except Exception as e:
-        logger.error(f"Legislator failed: {e}")
-        return {"generated_principles": "Error generating principles."}
-
-
-async def skeptic_node(state: ClassificationState) -> Dict[str, Any]:
-    text = state["target_text"]
+async def defense_node(state: ReXState) -> Dict[str, Any]:
     prompt = f"""
     <text_to_analyze>
-    {text}
+    {state['target_text']}
+    </text_to_analyze>
+    
+    <summary_context>
+    {state['marker_summary_str']}
+    </summary_context>
+
+    <task>
+    Construct a defense argument for why this text is **Non-Conspiracy** (Label: non).
+    
+    You must argue why the text **IS NOT** genuine endorsement:
+    1. Cite reporting verbs ("they said", "claimed") that distance the author.
+    2. Cite satire, mockery, or neutral analysis.
+    3. Explain why the extracted markers are just context, not belief.
+    </task>
+    """
+    try:
+        res = await safe_agent_run(defense_agent, prompt)
+        return {"defense_argument": res.output.argument}
+    except Exception as e:
+        logger.error(f"Defense failed: {e}")
+        return {"defense_argument": "Failed to generate defense."}
+
+
+async def prosecution_node(state: ReXState) -> Dict[str, Any]:
+    prompt = f"""
+    <text_to_analyze>
+    {state['target_text']}
     </text_to_analyze>
 
-    <mission>
-    Play the role of a Skeptic. Vigorously argue why this text is **Non-Conspiracy** (Label: non).
-    </mission>
-
-    <checklist>
-    1. **Attribution Check**: Does the text use reporting verbs ("claimed", "said", "users posted") to distance the author from the plot?
-    2. **Satire Check**: Is the text mocking the conspiracy (e.g., scare quotes, sarcasm, exaggeration)?
-    3. **Questioning**: Is the author just asking questions or analyzing the theory without endorsing it?
-    4. **Incoherence**: Is the text too fragmented to be a coherent endorsement?
-    </checklist>
-
-    Generate a specific defense argument citing exact words from the text.
+    <task>
+    Construct a prosecution argument for why this text is **Conspiracy Endorsement** (Label: conspiracy).
+    
+    You must argue why the text **IS NOT** merely reporting:
+    1. Identify assertions of fact without attribution ("The cabal IS controlling us").
+    2. Identify calls to action or urgent warnings ("Wake up!").
+    3. Identify "truth-telling" vocabulary ("The real truth", "Mainstream lies").
+    </task>
     """
     try:
-        result = await skeptic_agent.run(prompt)
-        return {"skeptic_argument": result.output.argument}
+        res = await safe_agent_run(prosecutor_agent, prompt)
+        return {"prosecution_argument": res.output.argument}
     except Exception as e:
-        logger.error(f"Skeptic failed: {e}")
-        return {"skeptic_argument": "No counter-argument generated."}
+        logger.error(f"Prosecutor failed: {e}")
+        return {"prosecution_argument": "Failed to generate prosecution."}
 
 
-async def judge_node(state: ClassificationState) -> Dict[str, Any]:
-    text = state["target_text"]
-    principles = state["generated_principles"]
-    skeptic_view = state["skeptic_argument"]
-
+async def judge_node(state: ReXState) -> Dict[str, Any]:
     prompt = f"""
     <case_file>
-    <target_text>
-    {text}
-    </target_text>
+    <text_evidence>
+    {state['target_text']}
+    </text_evidence>
     
-    <legal_principles>
-    {principles}
-    </legal_principles>
+    <defense_motion_to_dismiss>
+    (Argument for 'Non-Conspiracy' / Reporting):
+    {state['defense_argument']}
+    </defense_motion_to_dismiss>
     
-    <defense_argument_from_skeptic>
-    {skeptic_view}
-    </defense_argument_from_skeptic>
+    <prosecution_charges>
+    (Argument for 'Conspiracy Endorsement'):
+    {state['prosecution_argument']}
+    </prosecution_charges>
     </case_file>
     
-    <mandate>
-    Render a final verdict. 
+    <judicial_instruction>
+    You are the Judge. You must render a verdict based on **Stance Detection**.
     
-    **Burden of Proof**: 
-    The text is presumed 'non' (Reporting/Analysis) UNLESS there is clear evidence of **Endorsement**.
+    **The Law (Definitions):**
+    1. **Reporting (Non):** The author attributes the claims to someone else ("He said...", "Users claim...").
+    2. **Endorsement (Conspiracy):** The author asserts the claims as absolute fact in their own voice.
     
-    1. Does the text explicitly assert the conspiracy as fact (Principle Check)?
-    2. Does the Skeptic successfully highlight attribution or distancing markers (e.g., "They say...")?
-    3. If the text is ambiguous, rule 'non'.
+    **Decision Protocol:**
+    1. **Evaluate the Defense:** Does the Defense successfully point to *attribution verbs* or *distancing language* in the text? 
+       - IF YES -> The text is Reporting. Verdict: **non**.
+       
+    2. **Evaluate the Prosecution:** Does the Prosecution identify *unattributed assertions* of conspiracy facts?
+       - IF YES AND Defense is weak -> Verdict: **conspiracy**.
+       
+    **Tie-Breaker:** If the text is ambiguous or mixes both, rule **non** (Presumption of Innocence).
+    </judicial_instruction>
     
-    Output the final label and a rationale explaining the Stance.
-    </mandate>
+    Return the final label and a summary of which argument prevailed.
     """
     try:
-        result = await judge_agent.run(prompt)
-        return {"final_output": result.output}
+        res = await safe_agent_run(judge_agent, prompt)
+        return {"final_output": res.output}
     except Exception as e:
         logger.error(f"Judge failed: {e}")
-        return {"final_output": S2Output(label="non", rationale="Judge failed.")}
+        return {"final_output": S2Output(label="non", rationale="Graph failed.")}
 
 
 # --- 4. Graph Construction ---
 
 
-def build_pbp_graph():
-    workflow = StateGraph(ClassificationState)
-
-    # Add nodes
-    workflow.add_node("legislator", legislator_node)
-    workflow.add_node("skeptic", skeptic_node)
+def build_rex_graph():
+    workflow = StateGraph(ReXState)
+    workflow.add_node("defense", defense_node)
+    workflow.add_node("prosecutor", prosecution_node)
     workflow.add_node("judge", judge_node)
 
-    # Parallel Fan-Out from START
-    workflow.add_edge(START, "legislator")
-    workflow.add_edge(START, "skeptic")
+    # Parallel debate
+    workflow.add_edge(START, "defense")
+    workflow.add_edge(START, "prosecutor")
 
-    # Join at Judge
-    workflow.add_edge("legislator", "judge")
-    workflow.add_edge("skeptic", "judge")
-
+    # Converge at Judge
+    workflow.add_edge("defense", "judge")
+    workflow.add_edge("prosecutor", "judge")
     workflow.add_edge("judge", END)
 
     return workflow.compile()
 
 
-# Instantiate the compiled graph once
-PBP_APP = build_pbp_graph()
+REX_APP = build_rex_graph()
 
 # --- 5. Runner Entry Point ---
 
 
-async def run_s2_pbp(doc_id: str, text: str, fewshots: List[dict]) -> S2Output:
+async def run_s2_graph(
+    doc_id: str, text: str, marker_summary: Optional[Dict[str, Any]] = None
+) -> S2Output:
     """
-    Executes the Principle-Based Prompting (PBP) Graph for S2.
+    Executes the ReX-GoT (Reverse Exclusion Graph).
     """
-    # 1. Format few-shots
-    few_shot_str = ""
-    for ex in fewshots:
-        label = ex.get("label", "unknown")
-        txt = ex.get("text", "") or ex.get("doc_text", "")
-        rationale = ex.get("rationale", "")
-        few_shot_str += (
-            f"Example (Label: {label}):\nText: {txt}\nRationale: {rationale}\n---\n"
-        )
+    import json
 
-    # 2. Prepare Input State
+    summary_str = (
+        json.dumps(marker_summary, ensure_ascii=False)
+        if marker_summary
+        else "No summary provided."
+    )
+
     inputs = {
         "target_text": text,
-        "few_shot_str": few_shot_str,
-        "generated_principles": "",
-        "skeptic_argument": "",
+        "marker_summary_str": summary_str,
+        "defense_argument": "",
+        "prosecution_argument": "",
         "final_output": None,
     }
 
-    logger.info(f"[{doc_id}] PBP-Graph: Invoking Legislator & Skeptic...")
+    logger.info(f"[{doc_id}] ReX-Graph: Defense vs Prosecutor Debate...")
 
-    # 3. Invoke Graph
     try:
-        result_state = await PBP_APP.ainvoke(inputs)
-        final_out = result_state.get("final_output")
-
-        if not final_out:
-            return S2Output(label="non", rationale="Graph returned no output.")
-
-        logger.success(f"[{doc_id}] Judge Verdict: {final_out.label}")
-        return final_out
+        result = await REX_APP.ainvoke(inputs)
+        logger.info(f"[{doc_id}] ReX-Graph Result: {result.get("final_output")}")
+        return result.get("final_output") or S2Output(
+            label="non", rationale="No output."
+        )
     except Exception as e:
-        logger.error(f"[{doc_id}] Graph Execution Failed: {e}")
-        return S2Output(label="non", rationale=f"Graph error: {e}")
+        logger.error(f"[{doc_id}] Graph Error: {e}")
+        return S2Output(label="non", rationale=f"Graph Error: {e}")
