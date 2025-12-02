@@ -1,0 +1,115 @@
+Here are the PowerShell commands to run the entire pipeline, organized by **Sequential Phases**.
+
+**Prerequisites:**
+
+  * Ensure your `train_rehydrated.jsonl` is in `data\raw\` (based on your previous log).
+  * Ensure your `.env` file is set up with AWS credentials.
+
+### Phase 0: Data Cleaning & Artifact Generation
+
+Run this immediately. It prepares the clean datasets and `priors.json`.
+
+```powershell
+# Run Data Pipeline
+uv run data_pipeline.py `
+  --data-dir data\raw `
+  --output-root data\rag
+```
+
+-----
+
+### Phase 1: Initialization (Selection & First Batch Jobs)
+
+Run these commands to select the best documents and submit the first set of batch jobs (S1 Whys & S2 Summaries).
+
+```powershell
+# 1. Select S1 Docs
+uv run src\psycomark\eda\rag_creation.py `
+  --s1-train-jsonl data\rag\train_clean_s1.jsonl `
+  --s1-stage select `
+  --max-docs 512
+
+# 2. Submit S1 "Whys" Batch Job
+uv run src\psycomark\eda\rag_creation.py `
+  --s1-train-jsonl data\rag\train_clean_s1.jsonl `
+  --s1-stage submit-whys
+
+# 3. Select S2 Docs (Requires S1 clean data for marker lookup)
+uv run src\psycomark\eda\rag_creation.py `
+  --s2-train-docclf data\rag\train_clean_s2.jsonl `
+  --s1-train-jsonl data\rag\train_clean_s1.jsonl `
+  --s2-stage select `
+  --max-docs 1024
+
+# 4. Submit S2 "Summaries" Batch Job
+uv run src\psycomark\eda\rag_creation.py `
+  --s2-train-docclf data\rag\train_clean_s2.jsonl `
+  --s2-stage submit-summaries
+```
+
+**🛑 STOP:** Go to the AWS Console. Wait for the jobs `S1_WHYS-...` and `S2_SUMMARIES-...` to reach status **Completed**.
+
+-----
+
+### Phase 2: Processing Whys & Summaries -\> Starting Next Jobs
+
+Run these *after* Phase 1 jobs finish.
+
+```powershell
+# 1. Merge S1 Whys & Submit S1 Embeddings
+uv run src\psycomark\eda\rag_creation.py `
+  --s1-train-jsonl data\rag\train_clean_s1.jsonl `
+  --s1-stage merge-whys
+
+uv run src\psycomark\eda\rag_creation.py `
+  --s1-train-jsonl data\rag\train_clean_s1.jsonl `
+  --s1-stage submit-embed
+
+# 2. Merge S2 Summaries & Submit S2 Rationales
+uv run src\psycomark\eda\rag_creation.py `
+  --s2-train-docclf data\rag\train_clean_s2.jsonl `
+  --s2-stage merge-summaries
+
+uv run src\psycomark\eda\rag_creation.py `
+  --s2-train-docclf data\rag\train_clean_s2.jsonl `
+  --s2-stage submit-rats
+```
+
+**🛑 STOP:** Wait for `S1_EMBED-...` and `S2_RATS-...` to reach **Completed**.
+
+-----
+
+### Phase 3: Processing S2 Rationales -\> Starting Embeddings
+
+Run this *after* Phase 2 jobs finish. (S1 is technically ready for indexing now, but we can do it all at the end).
+
+```powershell
+# Merge S2 Rationales & Submit S2 Embeddings
+uv run src\psycomark\eda\rag_creation.py `
+  --s2-train-docclf data\rag\train_clean_s2.jsonl `
+  --s2-stage merge-rats
+
+uv run src\psycomark\eda\rag_creation.py `
+  --s2-train-docclf data\rag\train_clean_s2.jsonl `
+  --s2-stage submit-embed
+```
+
+**🛑 STOP:** Wait for `S2_EMBED-...` to reach **Completed**.
+
+-----
+
+### Phase 4: Final Indexing
+
+Run this when **all** batch jobs are done to build the ChromaDB locally.
+
+```powershell
+# 1. Index S1 RAG
+uv run src\psycomark\eda\rag_creation.py `
+  --s1-train-jsonl data\rag\train_clean_s1.jsonl `
+  --s1-stage index
+
+# 2. Index S2 RAG
+uv run src\psycomark\eda\rag_creation.py `
+  --s2-train-docclf data\rag\train_clean_s2.jsonl `
+  --s2-stage index
+```
