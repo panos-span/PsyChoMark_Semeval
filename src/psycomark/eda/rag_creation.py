@@ -587,8 +587,13 @@ def prepare_s2_summary_payload(docs: List[dict]) -> List[dict]:
             continue
 
         record_id = d["doc_id"]
-        # Convert markers to a readable list for the model
-        markers_text = "\n".join([f"- {m['label']}: {m['text']}" for m in d["markers"]])
+        # Convert markers to a readable list for the model, INCLUDING RATIONALES
+        markers_text = "\n".join(
+            [
+                f"- {m['label']}: {m['text']} (Rationale: {m.get('why', 'N/A')})"
+                for m in d["markers"]
+            ]
+        )
 
         user_prompt = (
             f"Raw Text Segment: {d['text']}...\n\n"
@@ -638,7 +643,18 @@ def run_s2_rag_pipeline(args):
                 d = json.loads(line)
                 if d["label"] in ["conspiracy", "non"]:
                     d["doc_id"] = str(d.get("doc_id") or d.get("_id"))
-                    d["markers"] = s1_lookup.get(d["doc_id"], [])
+
+                    # Prioritize S1 lookup (Enriched) over internal markers
+                    s1_markers = s1_lookup.get(d["doc_id"])
+                    internal_markers = d.get("spans") or d.get("markers")
+
+                    if s1_markers:
+                        d["markers"] = s1_markers
+                    elif internal_markers:
+                        d["markers"] = internal_markers
+                    else:
+                        d["markers"] = []
+
                     s2_docs.append(d)
 
         # Prioritize docs with markers
