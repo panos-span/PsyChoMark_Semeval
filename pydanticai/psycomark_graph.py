@@ -1,6 +1,6 @@
 import asyncio
 import random
-from typing import TypedDict, List, Optional, Any, Dict, Annotated
+from typing import TypedDict, Optional, Any, Dict, Annotated
 from langgraph.graph import StateGraph, END, START
 
 from pydantic import BaseModel, Field
@@ -10,8 +10,22 @@ from loguru import logger
 # Import shared resources
 from psycomark_agents import LLM, S2Output
 
+# [NEW] Import rich context from prompt_builder
+from prompt_builder import psycho_theory_preamble, playbook_block, data_profile_block
 
-# --- 0. Throttling Handler ---
+
+# --- 0. Shared Context Builder ---
+def build_agent_context() -> str:
+    """
+    Constructs the shared 'Constitution' for all graph agents.
+    Combines the Psycholinguistic role, the Playbook definitions, and Data Profile.
+    """
+    return (
+        psycho_theory_preamble() + "\n" + playbook_block() + "\n" + data_profile_block()
+    )
+
+
+# --- 1. Throttling Handler ---
 async def safe_agent_run(agent, prompt, deps=None):
     """Executes agent.run with exponential backoff for AWS Throttling."""
     max_retries = 8
@@ -32,7 +46,7 @@ async def safe_agent_run(agent, prompt, deps=None):
                 raise e
 
 
-# --- 1. State Definition ---
+# --- 2. State Definition ---
 def overwrite(old, new):
     return new
 
@@ -43,78 +57,104 @@ class ReXState(TypedDict):
     marker_summary_str: str  # Narrative summary from S1
 
     # Internal Debate (Annotated to allow updates)
-    defense_argument: Annotated[str, overwrite]  # Why it is NOT Conspiracy
-    prosecution_argument: Annotated[str, overwrite]  # Why it is NOT Reporting
+    defense_argument: Annotated[str, overwrite]  # Argument for Reporting/Satire
+    prosecution_argument: Annotated[str, overwrite]  # Argument for Endorsement
 
     # Output
     final_output: Optional[S2Output]
 
 
-# --- 2. Node Agents ---
+# --- 3. Node Agents (Enriched) ---
+
+SHARED_CONTEXT = build_agent_context()
 
 
 # Node A: The Defense (Reporting/Satire Analyst)
-# Mission: Prove 'Non-Conspiracy' by excluding 'Endorsement'.
 class DefenseOutput(BaseModel):
     argument: str = Field(
         ...,
-        description="Argument for why this text is Reporting/Satire and NOT Endorsement.",
+        description="Argument proving the text is merely Reporting, Summarizing, or Mocking.",
     )
 
 
 defense_agent = Agent(
     LLM,
     output_type=DefenseOutput,
-    system_prompt="You are a Skeptical Media Analyst. Your goal is to prove that a text is merely REPORTING on a conspiracy, or Mocking it, rather than endorsing it.",
+    # [NEW] Inject shared context before specific instructions
+    system_prompt=f"""
+{SHARED_CONTEXT}
+
+<role_specific>
+You are a Skeptical Media Analyst. Your goal is to prove that the text is attributed to a THIRD PARTY (Reporting) or is MOCKING the claim (Satire).
+Use the definitions in <psycomark_playbook> to distinguish between mentioning a cue (e.g., "they said the elites...") vs. using a cue (e.g., "the elites are...").
+</role_specific>
+""".strip(),
     model_settings=ModelSettings(temperature=0.3),
 )
 
 
 # Node B: The Prosecutor (Conspiracy Analyst)
-# Mission: Prove 'Endorsement' by excluding 'Reporting'.
 class ProsecutionOutput(BaseModel):
     argument: str = Field(
         ...,
-        description="Argument for why this text is Genuine Endorsement and NOT just Reporting.",
+        description="Argument proving the author explicitly ENDORSES the conspiracy as fact.",
     )
 
 
 prosecutor_agent = Agent(
     LLM,
     output_type=ProsecutionOutput,
-    system_prompt="You are a Forensic Investigator. Your goal is to identify linguistic proof of GENUINE ENDORSEMENT, ruling out neutral reporting.",
+    # [NEW] Inject shared context
+    system_prompt=f"""
+{SHARED_CONTEXT}
+
+<role_specific>
+You are a Forensic Investigator. Your goal is to find 'Stance Leakage'.
+Refer to the <cues_epistemics> in the playbook: Look for self-sealing logic or direct commands ("do your research") that prove endorsement.
+</role_specific>
+""".strip(),
     model_settings=ModelSettings(temperature=0.3),
 )
 
+
 # Node C: The Judge (ReX Evaluator)
-# Mission: Decide which exclusion failed.
 judge_agent = Agent(
     LLM,
     output_type=S2Output,
-    system_prompt="You are a Supreme Court Judge using Reverse Exclusion Logic. You must determine if the 'Non-Conspiracy' explanation can be definitively ruled out.",
+    # [NEW] Inject shared context
+    system_prompt=f"""
+{SHARED_CONTEXT}
+
+<role_specific>
+You are a Supreme Court Judge using the 'Attribution Firewall' protocol.
+Use the definitions of Actor/Action/Effect from the preamble to evaluate the arguments.
+</role_specific>
+""".strip(),
     model_settings=ModelSettings(temperature=0.0),
 )
 
-# --- 3. Node Functions ---
+
+# --- 4. Node Functions ---
 
 
 async def defense_node(state: ReXState) -> Dict[str, Any]:
     prompt = f"""
-    <text_to_analyze>
+    <evidence_text>
     {state['target_text']}
-    </text_to_analyze>
+    </evidence_text>
     
-    <summary_context>
+    <s1_context>
     {state['marker_summary_str']}
-    </summary_context>
+    </s1_context>
 
     <task>
-    Construct a defense argument for why this text is **Non-Conspiracy** (Label: non).
+    Build the **Defense Case** for Label: `non`.
     
-    You must argue why the text **IS NOT** genuine endorsement:
-    1. Cite reporting verbs ("they said", "claimed") that distance the author.
-    2. Cite satire, mockery, or neutral analysis.
-    3. Explain why the extracted markers are just context, not belief.
+    1. Check for **Attribution**: Does the text credit the "Action" (from definitions) to a third party?
+    2. Check for **Distancing**: Are there reporting verbs?
+    3. Check for **Mockery**: Is the "Effect" (e.g., mind control) treated as absurd?
+    
+    Refer to the <data_profile>: remember [URL] often indicates a link submission summary.
     </task>
     """
     try:
@@ -122,22 +162,21 @@ async def defense_node(state: ReXState) -> Dict[str, Any]:
         return {"defense_argument": res.output.argument}
     except Exception as e:
         logger.error(f"Defense failed: {e}")
-        return {"defense_argument": "Failed to generate defense."}
+        return {"defense_argument": "Defense failed."}
 
 
 async def prosecution_node(state: ReXState) -> Dict[str, Any]:
     prompt = f"""
-    <text_to_analyze>
+    <evidence_text>
     {state['target_text']}
-    </text_to_analyze>
+    </evidence_text>
 
     <task>
-    Construct a prosecution argument for why this text is **Conspiracy Endorsement** (Label: conspiracy).
+    Build the **Prosecution Case** for Label: `conspiracy`.
     
-    You must argue why the text **IS NOT** merely reporting:
-    1. Identify assertions of fact without attribution ("The cabal IS controlling us").
-    2. Identify calls to action or urgent warnings ("Wake up!").
-    3. Identify "truth-telling" vocabulary ("The real truth", "Mainstream lies").
+    1. **Stance Leakage**: Where does the author drop the reporter mask?
+    2. **Epistemics**: Use <cues_epistemics> (e.g., "wake up") to prove intent.
+    3. **First-Person**: Does the author include themselves in the "Victim" group?
     </task>
     """
     try:
@@ -145,7 +184,7 @@ async def prosecution_node(state: ReXState) -> Dict[str, Any]:
         return {"prosecution_argument": res.output.argument}
     except Exception as e:
         logger.error(f"Prosecutor failed: {e}")
-        return {"prosecution_argument": "Failed to generate prosecution."}
+        return {"prosecution_argument": "Prosecution failed."}
 
 
 async def judge_node(state: ReXState) -> Dict[str, Any]:
@@ -155,35 +194,29 @@ async def judge_node(state: ReXState) -> Dict[str, Any]:
     {state['target_text']}
     </text_evidence>
     
-    <defense_motion_to_dismiss>
-    (Argument for 'Non-Conspiracy' / Reporting):
+    <narrative_context>
+    {state['marker_summary_str']}
+    </narrative_context>
+    
+    <defense_motion>
     {state['defense_argument']}
-    </defense_motion_to_dismiss>
+    </defense_motion>
     
     <prosecution_charges>
-    (Argument for 'Conspiracy Endorsement'):
     {state['prosecution_argument']}
     </prosecution_charges>
     </case_file>
     
     <judicial_instruction>
-    You are the Judge. You must render a verdict based on **Stance Detection**.
+    **Protocol: The Attribution Firewall**
     
-    **The Law (Definitions):**
-    1. **Reporting (Non):** The author attributes the claims to someone else ("He said...", "Users claim...").
-    2. **Endorsement (Conspiracy):** The author asserts the claims as absolute fact in their own voice.
+    1. **Presumption of Innocence (Non):** If the text fits the <data_profile> of a submission statement (summarizing a link), default to `non`.
+    2. **Burden of Proof:** The Prosecutor must prove the author *endorses* the <Action> described.
     
-    **Decision Protocol:**
-    1. **Evaluate the Defense:** Does the Defense successfully point to *attribution verbs* or *distancing language* in the text? 
-       - IF YES -> The text is Reporting. Verdict: **non**.
-       
-    2. **Evaluate the Prosecution:** Does the Prosecution identify *unattributed assertions* of conspiracy facts?
-       - IF YES AND Defense is weak -> Verdict: **conspiracy**.
-       
-    **Tie-Breaker:** If the text is ambiguous or mixes both, rule **non** (Presumption of Innocence).
+    Compare the arguments against the <psycholinguistic_preamble>. 
+    - If the "Actor" is attributed to someone else -> `non`.
+    - If the author asserts the "Actor" is real -> `conspiracy`.
     </judicial_instruction>
-    
-    Return the final label and a summary of which argument prevailed.
     """
     try:
         res = await safe_agent_run(judge_agent, prompt)
@@ -193,7 +226,7 @@ async def judge_node(state: ReXState) -> Dict[str, Any]:
         return {"final_output": S2Output(label="non", rationale="Graph failed.")}
 
 
-# --- 4. Graph Construction ---
+# --- 5. Graph Construction ---
 
 
 def build_rex_graph():
@@ -216,15 +249,12 @@ def build_rex_graph():
 
 REX_APP = build_rex_graph()
 
-# --- 5. Runner Entry Point ---
+# --- 6. Runner Entry Point ---
 
 
 async def run_s2_graph(
     doc_id: str, text: str, marker_summary: Optional[Dict[str, Any]] = None
 ) -> S2Output:
-    """
-    Executes the ReX-GoT (Reverse Exclusion Graph).
-    """
     import json
 
     summary_str = (
@@ -241,14 +271,17 @@ async def run_s2_graph(
         "final_output": None,
     }
 
-    logger.info(f"[{doc_id}] ReX-Graph: Defense vs Prosecutor Debate...")
+    logger.info(f"[{doc_id}] ReX-Graph (Enriched): Defense vs Prosecutor Debate...")
 
     try:
         result = await REX_APP.ainvoke(inputs)
-        logger.info(f"[{doc_id}] ReX-Graph Result: {result.get("final_output")}")
-        return result.get("final_output") or S2Output(
-            label="non", rationale="No output."
-        )
+        final = result.get("final_output")
+        if not final:
+            final = S2Output(label="non", rationale="Graph produced no output.")
+
+        logger.info(f"[{doc_id}] ReX Result: {final.label} | Why: {final.rationale}")
+        return final
+
     except Exception as e:
         logger.error(f"[{doc_id}] Graph Error: {e}")
         return S2Output(label="non", rationale=f"Graph Error: {e}")
