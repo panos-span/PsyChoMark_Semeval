@@ -1,349 +1,370 @@
-# data_pipeline.py
 """
-PsyCoMark Data Processing Pipeline (Optimized for RAG).
+PsyCoMark Data Processing Pipeline (Final Reproducible Version).
 
-Enhancements:
-1. Lexical Bank: Extracts common terms per label.
-2. Narrative Scoring: Boosts docs with complete Actor->Action->Effect chains.
-3. Length Filter: Removes noise (too short/long texts).
+Role:
+1. Aggregates multiple annotators into a 'Gold Standard' (Consensus).
+2. Curates a BALANCED dataset for S2 RAG using Stratified Sampling.
+3. SCORES documents by Linguistic Intensity to select archetypal examples.
+4. GUARANTEES REPRODUCIBILITY via deterministic tie-breaking (Score + DocID).
 """
 
-import sys
 import json
 import re
 import argparse
-from loguru import logger
-import hashlib
+import collections
+import random
 from pathlib import Path
-from collections import defaultdict, Counter
-from typing import Dict, List, Any
+from typing import Dict, List, Counter
+from loguru import logger
 
-# --- Constants & Regex ---
-S2_CUE_RE = re.compile(
-    r"(deep state|globalist|elite|agenda|cover[- ]?up|false flag|"
-    r"hoax|they\s+want|they're trying|new world order|"
-    r"pedo|chemtrail|MK[-\s]?Ultra|shadow government)",
+# --- 1. Lexicons (Forensic Intensity) ---
+
+ABSOLUTIST = [
+    "always",
+    "never",
+    "everyone",
+    "no one",
+    "impossible",
+    "undeniable",
+    "without a doubt",
+    "completely",
+    "totally",
+    "entirely",
+    "absolutely",
+    "certainly",
+    "no doubt",
+    "truth",
+    "fact",
+    "proven",
+]
+
+HEDGES = [
+    "maybe",
+    "perhaps",
+    "possibly",
+    "likely",
+    "unlikely",
+    "appears",
+    "seems",
+    "suggests",
+    "might",
+    "could",
+    "may",
+    "arguably",
+    "allegedly",
+    "reportedly",
+    "claimed",
+]
+
+# --- 2. ReX Categories (Sub-typing) ---
+
+CUES_MUNDANE = re.compile(
+    r"\b(office|wages|manager|boss|weather|traffic|customer service|refund|price|scam|bs|myth|work from home|policy|HR|commission|fee)\b",
     re.I,
 )
-S2_DEBUNK_RE = re.compile(
-    r"\b(debunk|myth|not true|no evidence|conclusion is wrong|"
-    r"conspiracy theory(?:ies)? as such)\b",
+CUES_DEBUNK = re.compile(
+    r"\b(debunk|no evidence|false claim|conspiracy theory|not true|lies|fact check|hoax|bullshit|ridiculous)\b",
+    re.I,
+)
+CUES_EVANGELIST = re.compile(
+    r"\b(wake up|the truth|universal truth|mission|listen to|watch this|series|documentary|red pill|must watch|share this)\b",
+    re.I,
+)
+CUES_INSIDER = re.compile(
+    r"\b(deep state|cabal|regime|globalist|agenda|controlled by|owned by|false flag|psyop|elites|intelligence|shadow|new world order)\b",
     re.I,
 )
 
-STOPWORDS = {
-    "the",
-    "a",
-    "an",
-    "and",
-    "or",
-    "but",
-    "in",
-    "on",
-    "at",
-    "to",
-    "for",
-    "of",
-    "with",
-    "is",
-    "are",
-    "was",
-    "were",
-    "be",
-    "been",
-    "that",
-    "this",
-    "these",
-    "those",
-    "it",
-    "he",
-    "she",
-    "they",
-    "them",
-    "their",
-    "his",
-    "her",
-    "its",
-}
-
-# --- Scoring Functions ---
+# --- 3. Quality & Scoring Logic ---
 
 
-def score_s1_complexity(spans: List[Dict]) -> float:
-    """
-    Rates a document for S1 RAG suitability.
+def calculate_linguistic_intensity(text: str) -> dict:
+    tokens = re.findall(r"\w+", text.lower())
+    total = len(tokens) or 1
+    abs_count = sum(1 for t in tokens if t in ABSOLUTIST)
+    hed_count = sum(1 for t in tokens if t in HEDGES)
+    return {"abs_rate": abs_count / total, "hed_rate": hed_count / total}
 
-    IMPROVED LOGIC:
-    - Huge Bonus for COMPLETE CHAINS (Actor + Action + Effect).
-    - Penalty for ORPHANED ACTIONS (Action without Actor).
-    """
-    if not spans:
-        return 0.0
-    labels = {s.get("label") for s in spans}
-    count = len(spans)
 
-    score = count * 0.1
+def check_confusion_overlap(spans: List[Dict]) -> bool:
+    actions = [s for s in spans if s["label"] == "Action"]
+    effects = [s for s in spans if s["label"] == "Effect"]
+    if not actions or not effects:
+        return False
 
-    # 1. Narrative Completeness (The Holy Grail of Few-Shots)
-    if {"Actor", "Action", "Effect"}.issubset(labels):
-        score += 3.0  # Gold standard
-    elif {"Actor", "Action"}.issubset(labels):
-        score += 1.5  # Solid causality
+    for a in actions:
+        for e in effects:
+            start = max(a["start"], e["start"])
+            end = min(a["end"], e["end"])
+            if end > start:
+                inter = end - start
+                union = (a["end"] - a["start"]) + (e["end"] - e["start"]) - inter
+                iou = inter / union
+                if iou > 0.5:
+                    return True
+    return False
 
-    # 2. Rare Class Bonus
-    if "Victim" in labels:
-        score += 1.0
 
-    # 3. Orphan Penalty (Confusing for models)
-    if "Action" in labels and "Actor" not in labels:
-        score -= 0.5
-
-    return round(score, 3)
+def detect_s2_subtype(text: str, label: str) -> str:
+    if label == "non":
+        if CUES_DEBUNK.search(text):
+            return "non_debunking"
+        if CUES_MUNDANE.search(text):
+            return "non_mundane"
+        return "non_reporting"
+    if label == "conspiracy":
+        if CUES_EVANGELIST.search(text):
+            return "con_evangelist"
+        if CUES_INSIDER.search(text):
+            return "con_insider"
+        return "con_general"
+    return "unknown"
 
 
 def score_s2_richness(text: str, label: str, spans: List[Dict]) -> dict:
-    """Rates a document for S2 RAG suitability."""
-    cues = len(S2_CUE_RE.findall(text))
-    is_debunk = bool(S2_DEBUNK_RE.search(text))
-    length = len(text)
-    has_markers = len(spans) > 0
+    subtype = detect_s2_subtype(text, label)
+    ling_stats = calculate_linguistic_intensity(text)
+    is_confusing = check_confusion_overlap(spans)
+
     score = 0.0
+    length = len(text)
+    if 200 < length < 2000:
+        score += 1.0
+    if subtype != "unknown":
+        score += 1.0
 
-    if label == "conspiracy":
-        score += cues * 0.5
-        score += min(length / 500.0, 2.0)
-        if has_markers:
-            score += 3.0
-    elif label == "non":
-        if is_debunk:
-            score += 5.0
-        elif cues > 0:
-            score += 3.0
-        else:
-            score += 1.0
+    # Quality Control
+    if is_confusing:
+        score -= 5.0
 
-    return {"s2_score": round(score, 3), "is_hard_negative": is_debunk}
+    # Archetypal Boosting
+    if label == "conspiracy" and ling_stats["abs_rate"] > 0.015:
+        score += 2.0
+    elif label == "non" and ling_stats["hed_rate"] > 0.015:
+        score += 2.0
+
+    # Hard Negative Boost
+    is_hard_negative = (label == "non" and len(spans) > 0) or (
+        subtype == "non_debunking"
+    )
+    if is_hard_negative:
+        score += 3.0
+
+    return {
+        "s2_score": round(score, 3),
+        "s2_subtype": subtype,
+        "is_hard_negative": is_hard_negative,
+        "linguistics": ling_stats,
+    }
 
 
-def normalize_row(row: Dict) -> Dict:
-    """Standardizes keys."""
-    doc_id = str(row.get("_id") or row.get("doc_id") or "")
-    text = row.get("text", "").strip()
+# --- 4. S1 Consensus Logic ---
 
-    raw_label = row.get("conspiracy", "").strip()
-    label = "non"
+
+def merge_s1_spans(all_spans: List[Dict], num_annotators: int) -> List[Dict]:
+    if not all_spans:
+        return []
+    threshold = (num_annotators // 2) + 1
+    final_spans = []
+
+    spans_by_label = collections.defaultdict(list)
+    for s in all_spans:
+        spans_by_label[s["label"]].append(s)
+
+    for label, spans in spans_by_label.items():
+        # Deterministic Sort for Clustering
+        spans.sort(key=lambda x: (x["start"], x["end"]))
+
+        clusters = []
+        for span in spans:
+            placed = False
+            for cluster in clusters:
+                rep = cluster[0]
+                if span["start"] < rep["end"] and span["end"] > rep["start"]:
+                    cluster.append(span)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([span])
+
+        for cluster in clusters:
+            if len(cluster) >= threshold:
+                # Deterministic Selection (Longest first, then earliest start)
+                best_span = max(
+                    cluster, key=lambda x: (x["end"] - x["start"], -x["start"])
+                ).copy()
+                best_span["why"] = None
+                if "startIndex" in best_span:
+                    del best_span["startIndex"]
+                if "endIndex" in best_span:
+                    del best_span["endIndex"]
+                final_spans.append(best_span)
+
+    # Final deterministic sort of the list
+    final_spans.sort(key=lambda x: (x["start"], x["end"]))
+    return final_spans
+
+
+# --- 5. Main Pipeline ---
+
+
+def normalize_input_row(row: Dict) -> Dict:
+    raw_label = row.get("conspiracy", "non")
     if raw_label == "Yes":
         label = "conspiracy"
     elif raw_label == "No":
         label = "non"
     else:
-        label = "cant_tell"
-
-    raw_markers = row.get("markers", [])
-    spans = []
-    for m in raw_markers:
-        m_type = m.get("type") or m.get("label")
-        m_text = m.get("text")
-        s = m.get("startIndex") or m.get("start")
-        e = m.get("endIndex") or m.get("end")
-        if m_type and m_text:
-            span_obj = {"label": m_type, "text": m_text}
-            if s is not None and e is not None:
-                span_obj["start"] = int(s)
-                span_obj["end"] = int(e)
-            spans.append(span_obj)
+        label = "DROP_ME"
 
     return {
-        "doc_id": doc_id,
-        "text": text,
+        "doc_id": str(row.get("_id") or row.get("doc_id") or ""),
+        "text": row.get("text", "").strip(),
         "label": label,
-        "spans": spans,
+        "spans": row.get("markers", []),
         "subreddit": row.get("subreddit", ""),
     }
 
 
-# --- Artifact Generation ---
+def process_disaggregated_group(group: List[Dict]) -> Dict | None:
+    if not group:
+        return None
+    base = group[0]
 
+    # Strict Consensus
+    labels = [r["label"] for r in group]
+    counts = Counter(labels)
+    # Sort for deterministic tie breaking if counts equal (though we drop ties anyway)
+    consensus_label, _ = sorted(counts.most_common(1), key=lambda x: x[0])[0]
 
-def generate_priors(rows: List[Dict]) -> Dict[str, Any]:
-    """Calculates label distribution and conflicts."""
-    s1_label_counts = Counter()
-    s2_label_counts = Counter()
-    conflict_pairs = Counter()
+    if consensus_label == "DROP_ME":
+        return None
+    if len(counts) > 1 and counts.most_common(2)[0][1] == counts.most_common(2)[1][1]:
+        return None
 
-    for r in rows:
-        if r["label"] in ["conspiracy", "non"]:
-            s2_label_counts[r["label"]] += 1
-        spans = r["spans"]
-        if not spans:
-            continue
+    all_spans = []
+    for r in group:
+        for s in r["spans"]:
+            s_clean = {
+                "label": s.get("type") or s.get("label"),
+                "text": s.get("text"),
+                "start": int(s.get("startIndex") or s.get("start", 0)),
+                "end": int(s.get("endIndex") or s.get("end", 0)),
+            }
+            if s_clean["label"]:
+                all_spans.append(s_clean)
 
-        for s in spans:
-            s1_label_counts[s["label"]] += 1
-
-        valid_spans = [s for s in spans if "start" in s and "end" in s]
-        if len(valid_spans) > 1:
-            for i, s1 in enumerate(valid_spans):
-                for j, s2 in enumerate(valid_spans):
-                    if i >= j:
-                        continue
-                    if s1["start"] < s2["end"] and s2["start"] < s1["end"]:
-                        pair = tuple(sorted([s1["label"], s2["label"]]))
-                        if pair[0] != pair[1]:
-                            conflict_pairs[pair] += 1
-
-    total_spans = sum(s1_label_counts.values()) or 1
-    s1_priors = {k: round(v / total_spans, 3) for k, v in s1_label_counts.items()}
-    top_conflicts = [f"{k[0]} vs {k[1]}" for k, _ in conflict_pairs.most_common(5)]
+    final_spans = merge_s1_spans(all_spans, len(group))
+    s2_meta = score_s2_richness(base["text"], consensus_label, final_spans)
 
     return {
-        "s1_priors": s1_priors,
-        "s1_conflicts": top_conflicts,
-        "s2_class_balance": dict(s2_label_counts),
+        "doc_id": base["doc_id"],
+        "text": base["text"],
+        "label": consensus_label,
+        "spans": final_spans,
+        **s2_meta,
+        "subreddit": base["subreddit"],
     }
 
 
-def generate_lexical_bank(rows: List[Dict], top_k: int = 20) -> Dict[str, List[str]]:
+def select_balanced_s2_subset(rows: List[Dict], target_total=300) -> List[Dict]:
     """
-    Extracts the top K most frequent terms for each label.
-    Useful for 'Playbook' injection.
+    Stratified Sampling with DETERMINISTIC Sorting.
+    Sort Key: (-s2_score, doc_id)
+    This ensures identical results every run, regardless of input order.
     """
-    banks = defaultdict(Counter)
-
+    buckets = collections.defaultdict(list)
     for r in rows:
-        for s in r["spans"]:
-            # Simple cleaning: lowercase, keep only alpha words > 2 chars
-            words = [
-                w.lower()
-                for w in s["text"].split()
-                if w.isalpha() and len(w) > 2 and w.lower() not in STOPWORDS
-            ]
-            for w in words:
-                banks[s["label"]][w] += 1
+        if r["s2_score"] > 0:
+            buckets[r["s2_subtype"]].append(r)
 
-    output = {}
-    for label, counter in banks.items():
-        # Get top K terms
-        output[label] = [word for word, count in counter.most_common(top_k)]
+    selected = []
 
-    return output
+    def deterministic_sort(items):
+        # High score first, then alphabetical ID
+        return sorted(items, key=lambda x: (-x["s2_score"], x["doc_id"]))
 
+    # 1. Hard Negatives
+    hn_candidates = [r for r in rows if r["is_hard_negative"] and r["s2_score"] > 0]
+    selected.extend(deterministic_sort(hn_candidates)[:60])
 
-# --- LSH Helpers (MinHash) ---
-def get_minhash_signature(text: str, num_perm: int = 128) -> List[int]:
-    shingles = set()
-    words = text.lower().split()
-    for i in range(len(words) - 2):
-        shingles.add(" ".join(words[i : i + 3]))
-    if not shingles:
-        return [0] * num_perm
-    signature = []
-    for i in range(num_perm):
-        min_hash = float("inf")
-        for shingle in shingles:
-            hash_val = int(
-                hashlib.md5(f"{shingle}_{i}".encode("utf-8")).hexdigest(), 16
-            )
-            if hash_val < min_hash:
-                min_hash = hash_val
-        signature.append(min_hash)
-    return signature
+    # 2. Mundane & Debunking
+    for subtype in ["non_mundane", "non_debunking"]:
+        cands = deterministic_sort(buckets[subtype])
+        selected.extend(cands[:40])
 
+    # 3. Conspiracy Archetypes
+    for subtype in ["con_evangelist", "con_insider", "con_general"]:
+        cands = deterministic_sort(buckets[subtype])
+        selected.extend(cands[:35])
 
-def get_lsh_buckets(signature: List[int], bands: int = 8) -> List[str]:
-    rows = len(signature) // bands
-    buckets = []
-    for i in range(bands):
-        band = tuple(signature[i * rows : (i + 1) * rows])
-        bucket_id = int(hashlib.md5(str(band).encode("utf-8")).hexdigest(), 16)
-        buckets.append(f"{i}_{bucket_id}")
-    return buckets
+    # 4. Fill remaining
+    current_ids = {r["doc_id"] for r in selected}
+    remaining = [
+        r for r in rows if r["doc_id"] not in current_ids and r["s2_score"] > 0
+    ]
+    selected.extend(deterministic_sort(remaining)[: (target_total - len(selected))])
+
+    return selected
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--data-dir", type=Path, default="./", help="Dir with train_rehydrated.jsonl"
-    )
-    parser.add_argument("--output-root", type=Path, default="./data/rag")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--input", type=Path, default="train_rehydrated.jsonl")
+    parser.add_argument("--output-dir", type=Path, default="data/clean")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for reproducibility")
     args = parser.parse_args()
 
-    args.output_root.mkdir(parents=True, exist_ok=True)
+    # 1. Set Seed for any random ops (though we rely mostly on deterministic sorting now)
+    random.seed(args.seed)
 
-    raw_path = args.data_dir / "train_rehydrated.jsonl"
-    if not raw_path.exists():
-        logger.error(f"File not found: {raw_path}")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    groups = collections.defaultdict(list)
+    logger.info(f"Reading {args.input}...")
+    try:
+        with open(args.input, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = normalize_input_row(json.loads(line))
+                    if len(row["text"]) > 10:
+                        groups[row["doc_id"]].append(row)
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        logger.error("Input file not found.")
         return
 
-    logger.info(f"Processing {raw_path}...")
+    processed_rows = []
+    # Process in deterministic order of IDs
+    for doc_id in sorted(groups.keys()):
+        res = process_disaggregated_group(groups[doc_id])
+        if res:
+            processed_rows.append(res)
 
-    # 1. Load & Dedupe
-    unique_rows = []
-    seen_hashes = set()
+    # 3. Save S1 - Deterministic Sort
+    # Key: (Count desc, HardNeg desc, DocID asc)
+    processed_rows.sort(
+        key=lambda x: (-len(x["spans"]), -int(x["is_hard_negative"]), x["doc_id"])
+    )
 
-    with open(raw_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-                norm = normalize_row(row)
+    s1_path = args.output_dir / "train_clean_s1.jsonl"
+    with open(s1_path, "w", encoding="utf-8") as f:
+        for r in processed_rows:
+            if r["spans"]:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    logger.info(f"Wrote S1 data to {s1_path}")
 
-                # Length Filter (New Optimization)
-                # Drop extremely short (<50 chars) or huge (>10k chars) docs to reduce noise
-                if len(norm["text"]) < 50 or len(norm["text"]) > 10000:
-                    continue
+    # 4. Save S2 - Deterministic Selection
+    curated_s2 = select_balanced_s2_subset(processed_rows, target_total=300)
 
-                sig = get_minhash_signature(norm["text"])
-                buckets = tuple(get_lsh_buckets(sig))
-                if buckets in seen_hashes:
-                    continue
-                seen_hashes.add(buckets)
-
-                unique_rows.append(norm)
-            except Exception:
-                pass
-
-    logger.info(f"Unique, filtered docs: {len(unique_rows)}")
-
-    # 2. Generate Artifacts
-    priors_data = generate_priors(unique_rows)
-    with open(args.output_root / "priors.json", "w") as f:
-        json.dump(priors_data, f, indent=2)
-
-    lex_bank = generate_lexical_bank(unique_rows)
-    with open(args.output_root / "lexical_bank.json", "w") as f:
-        json.dump(lex_bank, f, indent=2)
-
-    logger.info("Saved priors.json and lexical_bank.json")
-
-    # 3. Build S1 Dataset (Sorted by improved complexity)
-    s1_rows = []
-    for r in unique_rows:
-        if r["spans"]:
-            r["s1_score"] = score_s1_complexity(r["spans"])
-            s1_rows.append(r)
-    s1_rows.sort(key=lambda x: x["s1_score"], reverse=True)
-
-    with open(args.output_root / "train_clean_s1.jsonl", "w", encoding="utf-8") as f:
-        for r in s1_rows:
+    s2_path = args.output_dir / "train_clean_s2.jsonl"
+    with open(s2_path, "w", encoding="utf-8") as f:
+        for r in curated_s2:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    # 4. Build S2 Dataset
-    s2_rows = []
-    for r in unique_rows:
-        if r["label"] in ["conspiracy", "non"]:
-            res = score_s2_richness(r["text"], r["label"], r["spans"])
-            r.update(res)
-            s2_rows.append(r)
-    s2_rows.sort(key=lambda x: x["s2_score"], reverse=True)
-
-    with open(args.output_root / "train_clean_s2.jsonl", "w", encoding="utf-8") as f:
-        for r in s2_rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    logger.info("Pipeline Complete.")
+    logger.info(f"Wrote S2 curated data ({len(curated_s2)} docs) to {s2_path}")
 
 
 if __name__ == "__main__":
