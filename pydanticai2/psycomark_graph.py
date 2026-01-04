@@ -1,17 +1,13 @@
-import asyncio
-from typing import TypedDict, List, Optional, Dict, Any
-from langgraph.graph import StateGraph, END, START
-from loguru import logger
+from typing import Any, Dict, List, Optional, TypedDict
 
+from langgraph.graph import END, START, StateGraph
+from loguru import logger
 from psycomark_agents import (
-    run_s2_sequential_debate,
-    S2Juror,
     S2CouncilOutput,
     S2Output,
-    LLM,
+    run_s2_judge_review,
+    run_s2_sequential_debate,
 )
-from prompt_builder import build_s2_judge_system
-from pydantic_ai import Agent
 
 
 # --- State ---
@@ -33,6 +29,7 @@ class S2GraphState(TypedDict):
 async def s2_council_node(state: S2GraphState):
     doc_id = state["doc_id"]
     temp = state.get("juror_temperature", 0.4)
+    rag = state.get("rag_context", "")  # <--- Retrieve context
     logger.info(f"[{doc_id}] Convening Sequential Debate...")
 
     # Use the new Sequential Debate Runner
@@ -40,6 +37,7 @@ async def s2_council_node(state: S2GraphState):
         text=state["text"],
         s1_spans=state["s1_spans"],
         marker_summary=state["marker_summary"],
+        rag_context=rag,
         temperature=temp,
     )
 
@@ -50,108 +48,36 @@ async def s2_council_node(state: S2GraphState):
 # --- Node 2: The Judge ---
 async def s2_judge_node(state: S2GraphState):
     """
-    The Chief Justice Node (Updated for Sequential Debate).
-    Synthesizes the 'Court Transcript' where Defense specifically refutes Prosecution.
+    The Chief Justice Node.
+    Delegates to the optimized run_s2_judge_review function.
     """
-    doc_id = state["doc_id"]
     council = state["council_result"]
-    votes = council.votes
+    text = state["text"]
+    rag = state.get("rag_context", "")
 
-    # 1. Sort Votes for the Transcript (Prosecutor -> Defense -> Witnesses)
-    # This ensures the Judge reads the flow of argument logically.
-    order_map = {
-        S2Juror.BELIEVER: 1,  # The Prosecutor
-        S2Juror.DEFENSE: 2,  # The Defense Attorney
-        S2Juror.LITERALIST: 3,  # Expert Witness 1
-        S2Juror.PROFILER: 4,  # Expert Witness 2
-    }
-    # Sort votes based on the map; unknowns go last
-    votes.sort(key=lambda x: order_map.get(x.juror, 99))
-
-    # 2. Construct the "Court Transcript"
-    # We apply specific labels so the Judge understands the role of each argument.
-    transcript_lines = []
-    for v in votes:
-        role_name = v.juror.value.upper()
-
-        if v.juror == S2Juror.BELIEVER:
-            transcript_lines.append(
-                f"PROSECUTION ({role_name}):\nArgues: {v.verdict.upper()}\n"
-                f'Indictment: "{v.rationale}"\n'
+    # [CRITICAL GUARD]
+    # If the Council produced no votes (e.g. all agents crashed),
+    # we must short-circuit or provide a fallback to prevent Judge hallucination.
+    if not council or not council.votes:
+        logger.error(f"[{state['doc_id']}] Council failed (0 votes). Skipping Judge.")
+        return {
+            "final_output": S2Output(
+                label="non",
+                rationale="Mistrial: Council failed to convene.",
+                confidence=0.0,
+                key_evidence=[],
             )
-        elif v.juror == S2Juror.DEFENSE:
-            transcript_lines.append(
-                f"DEFENSE ({role_name}):\nArgues: {v.verdict.upper()}\n"
-                f'Rebuttal: "{v.rationale}"\n'
-            )
-        else:
-            transcript_lines.append(
-                f"WITNESS ({role_name}):\nTestimony: {v.verdict.upper()}\n"
-                f'Statement: "{v.rationale}"\n'
-            )
+        }
 
-    transcript = "\n".join(transcript_lines)
-
-    # 3. Prepare the Judge's System Prompt
-    rag_txt = state.get("rag_context", "") or "No specific precedents available."
-    system_prompt = build_s2_judge_system(rag_context=rag_txt)
-
-    # 4. Create Stateless Agent
-    judge_agent = Agent(
-        LLM, output_type=S2Output, system_prompt=system_prompt, retries=2
+    # Call the shared, optimized function
+    result = await run_s2_judge_review(
+        text=text,
+        council_result=council,
+        doc_id=state["doc_id"],
+        rag_context=rag,
     )
 
-    # 5. Construct the Case File (Transcript Mode)
-    user_prompt = f"""
-<court_transcript id="{doc_id}">
-  <evidence_exhibit_A>
-{state['text']}
-  </evidence_exhibit_A>
-
-  <debate_transcript>
-{transcript}
-  </debate_transcript>
-
-  <instruction>
-    You have heard the Prosecution and the Defense.
-    
-    1. **Evaluation:** Did the Defense successfully refute the Prosecutor's specific point using Hanlon's Razor or the 'Librarian Defense'?
-    2. **Check:** If the Prosecutor relies on "Implicit Support" but the Defense proves "Attribution/Reporting", you MUST Acquit.
-    3. **Verdict:** Render the Final Decision based on the ReX Protocol.
-  </instruction>
-</court_transcript>
-"""
-
-    try:
-        # Run the Judge
-        result = await judge_agent.run(user_prompt)
-
-        # Log Overrules
-        majority = max(council.tally, key=council.tally.get) if council.tally else "non"
-        if result.output.label != majority:
-            logger.warning(
-                f"[{doc_id}] JUDGE OVERRULED COUNCIL! (Council: {majority} -> Judge: {result.output.label})"
-            )
-
-        return {"final_output": result.output}
-
-    except Exception as e:
-        logger.error(f"[{doc_id}] Judge Logic Failed: {e}")
-
-        # Fail-safe: Fallback to simple majority vote
-        fallback_label = (
-            "conspiracy"
-            if council.tally.get("conspiracy", 0) > council.tally.get("non", 0)
-            else "non"
-        )
-
-        fallback_output = S2Output(
-            label=fallback_label,
-            rationale=f"Judge agent failed ({str(e)}). Defaulted to Council majority.",
-            confidence=0.5,
-            key_evidence=[],
-        )
-        return {"final_output": fallback_output}
+    return {"final_output": result}
 
 
 # --- Graph Wiring ---

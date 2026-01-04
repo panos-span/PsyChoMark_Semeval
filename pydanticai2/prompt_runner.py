@@ -64,6 +64,8 @@ _load_dotenv_into_environ()
 # Project modules
 import pydanticai2.psycomark_agents as agents_mod
 import pydanticai2.prompt_builder as prompt_builder
+from pydanticai2.prompt_loader import S1_PROMPTS, S2_PROMPTS
+
 
 # Import the new S1 Graph (The "Consensus Engine")
 from pydanticai2.s1_graph import s1_graph
@@ -358,55 +360,92 @@ async def main_async():
     with mlflow.start_run():
         mlflow.log_params(vars(args))
 
-        # Log active templates
+        # S1 Prompts
         if args.task in ("s1", "both"):
-            # Import private builder to snapshot the exact system prompt
-            from prompt_builder import build_s1_discriminative_system
-
-            mlflow.log_text(
-                build_s1_discriminative_system(),
-                "prompts/s1/system_discriminative.txt",
+            # 1. Generator
+            s1_gen_sys = (
+                S1_PROMPTS.gen_system
+                if S1_PROMPTS
+                else prompt_builder.build_s1_discriminative_system()
             )
-        # --- 2. Log S2 Prompts (Judge & The Full Council) ---
+            s1_gen_usr = (
+                S1_PROMPTS.gen_user_template
+                if S1_PROMPTS
+                else prompt_builder.build_s1_user_template()
+            )
+            mlflow.log_text(s1_gen_sys, "prompts/s1/s1_generator_optimized.txt")
+            mlflow.log_text(s1_gen_usr, "prompts/s1/s1_user_optimized.txt")
+
+            # 2. Critic [NEW]
+            # Use getattr to safely access attributes that might not exist in older loaders
+            s1_crit_sys = (
+                getattr(S1_PROMPTS, "critic_system", None)
+                or prompt_builder.build_s1_critic_system()
+            )
+            s1_crit_usr = (
+                getattr(S1_PROMPTS, "critic_user_template", None)
+                or prompt_builder.build_s1_critic_user_template()
+            )
+            mlflow.log_text(s1_crit_sys, "prompts/s1/s1_critic_optimized.txt")
+            mlflow.log_text(s1_crit_usr, "prompts/s1/s1_critic_user_optimized.txt")
+
+            # 3. Refiner [NEW]
+            s1_ref_sys = (
+                getattr(S1_PROMPTS, "refiner_system", None)
+                or prompt_builder.build_s1_refiner_system()
+            )
+            s1_ref_usr = (
+                getattr(S1_PROMPTS, "refiner_user_template", None)
+                or prompt_builder.build_s1_refiner_user_template()
+            )
+            mlflow.log_text(s1_ref_sys, "prompts/s1/s1_refiner_optimized.txt")
+            mlflow.log_text(s1_ref_usr, "prompts/s1/s1_refiner_user_optimized.txt")
+
+        # S2 Prompts
         if args.task in ("s2", "both"):
-            # A. The Judge (ReX Logic)
+            # Helper to safely get prompt content
+            def get_s2_p(attr, fallback_func):
+                return (
+                    getattr(S2_PROMPTS, attr)
+                    if S2_PROMPTS and hasattr(S2_PROMPTS, attr)
+                    else fallback_func()
+                )
+
+            # Log System Personas
             mlflow.log_text(
-                prompt_builder.build_s2_judge_system(), "prompts/s2/system_judge.txt"
+                get_s2_p("pros_sys", prompt_builder.build_s2_prosecutor_system),
+                "prompts/s2/sys_prosecutor.txt",
+            )
+            mlflow.log_text(
+                get_s2_p("def_sys", prompt_builder.build_s2_defense_system),
+                "prompts/s2/sys_defense.txt",
+            )
+            mlflow.log_text(
+                get_s2_p("lit_sys", prompt_builder.build_s2_literalist_system),
+                "prompts/s2/sys_literalist.txt",
+            )
+            mlflow.log_text(
+                get_s2_p("prof_sys", prompt_builder.build_s2_profiler_system),
+                "prompts/s2/sys_profiler.txt",
+            )
+            mlflow.log_text(
+                get_s2_p("judge_sys", prompt_builder.build_s2_judge_system),
+                "prompts/s2/sys_judge.txt",
             )
 
-            # B. Juror 1: The Literalist (Grammar/Attribution)
+            # Log User Templates
             mlflow.log_text(
-                prompt_builder.build_s2_triage_system(),
-                "prompts/s2/juror_literalist.txt",
+                get_s2_p("pros_user", prompt_builder.build_s2_prosecutor_user_template),
+                "prompts/s2/user_prosecutor.txt",
             )
-
-            # C. Juror 2: The Believer (Prosecutor/High Recall)
             mlflow.log_text(
-                prompt_builder.build_s2_system(include_cot=False),
-                "prompts/s2/juror_believer.txt",
+                get_s2_p("def_user", prompt_builder.build_s2_defense_user_template),
+                "prompts/s2/user_defense.txt",
             )
-
-            # D. Juror 3: The Profiler (Tone/Vibe)
             mlflow.log_text(
-                prompt_builder.build_s2_profiler_system(),
-                "prompts/s2/juror_profiler.txt",
+                get_s2_p("judge_user", prompt_builder.build_s2_judge_user_template),
+                "prompts/s2/user_judge.txt",
             )
-
-            # E. Juror 4: The Defense (Hanlon's Razor)
-            mlflow.log_text(
-                prompt_builder.build_s2_defense_system(), "prompts/s2/juror_defense.txt"
-            )
-
-            # F. User Prompts (Templates)
-            # Log the templates used for the Council and Judge interactions
-            council_template = """
-<case_file>
-  <evidence_text>{text}</evidence_text>
-  <forensic_markers>{marker_summary}</forensic_markers>
-  <instruction>Review the evidence above according to your System Role. Render your Verdict.</instruction>
-</case_file>
-            """
-            mlflow.log_text(council_template, "prompts/s2/user_template_council.txt")
 
         # 5. Execution Loop
         s1_results = []

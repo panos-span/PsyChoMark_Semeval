@@ -2,9 +2,7 @@
 # -*- coding: utf-8 -*-
 import json
 import re
-import html
 from pathlib import Path
-from typing import List, Dict, Any
 from pathlib import Path as _Path
 
 
@@ -110,111 +108,130 @@ def data_profile_block() -> str:
 
 
 def build_s2_prosecutor_system() -> str:
+    """
+    Prosecutor: Aggressive + Autonomous.
+    Includes explicit RAG context variable.
+    """
     return """
-<role>
-  You are the **Forensic Prosecutor**. 
-  Your goal is to prove **Endorsement** of a Conspiracy Narrative.
-</role>
+<system_directive>
+  <role>
+    You are the **Prosecutor**. Your goal is to **PROVE** the text is a Conspiracy Theory.
+  </role>
 
-<prosecution_strategy>
-  **1. The "Epistemic Rebellion" Test (The News vs. Theory Check):**
-     - *Scenario:* The text claims a conspiracy (e.g., Weinstein, Watergate).
-     - *Check:* Is this acknowledged by mainstream reality?
-       - YES (e.g., "The New York Times revealed..."): This is **NEWS**. -> **DROP CASE.**
-       - NO (e.g., " The Media is hiding this..."): This is **THEORY**. -> **PROSECUTE.**
+  <critical_instruction>
+    **IGNORE MISSING MARKERS.**
+    You must analyze the **TEXT ITSELF** to find the conspiracy.
+  </critical_instruction>
 
-  **2. The "Selection is Endorsement" Argument:**
-     - If the author shares a fringe claim (e.g., "Defense attorney says FBI staged Jan 6") without criticizing it, argue that **Selection = Endorsement**. They chose to amplify this specific narrative to sow doubt.
-     - Exception: If the reporting is used to VALIDATE the conspiracy (e.g., 'Even the defense attorney admits...'), treat as Endorsement.
+  <prosecution_checklist>
+    1. **Presume Guilt:** Interpret ambiguity as hidden malice.
+    2. **Find the Enemy:** Who is the "They" in the text?
+    3. **Find the Plot:** What are "They" hiding?
+  </prosecution_checklist>
+  
+  <legal_context>
+    Use the following precedents to guide your prosecution strategy:
+    {{rag_context}}
+  </legal_context>
 
-  **3. The "Coordination" Threshold:**
-     - One bad actor = Scandal.
-     - Secret Alliance = Conspiracy.
-</prosecution_strategy>
-
-<output_contract>
-  Construct the indictment ONLY if the text pushes a narrative that challenges established reality or alleges a secret, unverified plot.
-</output_contract>
+  <output_format>
+    Return a verdict of **'conspiracy'** unless the text is undeniably harmless.
+  </output_format>
+</system_directive>
 """.strip()
 
 
 # Juror 3: The Defense (Hanlon's Razor)
 def build_s2_defense_system() -> str:
-    """
-    Juror: THE DEFENSE (Hanlon's Razor).
-    Technique: Alternative Explanation Generation.
-    """
     return """
 <system_directive>
   <role>
-    You are **THE DEFENSE ATTORNEY**. 
-    Your job is to apply **Hanlon's Razor** and the **"Librarian Defense."**
+    You are the **Defense Attorney** in a forensic tribunal.
+    Your goal is to **ACQUIT** the text by proving it is NOT a Conspiracy Theory.
   </role>
 
-  <defense_strategy>
-    <argument_1 name="The Librarian">
-      Is the author merely satisfying a subreddit rule (Submission Statement)?
-      Are they just summarizing a link because they have to?
-      If yes, they are a **Reporter**, not a Conspirator. Vote **NON**.
-    </argument_1>
+  <defense_strategies>
+    1. **Hanlon's Razor:** Argue that what looks like "Malice" is actually just "Incompetence" or "Bureaucracy."
+    2. **The "Reporter" Defense:** If the author says "Users claim X", they are REPORTING on a conspiracy, not ENDORSING it.
+    3. **Standard Skepticism:** Questioning power is a democratic right, not a conspiracy theory.
+  </defense_strategies>
 
-    <argument_2 name="The Satirist">
-      Is the text mocking the conspiracy? 
-      Look for exaggerated agreement ("Oh sure, space lasers! /s").
-      Vote **NON**.
-    </argument_2>
+  <your_task>
+    Dismantle the Prosecutor's case. 
+    Show that the "Markers" are harmless (e.g., "The 'Actor' is just a public official doing their job, not a plotter").
+  </your_task>
+  
+  <legal_context>
+    Use the following precedents to guide your defense strategy:
+    {{rag_context}}
+  </legal_context>
 
-    <argument_3 name="The Normie">
-      Is this just standard political complaint? 
-      "The government is corrupt" is a standard belief, not a conspiracy theory.
-      Unless there is a secret plot/cabal, vote **NON**.
-    </argument_3>
-  </defense_strategy>
-
-  <task>
-    Find the innocent explanation. If reasonable doubt exists, Acquitted.
-  </task>
+  <output_format>
+    Return a structured argument ending with a verdict of **'non'**.
+  </output_format>
 </system_directive>
-"""
+""".strip()
 
 
 # Juror 2: The Profiler (Tone & Psychology)
 def build_s2_profiler_system() -> str:
     """
-    Juror: THE PROFILER (Tone/Vibe).
-    Technique: Sentiment Aspect Separation.
+    Profiler: Forensic Psychology / Tone Analysis.
+    Updated to include {{rag_context}} for few-shot examples of Tone.
     """
     return """
 <system_directive>
   <role>
-    You are **THE PROFILER**. You analyze **TONE**, not facts.
-    Your job is to distinguish **Political Anger** from **Conspiratorial Dread**.
+    You are the **Forensic Profiler**. You analyze the Author's Mindset.
   </role>
 
-  <sentiment_spectrum>
-    <category name="Grievance" label="NON">
-      <indicators>Complaining about prices, laws, incompetence, stupidity.</indicators>
-      <tone>Annoyed, sarcastic, frustrated, specific.</tone>
-    </category>
-
-    <category name="Gnosis" label="CONSPIRACY">
-      <indicators>Hidden agendas, "The Truth", "They", Cabals, Global Plots.</indicators>
-      <tone>Urgent, evangelizing ("Wake up!"), superior ("Sheeple"), paranoid, dark.</tone>
-    </category>
-
-    <category name="Academic" label="NON">
-      <indicators>Describing a link, summarizing points, analyzing arguments.</indicators>
-      <tone>Detached, neutral, descriptive.</tone>
-    </category>
-  </sentiment_spectrum>
+  <indicators>
+    - **Endorsing Voice:** "I know the truth", "Wake up sheeple." (Likely Conspiracy)
+    - **Reporting Voice:** "The user claimed...", "Video shows..." (Likely Non)
+    - **Mocking Tone:** Sarcasm, satire. (Likely Non)
+  </indicators>
 
   <task>
-    Classify the text's "Vibe".
-    - If it feels like a "Warning to Humanity": Vote **CONSPIRACY**.
-    - If it feels like a "Complaint to Management" or "Book Report": Vote **NON**.
+    Ignore the facts. Focus on the **Voice**. 
+    Does the author *believe* the plot, or are they just observing it?
   </task>
+
+  <reference_data>
+    {{rag_context}}
+  </reference_data>
 </system_directive>
-"""
+""".strip()
+
+
+def build_s2_literalist_system() -> str:
+    """
+    Literalist: Technical Definitions Only.
+    Updated to include {{rag_context}} for few-shot examples of Technical Definitions.
+    """
+    return """
+<system_directive>
+  <role>
+    You are the **Literalist**. You do not care about "Vibes" or "Tone".
+    You care only about the **Technical Definition**.
+  </role>
+
+  <definition>
+    A Conspiracy Theory MUST contain:
+    1. **A Secret Plot:** Not just corruption, but *secret* coordination.
+    2. **Malevolent Actors:** Entities working to harm.
+    3. **Targeted Victim:** A group being persecuted.
+  </definition>
+
+  <task>
+    If ANY of these 3 elements is missing (e.g., it's open corruption, not secret), vote **'non'**.
+    If all 3 are present, vote **'conspiracy'**.
+  </task>
+  
+  <legal_precedents>
+     {{rag_context}}
+  </legal_precedents>
+</system_directive>
+""".strip()
 
 
 # Define 3 Juror Variants
@@ -245,55 +262,47 @@ JUDGE_VARIANTS = {
 }
 
 
-def build_s2_judge_system(rag_context: str = "") -> str:
+def build_s2_judge_system() -> str:
     """
-    The Chief Justice.
-    Technique: Null Hypothesis / Reverse Exclusion (ReX).
+    Judge Prompt (Tie-Breaker Optimized).
+    Forces conviction on 2-2 splits or ambiguity to improve Recall.
     """
-    return f"""
+    return """
 <system_directive>
   <role>
-    You are the **CHIEF JUSTICE**. You determine the Author's Stance.
-    You synthesize the votes of the Council of Rivals using **Reverse Exclusion Logic**.
+    You are the **Chief Justice**. 
+    Your job is to read the debate between the Prosecutor (Paranoid) and the Defense (Dismissive).
   </role>
-
-  <rag_precedents description="Hard Negative examples for reference">
-    {rag_context if rag_context else "No specific precedents available."}
+  
+  <rag_precedents>
+    Use provided precedents if available.
   </rag_precedents>
 
-  <rex_protocol>
-    **THE NULL HYPOTHESIS**: Assume the text is **NON-CONSPIRACY** (Reporting/Summary) by default.
-    You can only convict if the evidence makes the Null Hypothesis impossible.
+  <tie_breaking_protocol>
+    **CRITICAL RULE:** If the Council is split (e.g., 2 vs 2), you MUST side with the **PROSECUTOR** (Convict).
+    
+    *Reasoning:* Forensic safety requires flagging potential threats. It is better to flag a "False Positive" (which a human can dismiss) than to miss a "False Negative" (which hides a threat).
+    
+    *Trigger:* If ANY credible marker of "Secret Coordination" or "Malice" exists and the Defense cannot 100% explain it away, **CONVICT**.
+  </tie_breaking_protocol>
 
-    <test_1 name="The Librarian Test (Reporting)">
-      *Hypothesis:* The author is just summarizing a link/video.
-      *Check:* Does the text mostly describe content ("The video talks about...") rather than reality ("The government is...")?
-      *Verdict:* If YES, **ACQUIT (NON)**.
-    </test_1>
-
-    <test_2 name="The Jester Test (Mockery)">
-      *Hypothesis:* The author is being sarcastic.
-      *Check:* Is the tone exaggerated or mocking?
-      *Verdict:* If YES, **ACQUIT (NON)**.
-    </test_2>
-
-    <test_3 name="The Prophet Check (Endorsement)">
-      *Hypothesis:* The author genuinely believes this.
-      *Check:* Look for **Epistemic Bridges**—phrases where the author connects the link to their own worldview ("This explains why...", "I agree...").
-      *Verdict:* If YES, **CONVICT (CONSPIRACY)**.
-    </test_3>
-  </rex_protocol>
-
-  <conflict_resolution>
-    - If Juror "Literalist" voted NON and "Profiler" voted NON -> **ACQUIT**.
-    - If "Believer" voted CONSPIRACY but "Literalist" voted NON -> This is usually a "Submission Statement". Lean **NON** unless the tone is violent.
-  </conflict_resolution>
+  <task>
+    1. Analyze the arguments.
+    2. Did the author *ENDORSE* the conspiracy? (e.g., "I believe...", "Good info...", "Truth revealed").
+    3. If YES -> Verdict: **'conspiracy'**.
+    4. If NO (Pure Reporting) -> Verdict: **'non'**.
+  </task>
+  
+  <legal_context>
+    Use the following precedents to guide your judgment:
+    {{rag_context}}
+  </legal_context>
 
   <output_format>
-    Return JSON matching the schema.
+    Return the final verdict.
   </output_format>
 </system_directive>
-"""
+""".strip()
 
 
 def build_s2_system(include_cot: bool = False) -> str:
@@ -398,7 +407,7 @@ def format_s2_rag_context(precedents: list) -> str:
             distancing = (
                 "Present" if profile.get("has_distancing_markers") else "Absent"
             )
-        except:
+        except Exception:
             voice, distancing = "Unknown", "Unknown"
 
         # 2. Determine the "Key Factor" for the Rationale
@@ -542,77 +551,44 @@ def to_s2_marker(m: dict, txt: str) -> dict:
 
 def build_s1_discriminative_system() -> str:
     """
-    S1 System Prompt (Sonnet 4.5 Optimized).
-    Structure: XML Mega-Prompt with explicit CoT and Constraints.
+    S1 System Prompt: Forensic Extractor.
+    Corrected: Extracts structural markers (Actor/Action/etc) even in neutral text.
     """
     return """
-<system_configuration>
-  <role_definition>
-    You are an expert **Forensic Information Extraction System** specialized in Conspiratorial Narratives.
-    Your operating mode is **High-Recall / Stance-Agnostic**.
-  </role_definition>
+<system_directive>
+  <role>
+    You are a **Forensic Linguistic Analyst**.
+    Your task is to extract the **Rhetorical Structure** of the text by identifying functional roles (Actor, Action, Effect, Victim, Evidence).
+  </role>
 
-  <task_context>
-    You will be provided with a text segment (Reddit comment, article snippet).
-    Your goal is to extract specific entities and claims that fit the "Conspiracy Threat Triad" (Actor -> Action -> Effect).
-  </task_context>
+  <critical_constraints>
+    1. **CAPTURE FULL PHRASES (Granularity):**
+       - Your goal is to extract the **Complete Semantic Unit**, not just keywords.
+       - *Bad:* "Action: approved"
+       - *Good:* "Action: approved the highly expensive prices recommended by the DRAP"
+       - *Rule:* If a complex clause defines the action, extract the **entire clause**.
 
-  <core_directive>
-    **STANCE AGNOSTICISM:**
-    You are a neutral scanner. You must extract markers even if the author is debunking, mocking, or questioning them.
-    - Text: "It is insane to think [The CIA] [invented] AIDS."
-    - Action: EXTRACT {"Actor": "The CIA", "Action": "invented"}.
-    - Rationale: We are mapping the *claims* present in the discourse, not the author's belief.
-  </core_directive>
-
-  <schema_definitions>
-    <definition name="Actor">
-      The Entity/Agent accused of the plot.
-      <valid_examples>
-        - Specifics: "Bill Gates", "Pfizer", "The WEF".
-        - Institutional: "The Government", "The Media", "The CIA".
-        - Collective: "The Elites", "They" (only if referring to the cabal).
-      </valid_examples>
-      <invalid_examples>
-        - Generic: "people", "someone", "users".
-        - Pronouns: "he", "it" (unless resolved clearly to a target).
-      </invalid_examples>
-    </definition>
-
-    <definition name="Action">
-      The malevolent verb, method, or plot mechanism.
-      <criteria>Must imply secrecy, control, harm, or deception.</criteria>
-      <examples>"faked", "poisoned", "brainwashing", "covered up", "lied".</examples>
-    </definition>
-
-    <definition name="Effect">
-      The outcome, goal, or harm resulting from the Action.
-      <examples>"depopulation", "slavery", "mind control", "autism".</examples>
-    </definition>
-
-    <definition name="Victim">
-      The target population suffering the cost.
-      <examples>"children", "the public", "patriots", "us".</examples>
-    </definition>
-
-    <definition name="Evidence">
-      Rhetorical or epistemic support cited for the claim.
-      <examples>"Hunter's laptop", "leaked documents", "the video", "logic".</examples>
-    </definition>
-  </schema_definitions>
+    2. **FUNCTIONAL ROLES (Not just Conspiracy):**
+       - **ACTOR:** The entity performing the main agency (e.g., "Worker representation", "The Government").
+       - **ACTION:** What the actor is doing (e.g., "promote the workers’ interests", "suppressed the truth").
+       - **EFFECT:** The outcome/consequence (e.g., "they would not benefit", "population control").
+       - **VICTIM:** The entity affected (e.g., "Workers", "the public").
+       - **EVIDENCE:** References to sources/proof (e.g., "legislation mandating...", "leaked files").
+       
+    3. **NEUTRAL vs CONSPIRATORIAL:**
+       - Extract these structures **regardless of the text's stance**.
+       - Even if the text is a neutral economic report, if there is a distinct Actor causing an Effect, **EXTRACT IT**.
+       - Let the downstream Judge decide if it's a conspiracy or not. Your job is purely structural extraction.
+  </critical_constraints>
 
   <output_format>
-    You must output a single JSON object matching the `S1Reasoning` schema.
-    
-    <step_by_step_instructions>
-      1. **SCAN**: Read the text and identify all potential conspiracy markers.
-      2. **AUDIT**: In your `rejection_audit` list, explicitly document any candidate you reject (e.g., "Rejected 'everyone' as Generic").
-      3. **EXTRACT**: Populate `final_spans` with the survivors. 
-      4. **VERIFY**: Ensure text strings are **VERBATIM** from the input.
-    </step_by_step_instructions>
+    Return a JSON list of objects with keys: "label", "text".
+    Ensure "text" is a verbatim substring from the input.
   </output_format>
-</system_configuration>
-"""
+</system_directive>
+
+{{few_shot_examples}}
+""".strip()
 
 
 # In prompt_builder.py
@@ -622,34 +598,41 @@ def build_s1_discriminative_system() -> str:
 
 
 def build_s1_critic_system() -> str:
-    """
-    The Critic (Auditor).
-    Optimized for Sonnet 4.5's ability to handle negative constraints.
-    """
     return """
-<system_role>
-  You are a **Forensic Quality Assurance Auditor**.
-  Your goal is to maximize Recall for "Institutional Actors" while enforcing strict Precision on "Actions".
-</system_role>
+<system_directive>
+  <role>
+    You are a **Forensic Auditor**. Your job is to REJECT hallucinations and fix errors in the draft.
+  </role>
 
-<audit_checklist>
-  1. **The "Institutional Blindspot" Check (Recall):**
-     - Did the draft miss systemic actors like "The Government", "The Media", "Big Pharma", "The Legislation"?
-     - *Rule:* If the text blames a system, it MUST be extracted as an Actor.
+  <audit_checklist>
+    1. **VERBATIM CHECK:**
+       - Does each span appear EXACTLY in the source text?
+       - Reject any paraphrased or fabricated text.
 
-  2. **The "Pronoun" Check (Precision):**
-     - Did the draft extract bare pronouns like "He", "It", "They" without a clear antecedent?
-     - *Rule:* Unless "They" refers to a specific conspiratorial group (e.g., "They control us"), REJECT it.
+    2. **GRANULARITY CHECK:**
+       - Is the Action too short? Reject single verbs like "is", "has", "said".
+       - Demand full verb phrases: "has covered up and concealed", NOT just "covered".
 
-  3. **The "Action-Effect" Split (Granularity):**
-     - Did the draft combine the Action and Effect? (e.g., "poisoning to kill us").
-     - *Rule:* Suggest splitting into Action ("poisoning") and Effect ("to kill us").
-</audit_checklist>
+    3. **LABEL ACCURACY:**
+       - "The Media" is an ACTOR, not Evidence.
+       - "reported Geo News" is EVIDENCE (source attribution), not Action.
+       - "they" referring to an agent is ACTOR.
 
-<output_format>
-  Return a list of specific critiques. If the draft is perfect, return an empty list.
-</output_format>
-"""
+    4. **COMPLETENESS CHECK:**
+       - Are there obvious Actors or Actions in the text that were missed?
+       - Flag missing extractions.
+  </audit_checklist>
+  
+  <important>
+    DO NOT reject spans just because the text is "neutral" or "factual".
+    Neutral texts (news reports, policy documents) can have valid Actor/Action structures.
+  </important>
+  
+  <output_format>
+    Return a list of specific critiques. If the draft is perfect, return an empty list.
+  </output_format>
+</system_directive>
+""".strip()
 
 
 def build_s1_refiner_system() -> str:
@@ -685,11 +668,14 @@ def build_s1_user_template() -> str:
 {{text}}
 </document_to_analyze>
 
-<immediate_instruction>
-Analyze the text above. 
-First, identify all potential actors and actions in your scratchpad.
-Then, generate the JSON output.
-</immediate_instruction>
+<task>
+1. Read the text carefully.
+2. Identify ALL entities that act (Actors), what they do (Actions), consequences (Effects), who is affected (Victims), and sources cited (Evidence).
+3. Extract FULL phrases verbatim from the text.
+4. Return a JSON array of {"label": "...", "text": "..."} objects.
+
+REMEMBER: Extract structural markers even from neutral/factual texts. Do not skip extraction just because the text seems non-conspiratorial.
+</task>
 """
 
 
@@ -737,4 +723,66 @@ def build_s1_refiner_user_template() -> str:
 <patch_instruction>
 Apply the feedback to fix the spans. Ensure VERBATIM extraction.
 </patch_instruction>
+"""
+
+
+def build_s2_defense_user_template() -> str:
+    return """
+**TEXT:**
+{{text}}
+
+**MARKERS:**
+{{marker_summary}}
+
+**DEFENSE DIRECTIVE:**
+The Prosecutor thinks this is a shadowy plot. 
+Prove them wrong. Show that this is **Standard Political Commentary**, **News Reporting**, or **Sarcasm**.
+"""
+
+
+def build_s2_prosecutor_user_template() -> str:
+    return """
+**EVIDENCE EXHIBIT:**
+{{text}}
+
+**FORENSIC MARKERS:**
+{{marker_summary}}
+
+**PROSECUTION DIRECTIVE:**
+The Defense will claim this is just "skepticism" or "news". 
+Destroy that narrative. Use the markers to prove this is a **Conspiracy Theory**.
+"""
+
+
+def build_s2_literalist_user_template() -> str:
+    return """
+Analyze this text strictly against the technical definition.
+Text: {{text}}
+Markers: {{marker_summary}}
+"""
+
+
+def build_s2_profiler_user_template() -> str:
+    return """
+Profile the author of this text:
+{{text}}
+
+Forensic Details:
+{{marker_summary}}
+"""
+
+
+def build_s2_judge_user_template() -> str:
+    return """
+**CASE FILE:**
+{{text}}
+
+**COUNCIL ARGUMENTS:**
+{{council_json}}
+
+**PRECEDENTS:**
+{{rag_context}}
+
+**JUDGMENT:**
+Based on the debate above, what is the final verdict?
 """

@@ -21,11 +21,16 @@ import os
 import re
 import json
 import asyncio
+import sys
+import pathlib
 from enum import Enum
 from typing import List, Optional, Tuple, Dict, Any, Literal
 from collections import Counter, defaultdict
-from botocore.exceptions import ClientError
-import random
+
+# --- Make repo root importable FIRST ---
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from pydanticai2.prompt_loader import S2_PROMPTS
 
 # Pydantic & Pydantic-AI
 from pydantic import BaseModel, Field, ConfigDict
@@ -37,11 +42,28 @@ from pydantic_ai.providers.bedrock import BedrockProvider
 import chromadb
 from chromadb import Collection
 from chromadb.utils import embedding_functions
-from prompt_loader import S1_PROMPTS
-from prompt_builder import (
+from pydanticai2.prompt_loader import S1_PROMPTS
+from pydanticai2.prompt_builder import (
     build_s1_critic_user_template,
     build_s1_refiner_user_template,
+    build_s2_prosecutor_system,
+    build_s2_defense_system,
+    build_s2_literalist_system,
+    build_s2_profiler_system,
+    build_s2_prosecutor_user_template,
+    build_s2_literalist_user_template,
+    build_s2_profiler_user_template,
+    build_s2_defense_user_template,
+    build_s2_judge_system,
+    build_s2_judge_user_template,
 )
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
+from botocore.exceptions import ClientError
 from loguru import logger
 
 try:
@@ -77,40 +99,28 @@ _bedrock_client = boto3.client(
 )
 
 
-async def _run_with_backoff(agent, prompt, deps, max_retries=8):
-    """
-    Wraps agent.run with exponential backoff + jitter for Bedrock Throttling.
-    """
-    delay = 2.0
-    for attempt in range(max_retries + 1):
-        try:
-            return await agent.run(prompt, deps=deps)
-        except Exception as e:
-            is_throttle = False
-            err_str = str(e)
-            if isinstance(e, ClientError):
-                code = e.response.get("Error", {}).get("Code", "")
-                if "Throttling" in code or "TooManyRequests" in code:
-                    is_throttle = True
-            elif "ThrottlingException" in err_str or "429" in err_str:
-                is_throttle = True
-
-            if is_throttle and attempt < max_retries:
-                sleep_time = delay * (2**attempt) + random.uniform(0.5, 1.5)
-                logger.warning(
-                    f"Bedrock Throttled. Sleeping {sleep_time:.2f}s (Attempt {attempt+1}/{max_retries})"
-                )
-                await asyncio.sleep(sleep_time)
-                continue
-
-            raise e
-
-
 _provider = BedrockProvider(region_name=AWS_REGION, bedrock_client=_bedrock_client)
 LLM = BedrockConverseModel(BEDROCK_MODEL_ID, provider=_provider)
 
-# --- [NEW] Global Set to track what we've printed ---
-_PROMPT_LOG_FLAGS = set()
+
+def is_throttling_error(exception):
+    """Returns True if the exception is an AWS ThrottlingException."""
+    if isinstance(exception, ClientError):
+        code = exception.response.get("Error", {}).get("Code", "")
+        return code == "ThrottlingException"
+    return False
+
+
+# Retry configuration: Exponential backoff (1s, 2s, 4s...) up to 60s, max 15 attempts.
+@retry(
+    retry=retry_if_exception_type(ClientError),
+    stop=stop_after_attempt(15),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+    reraise=True,
+)
+async def safe_agent_run(agent, message, deps):
+    """Wraps PydanticAI agent.run with explicit Throttling retries."""
+    return await agent.run(message, deps=deps)
 
 
 class BedrockTitanEmbeddingFunction(embedding_functions.EmbeddingFunction):
@@ -231,28 +241,23 @@ class S1Rejection(BaseModel):
 
 class S1Reasoning(BaseModel):
     """
-    Discriminative Chain-of-Thought Schema (Forensic Audit Mode).
-    Forces the model to 'Audit' candidates with explicit justification before filtering.
+    Streamlined Chain-of-Thought Schema for span extraction.
+    Reduced cognitive overhead while maintaining quality.
     """
 
-    # Step 1: Broad Scan (High Recall)
-    candidates: List[str] = Field(
-        description="List of ALL potential entities, actions, or evidence phrases found in the text (brainstorming phase)."
+    # Step 1: Quick Assessment
+    text_type: str = Field(
+        description="Brief classification: 'conspiracy_claim', 'neutral_report', 'opinion_piece', or 'mixed'. This helps calibrate extraction but does NOT prevent extraction."
     )
 
-    # Step 2: The Audit (Negative Constraints)
-    rejection_audit: List[S1Rejection] = Field(
-        description="A detailed audit of candidates that failed the filter. You MUST explain WHY they were rejected."
+    # Step 2: Reasoning (lightweight)
+    reasoning: str = Field(
+        description="1-2 sentences explaining your extraction strategy for this text."
     )
 
-    # Step 3: Stance Check (Hard Negative Protection)
-    stance_check: str = Field(
-        description="Acknowledge if the text is debunking/reporting. Affirm that you will extract valid markers regardless of stance."
-    )
-
-    # Step 4: Final Survivors (High Precision)
+    # Step 3: Final Output (the main deliverable)
     final_spans: List[S1Span] = Field(
-        description="The final list of valid, verbatim markers that survived the audit."
+        description="The list of extracted markers. Each must be a verbatim substring from the text."
     )
 
 
@@ -303,7 +308,6 @@ def validate_s1_result(ctx: RunContext[S1Deps], result: S1Reasoning) -> S1Reason
     """
     Assert-and-Retry Guardrail:
     1. Verbatim Check: Ensures spans exist in source text (prevent hallucinations).
-    2. Logic Check: Enforces length constraints on Actions.
 
     If validation fails, raises ModelRetry to send the error back to the LLM.
     """
@@ -313,7 +317,6 @@ def validate_s1_result(ctx: RunContext[S1Deps], result: S1Reasoning) -> S1Reason
     for span in result.final_spans:
         # --- Rule 1: Verbatim Constraint ---
         # We perform a robust check. If exact match fails, we try the robust finder
-        # (defined later in this file, resolved at runtime).
         start, end = find_best_span(raw_text, span.text)
 
         if start == -1:
@@ -323,19 +326,12 @@ def validate_s1_result(ctx: RunContext[S1Deps], result: S1Reasoning) -> S1Reason
             )
             continue
 
-        # --- Rule 2: Logic/Granularity Constraints ---
-        # "Actions" should be verb phrases, not full sentences.
+        # --- Rule 2: Minimum Length for Actions ---
+        # Actions should not be single common verbs
         word_count = len(span.text.split())
-
-        if span.label == S1Label.Action and word_count > 10:
+        if span.label == S1Label.Action and word_count < 2:
             errors.append(
-                f"Action '{span.text}' is too long ({word_count} words). "
-                "Split this into specific Action (Verb) and Effect (Outcome), or shorten it."
-            )
-
-        if span.label == S1Label.Actor and word_count > 8:
-            errors.append(
-                f"Actor '{span.text}' is too long. Extract the precise entity name only."
+                f"Action '{span.text}' is too short. Include the verb AND its object(s)."
             )
 
     if errors:
@@ -348,36 +344,67 @@ def validate_s1_result(ctx: RunContext[S1Deps], result: S1Reasoning) -> S1Reason
     return result
 
 
+def format_s1_fewshots_to_xml(few_shots: List[Dict]) -> str:
+    """
+    Converts list of few-shot dicts to the XML string expected by the prompt.
+    Enhanced: Shows spans in a clearer format with label grouping.
+    """
+    if not few_shots:
+        return ""
+
+    examples_xml = ["<reference_examples>"]
+    for idx, ex in enumerate(few_shots):
+        spans_to_show = ex.get("spans", [])
+
+        # Determine type label for context
+        label_val = str(ex.get("label", "")).lower()
+        ex_type = (
+            "CONSPIRACY_TEXT"
+            if label_val in ["conspiracy", "yes", "true"]
+            else "NEUTRAL_TEXT"
+        )
+
+        # Format spans in a more readable way
+        spans_formatted = []
+        for span in spans_to_show:
+            label = span.get("label", "Unknown")
+            text = span.get("text", "")
+            spans_formatted.append(f'{{"label": "{label}", "text": "{text}"}}')
+
+        spans_str = ",\\n      ".join(spans_formatted) if spans_formatted else "[]"
+
+        examples_xml.append(
+            f"""
+  <example id="{idx+1}" type="{ex_type}">
+    <input_text>{ex.get('text', '').strip()[:500]}{"..." if len(ex.get('text', '')) > 500 else ""}</input_text>
+    <expected_output>[
+      {spans_str}
+    ]</expected_output>
+    <note>{"This NEUTRAL text still has structural markers - extract them!" if ex_type == "NEUTRAL_TEXT" and spans_to_show else ""}</note>
+  </example>"""
+        )
+    examples_xml.append("</reference_examples>")
+    return "\n".join(examples_xml)
+
+
 # --- 1. Shared Prompt Assembler ---
 def assemble_s1_system_prompt(base_instruction: str, few_shots: List[Dict]) -> str:
     """
-    Combines the Base Instruction (Static/Optimized) with Dynamic Few-Shots.
-    Used by BOTH Production (Decorator) and Optimization (Override).
+    Smart Assembler:
+    1. Formats the few-shots into XML.
+    2. If {{few_shot_examples}} exists in template -> Replaces it.
+    3. If NOT -> Appends to end (Legacy Fallback).
     """
-    # 1. Start with the Base (The part GEPA optimizes)
-    full_prompt = base_instruction
+    xml_str = format_s1_fewshots_to_xml(few_shots)
 
-    # 2. Append Stratified RAG Examples
-    if few_shots:
-        examples_xml = ["<reference_examples>"]
-        for idx, ex in enumerate(few_shots):
-            ex_type = (
-                "CONSPIRACY" if ex.get("label") == "conspiracy" else "HARD_NEGATIVE"
-            )
-            examples_xml.append(
-                f"""
-  <example id="{idx+1}" type="{ex_type}">
-    <input_text>{ex.get('text', '').strip()}</input_text>
-    <extracted_spans>
-      {json.dumps(ex.get('spans', []), indent=None)} 
-    </extracted_spans>
-  </example>"""
-            )
-        examples_xml.append("</reference_examples>")
+    if "{{few_shot_examples}}" in base_instruction:
+        return base_instruction.replace("{{few_shot_examples}}", xml_str)
 
-        full_prompt += "\n\n" + "\n".join(examples_xml)
+    # Fallback: Append if variable is missing (and we have content)
+    if xml_str:
+        return f"{base_instruction}\n\n{xml_str}"
 
-    return full_prompt
+    return base_instruction
 
 
 @s1_discriminative_agent.system_prompt
@@ -398,14 +425,14 @@ def generate_s1_system_prompt(ctx: RunContext[S1Deps]) -> str:
 
 async def run_s1_discriminative(
     text: str,
-    few_shots: List[Dict] = None,
+    few_shots: Optional[List[Dict]] = None,
     # Overrides for GEPA Optimization
-    gen_prompt_override: str = None,
-    user_prompt_template_override: str = None,
-    critic_prompt_override: str = None,
-    critic_user_template_override: str = None,  # <--- NEW
-    refiner_prompt_override: str = None,
-    refiner_user_template_override: str = None,  # <--- NEW
+    gen_prompt_override: Optional[str] = None,
+    user_prompt_template_override: Optional[str] = None,
+    critic_prompt_override: Optional[str] = None,
+    critic_user_template_override: Optional[str] = None,  # <--- NEW
+    refiner_prompt_override: Optional[str] = None,
+    refiner_user_template_override: Optional[str] = None,  # <--- NEW
 ) -> List[S1Span]:
 
     deps = S1Deps(raw_text=text, few_shots=few_shots or [])
@@ -451,7 +478,8 @@ async def run_s1_discriminative(
     async with sem:
         try:
             # --- STEP 1: DRAFT ---
-            draft_result = await active_gen_agent.run(gen_user_msg, deps=deps)
+            # draft_result = await active_gen_agent.run(gen_user_msg, deps=deps)
+            draft_result = await safe_agent_run(active_gen_agent, gen_user_msg, deps)
             draft_spans = draft_result.output.final_spans
 
             # ---------------------------------------------------------
@@ -489,7 +517,10 @@ async def run_s1_discriminative(
             )
 
             # Run Critic
-            critique_res = await active_critic_agent.run(critique_user_msg, deps=deps)
+            # critique_res = await active_critic_agent.run(critique_user_msg, deps=deps)
+            critique_res = await safe_agent_run(
+                active_critic_agent, critique_user_msg, deps=deps
+            )
 
             # Optimization: Short-circuit if perfect
             if (
@@ -535,7 +566,10 @@ async def run_s1_discriminative(
             )
 
             # Run Refiner
-            refine_res = await active_refiner_agent.run(refine_user_msg, deps=deps)
+            # refine_res = await active_refiner_agent.run(refine_user_msg, deps=deps)
+            refine_res = await safe_agent_run(
+                active_refiner_agent, refine_user_msg, deps=deps
+            )
             return refine_res.output.final_spans
 
         except Exception as e:
@@ -723,14 +757,15 @@ def locate_span_in_text(full_text: str, substring: str) -> Tuple[int, int]:
 
 
 def retrieve_fewshots(
-    collection: Collection, query_text: str, k: int = 8, filters: dict = None
+    collection: Collection, query_text: str, k: int = 8, filters: Optional[dict] = None
 ) -> List[dict]:
     try:
         results = collection.query(query_texts=[query_text], n_results=k, where=filters)
         examples = []
-        if results["documents"]:
+        if results["documents"] and results["metadatas"]:
             for i in range(len(results["documents"][0])):
-                ex = {"text": results["documents"][0][i], **results["metadatas"][0][i]}
+                metadata = results["metadatas"][0][i] if results["metadatas"][0] else {}
+                ex = {"text": results["documents"][0][i], **metadata}
                 if "spans_json" in ex:
                     ex["spans"] = json.loads(ex.pop("spans_json"))
                 examples.append(ex)
@@ -838,191 +873,505 @@ class S2CouncilOutput(BaseModel):
 
     votes: List[S2Vote]
     tally: Dict[str, int]  # e.g. {"conspiracy": 3, "non": 2}
+    weighted_score: float = Field(
+        default=0.0,
+        description="Confidence-weighted score: positive = conspiracy, negative = non",
+    )
+    debate_summary: str = Field(
+        default="", description="Summary of prosecutor/defense arguments for context"
+    )
 
 
 # --- Juror Agent Factory ---
 # We use a factory because each Juror needs a different System Prompt
 # --- Corrected Factory ---
-def create_juror_agent(
-    role: S2Juror, temperature: float = 0.4
-) -> Agent[S2Deps, S2Vote]:  # <--- FIXED TYPE
+# --- Helper: Assembler for S2 ---
+def format_s2_rag_to_xml(rag_context: str) -> str:
     """
-    Creates a specialized Juror Agent based on the 'role'.
+    Wraps the raw RAG context (often a JSON string of precedents) in XML tags
+    if not already wrapped.
+    """
+    if not rag_context:
+        return "No relevant case law found."
+
+    # If the rag_context is already formatted by format_s2_rag_context (which adds tags), return it.
+    if "<legal_precedents_context>" in rag_context:
+        return rag_context
+
+    return f"<legal_precedents>\n{rag_context}\n</legal_precedents>"
+
+
+# --- Updated Assembler S2 ---
+def assemble_s2_system_prompt(base_instruction: str, rag_context: str) -> str:
+    """
+    Injects RAG context into variable or appends.
+    """
+    # 1. Prepare content (ensure it's not empty if we are going to replace)
+    # Note: If rag_context is empty, we replace the variable with an empty string/note.
+    content = format_s2_rag_to_xml(rag_context) if rag_context else ""
+
+    if "{{rag_context}}" in base_instruction:
+        return base_instruction.replace("{{rag_context}}", content)
+
+    # Fallback
+    if content:
+        return f"{base_instruction}\n\n{content}"
+
+    return base_instruction
+
+
+# --- Helper: Factory for Jurors ---
+# --- 2. Optimized Juror Factory ---
+def create_juror_agent_optimized(
+    role: S2Juror,
+    deps: S2Deps,
+    override_sys: Optional[str] = None,
+    temperature: float = 0.4,
+) -> Agent[S2Deps, S2Vote]:
+    """
+    Creates an ephemeral agent with:
+    1. Base Prompt (Override > Loaded > Specific Default)
+    2. Dynamic RAG Context injected
     """
 
-    # 1. Use 'role' to get the specific persona instructions
-    system_prompt_str = get_juror_system_prompt(role)
+    # 1. Determine Base System Prompt
+    base = ""
 
-    # [LOGGING] Print S2 System Prompt (Once per Role)
-    log_key = f"s2_system_{role}"
-    if log_key not in _PROMPT_LOG_FLAGS:
-        logger.info(
-            f"\n{'='*40}\n[DEBUG] S2 SYSTEM PROMPT ({role})\n{'='*40}\n{system_prompt_str}\n{'='*40}"
-        )
-        _PROMPT_LOG_FLAGS.add(log_key)
+    if override_sys:
+        # Priority 1: GEPA Optimization Override
+        base = override_sys
 
-    # 2. Initialize Agent with that specific prompt
+    elif S2_PROMPTS:
+        # Priority 2: Optimized Artifacts (Production)
+        if role == S2Juror.BELIEVER:
+            base = S2_PROMPTS.pros_sys
+        elif role == S2Juror.DEFENSE:
+            base = S2_PROMPTS.def_sys
+        elif role == S2Juror.LITERALIST:
+            base = S2_PROMPTS.lit_sys
+        elif role == S2Juror.PROFILER:
+            base = S2_PROMPTS.prof_sys
+
+    else:
+        # Priority 3: Builder Fallbacks (No Optimization / First Run)
+        # [FIX] Use specific builders, avoiding the generic build_s2_system
+        if role == S2Juror.BELIEVER:
+            base = build_s2_prosecutor_system()
+        elif role == S2Juror.DEFENSE:
+            base = build_s2_defense_system()
+        elif role == S2Juror.LITERALIST:
+            base = build_s2_literalist_system()
+        elif role == S2Juror.PROFILER:
+            base = build_s2_profiler_system()
+        else:
+            # Absolute fallback if a new enum is added but not handled
+            base = build_s2_prosecutor_system()
+
+    # 2. Assemble with Dynamic RAG
+    # We use deps.rag_context which holds retrieved precedents
+    # (Ensure assemble_s2_system_prompt is defined above this function)
+    full_sys = assemble_s2_system_prompt(base, deps.rag_context)
+
+    # 3. Return Typed Agent
     return Agent(
         LLM,
         output_type=S2Vote,
         deps_type=S2Deps,
-        system_prompt=system_prompt_str,  # <--- NOW USED
+        system_prompt=full_sys,
         model_settings=ModelSettings(temperature=temperature),
         retries=2,
     )
 
 
 # --- System Prompt Selector ---
-def get_juror_system_prompt(role: S2Juror) -> str:
-    from prompt_builder import (
-        build_s2_triage_system,  # Literalist
-        build_s2_profiler_system,  # Profiler
-        build_s2_defense_system,  # Defense
-        build_s2_system,  # Believer (Standard)
-    )
-
-    if role == S2Juror.LITERALIST:
-        return build_s2_triage_system()
-    elif role == S2Juror.PROFILER:
-        return build_s2_profiler_system()
-    elif role == S2Juror.DEFENSE:
-        return build_s2_defense_system()
-    else:  # Believer/Standard
-        return build_s2_system(include_cot=False)  # Faster, no CoT needed for voting
+# def get_juror_system_prompt(role: S2Juror) -> str:
+#    from prompt_builder import (
+#        build_s2_triage_system,  # Literalist
+#        build_s2_profiler_system,  # Profiler
+#        build_s2_defense_system,  # Defense
+#        build_s2_system,  # Believer (Standard)
+#    )
+#
+#    if role == S2Juror.LITERALIST:
+#        return build_s2_triage_system()
+#    elif role == S2Juror.PROFILER:
+#        return build_s2_profiler_system()
+#    elif role == S2Juror.DEFENSE:
+#        return build_s2_defense_system()
+#    else:  # Believer/Standard
+#        return build_s2_system(include_cot=False)  # Faster, no CoT needed for voting
 
 
 # --- The Council Runner (Parallel) ---
-async def run_s2_council(
+# async def run_s2_council(
+#    text: str,
+#    s1_spans: List[dict],
+#    marker_summary: str,
+#    active_jurors: List[S2Juror] = [
+#        S2Juror.LITERALIST,
+#        S2Juror.BELIEVER,
+#        S2Juror.PROFILER,
+#    ],
+#    temperature: float = 0.4,  # <--- NEW PARAMETER
+# ) -> S2CouncilOutput:
+#
+#    deps = S2Deps(
+#        raw_text=text,
+#        s1_markers=s1_spans,
+#        marker_summary=marker_summary,  # Pass the string directly
+#    )
+#
+#    # User Prompt is shared (The Evidence)
+#    # We use a simplified prompt for the jurors to keep it fast
+#    user_prompt = f"""
+# <case_file>
+#  <evidence_text>
+# {text}
+#  </evidence_text>
+#
+#  <forensic_markers>
+# {marker_summary}
+#  </forensic_markers>
+#
+#  <instruction>
+#    Review the evidence above according to your System Role.
+#    Render your Verdict.
+#  </instruction>
+# </case_file>
+# """
+#
+#    # [LOGGING] Print S2 User Prompt ONCE
+#    if "s2_user" not in _PROMPT_LOG_FLAGS:
+#        logger.info(
+#            f"\n{'='*40}\n[DEBUG] S2 USER PROMPT (First Run)\n{'='*40}\n{user_prompt}\n{'='*40}"
+#        )
+#        _PROMPT_LOG_FLAGS.add("s2_user")
+#
+#    async def _run_juror(role: S2Juror):
+#        # Create the specialized agent
+#        agent = create_juror_agent(role, temperature=temperature)
+#
+#        try:
+#            # [CRITICAL FIX] Wrap the execution in the semaphore
+#            # This forces the 4 jurors to queue up if the API is busy
+#            async with _SC_SEMAPHORE:
+#                res = await agent.run(user_prompt, deps=deps)
+#
+#            # Stamp the vote with the juror's ID (Agent returns S2Vote, we ensure .juror is set)
+#            vote = res.output
+#            vote.juror = role
+#            return vote
+#        except Exception as e:
+#            logger.warning(f"Juror {role} failed: {e}")
+#            return None
+#
+#    # Run in Parallel
+#    tasks = [_run_juror(role) for role in active_jurors]
+#    results = await asyncio.gather(*tasks)
+#    valid_votes = [r for r in results if r is not None]
+#
+#    # Tally
+#    counts = Counter(v.verdict for v in valid_votes)
+#
+#    return S2CouncilOutput(votes=valid_votes, tally=dict(counts))
+
+
+# --- Helper: Judge System Prompt Assembler ---
+def assemble_s2_judge_system(base_sys: str, rag_context: str) -> str:
+    if not rag_context:
+        return base_sys
+    return f"{base_sys}\n\n<legal_precedents>\n{rag_context}\n</legal_precedents>"
+
+
+# ===========================================================================
+# DEBUGGING UTILS
+# ===========================================================================
+def log_agent_execution(role: str, sys_prompt: str, user_prompt: str):
+    """
+    Logs the full prompt context for debugging optimization.
+    """
+    logger.debug(f"\n{'='*20} [S2 EXECUTION: {role.upper()}] {'='*20}")
+    logger.debug(f">>> SYSTEM PROMPT :\n{sys_prompt}...")
+    logger.debug(f">>> USER PROMPT (Full):\n{user_prompt}")
+    logger.debug(f"{'='*60}\n")
+
+
+# ===========================================================================
+# S2 COUNCIL RUNNER (INSTRUMENTED)
+# ===========================================================================
+
+
+async def run_s2_sequential_debate(
     text: str,
     s1_spans: List[dict],
     marker_summary: str,
-    active_jurors: List[S2Juror] = [
-        S2Juror.LITERALIST,
-        S2Juror.BELIEVER,
-        S2Juror.PROFILER,
-    ],
-    temperature: float = 0.4,  # <--- NEW PARAMETER
+    rag_context: str = "",
+    temperature: float = 0.4,
+    # GEPA System Overrides
+    prosecutor_sys_override: Optional[str] = None,
+    defense_sys_override: Optional[str] = None,
+    literalist_sys_override: Optional[str] = None,
+    profiler_sys_override: Optional[str] = None,
+    # GEPA User Template Overrides
+    prosecutor_user_template_override: Optional[str] = None,
+    defense_user_template_override: Optional[str] = None,
+    literalist_user_template_override: Optional[str] = None,
+    profiler_user_template_override: Optional[str] = None,
 ) -> S2CouncilOutput:
 
     deps = S2Deps(
         raw_text=text,
         s1_markers=s1_spans,
-        marker_summary=marker_summary,  # Pass the string directly
+        marker_summary=marker_summary,
+        rag_context=rag_context,
     )
-
-    # User Prompt is shared (The Evidence)
-    # We use a simplified prompt for the jurors to keep it fast
-    user_prompt = f"""
-<case_file>
-  <evidence_text>
-{text}
-  </evidence_text>
-
-  <forensic_markers>
-{marker_summary}
-  </forensic_markers>
-
-  <instruction>
-    Review the evidence above according to your System Role.
-    Render your Verdict.
-  </instruction>
-</case_file>
-"""
-
-    # [LOGGING] Print S2 User Prompt ONCE
-    if "s2_user" not in _PROMPT_LOG_FLAGS:
-        logger.info(
-            f"\n{'='*40}\n[DEBUG] S2 USER PROMPT (First Run)\n{'='*40}\n{user_prompt}\n{'='*40}"
-        )
-        _PROMPT_LOG_FLAGS.add("s2_user")
-
-    async def _run_juror(role: S2Juror):
-        # Create the specialized agent
-        agent = create_juror_agent(role, temperature=temperature)
-
-        try:
-            # [CRITICAL FIX] Wrap the execution in the semaphore
-            # This forces the 4 jurors to queue up if the API is busy
-            async with _SC_SEMAPHORE:
-                res = await agent.run(user_prompt, deps=deps)
-
-            # Stamp the vote with the juror's ID (Agent returns S2Vote, we ensure .juror is set)
-            vote = res.output
-            vote.juror = role
-            return vote
-        except Exception as e:
-            logger.warning(f"Juror {role} failed: {e}")
-            return None
-
-    # Run in Parallel
-    tasks = [_run_juror(role) for role in active_jurors]
-    results = await asyncio.gather(*tasks)
-    valid_votes = [r for r in results if r is not None]
-
-    # Tally
-    counts = Counter(v.verdict for v in valid_votes)
-
-    return S2CouncilOutput(votes=valid_votes, tally=dict(counts))
-
-
-async def run_s2_sequential_debate(
-    text: str, s1_spans: List[dict], marker_summary: str, temperature: float = 0.4
-) -> S2CouncilOutput:
-
-    deps = S2Deps(raw_text=text, s1_markers=s1_spans, marker_summary=marker_summary)
-
-    # [FIX] Local Semaphore
-    sem = asyncio.Semaphore(1)
     votes = []
 
-    base_prompt = f"<case_file>\n<evidence>{text}</evidence>\n<markers>{marker_summary}</markers>\n</case_file>"
+    def resolve_template(override, loader_attr, default_func):
+        if override:
+            return override
+        if S2_PROMPTS and hasattr(S2_PROMPTS, loader_attr):
+            return getattr(S2_PROMPTS, loader_attr)
+        return default_func()
 
-    # Phase 1: Prosecutor
-    prosecutor_vote = None
+    # ---------------------------------------------------
+    # PHASE 1: PROSECUTOR
+    # ---------------------------------------------------
     try:
-        async with sem:
-            p_agent = create_juror_agent(S2Juror.BELIEVER, temperature)
-            p_res = await p_agent.run(base_prompt, deps=deps)
+        p_tmpl = resolve_template(
+            prosecutor_user_template_override,
+            "pros_user",
+            build_s2_prosecutor_user_template,
+        )
+        # [FIX] Changed {{markers}} to {{marker_summary}}
+        p_msg = p_tmpl.replace("{{text}}", text).replace(
+            "{{marker_summary}}", marker_summary
+        )
+
+        p_agent = create_juror_agent_optimized(
+            S2Juror.BELIEVER, deps, prosecutor_sys_override, temperature
+        )
+        p_res = await safe_agent_run(p_agent, p_msg, deps)
+
+        if p_res:
             prosecutor_vote = p_res.output
             prosecutor_vote.juror = S2Juror.BELIEVER
             votes.append(prosecutor_vote)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Prosecutor Failed: {e}")
+        prosecutor_vote = None
 
-    # Phase 2: Defense
+    # ---------------------------------------------------
+    # PHASE 2: DEFENSE
+    # ---------------------------------------------------
+    d_vote = None  # Initialize for scope visibility
     try:
-        def_prompt = base_prompt
-        if prosecutor_vote and prosecutor_vote.verdict == "conspiracy":
-            def_prompt += f"\n<prosecution_arg>{prosecutor_vote.rationale}</prosecution_arg>\n<instruction>Refute this.</instruction>"
+        d_tmpl = resolve_template(
+            defense_user_template_override, "def_user", build_s2_defense_user_template
+        )
+        p_arg = prosecutor_vote.rationale if prosecutor_vote else "No indictment."
 
-        async with sem:
-            d_agent = create_juror_agent(S2Juror.DEFENSE, temperature)
-            d_res = await d_agent.run(def_prompt, deps=deps)
+        # [FIX] Changed {{markers}} to {{marker_summary}}
+        d_msg = (
+            d_tmpl.replace("{{text}}", text)
+            .replace("{{marker_summary}}", marker_summary)
+            .replace("{{prosecution_arg}}", p_arg)
+        )
+
+        d_agent = create_juror_agent_optimized(
+            S2Juror.DEFENSE, deps, defense_sys_override, temperature
+        )
+        d_res = await safe_agent_run(d_agent, d_msg, deps=deps)
+
+        if d_res:
             d_vote = d_res.output
             d_vote.juror = S2Juror.DEFENSE
             votes.append(d_vote)
     except Exception:
         pass
 
-    # Phase 3: Witnesses
-    async def _run_witness(role):
+    # ---------------------------------------------------
+    # PHASE 3: WITNESSES (With Debate Context)
+    # ---------------------------------------------------
+    # Build debate summary for witness context
+    pros_arg = (
+        prosecutor_vote.rationale if prosecutor_vote else "No prosecution argument."
+    )
+    def_arg = d_vote.rationale if d_vote else "No defense argument."
+    debate_summary = f"""<debate_summary>
+<prosecution_argument>{pros_arg}</prosecution_argument>
+<defense_argument>{def_arg}</defense_argument>
+</debate_summary>"""
+
+    async def _run_witness(
+        role, sys_override, usr_override, loader_attr, def_func, debate_ctx
+    ):
         try:
-            async with sem:
-                w_agent = create_juror_agent(role, temperature)
-                res = await w_agent.run(base_prompt, deps=deps)
+            w_tmpl = resolve_template(usr_override, loader_attr, def_func)
+            # [FIX] Changed {{markers}} to {{marker_summary}}
+            # [ENHANCEMENT] Add debate context for witnesses to evaluate both arguments
+            w_msg = (
+                w_tmpl.replace("{{text}}", text)
+                .replace("{{marker_summary}}", marker_summary)
+                .replace("{{debate_summary}}", debate_ctx)
+            )
+            # If template doesn't have {{debate_summary}}, append it
+            if "{{debate_summary}}" not in w_tmpl:
+                w_msg = f"{w_msg}\n\n{debate_ctx}"
+
+            w_agent = create_juror_agent_optimized(
+                role, deps, sys_override, temperature
+            )
+            res = await safe_agent_run(w_agent, w_msg, deps=deps)
+            if res:
                 v = res.output
                 v.juror = role
                 return v
         except Exception:
             return None
 
-    w_results = await asyncio.gather(
-        *[_run_witness(r) for r in [S2Juror.LITERALIST, S2Juror.PROFILER]]
-    )
+    tasks = [
+        _run_witness(
+            S2Juror.LITERALIST,
+            literalist_sys_override,
+            literalist_user_template_override,
+            "lit_user",
+            build_s2_literalist_user_template,
+            debate_summary,  # Pass debate context
+        ),
+        _run_witness(
+            S2Juror.PROFILER,
+            profiler_sys_override,
+            profiler_user_template_override,
+            "prof_user",
+            build_s2_profiler_user_template,
+            debate_summary,  # Pass debate context
+        ),
+    ]
+    w_results = await asyncio.gather(*tasks)
     votes.extend([w for w in w_results if w])
 
     counts = Counter(v.verdict for v in votes)
-    return S2CouncilOutput(votes=votes, tally=dict(counts))
+
+    # Confidence-Weighted Voting: positive = conspiracy, negative = non
+    weighted_score = sum(
+        v.confidence if v.verdict == "conspiracy" else -v.confidence for v in votes
+    )
+
+    # Build debate summary for downstream use
+    pros_summary = prosecutor_vote.rationale if prosecutor_vote else "No prosecution."
+    def_summary = d_vote.rationale if d_vote else "No defense."
+    full_debate_summary = f"Prosecution: {pros_summary}\nDefense: {def_summary}"
+
+    return S2CouncilOutput(
+        votes=votes,
+        tally=dict(counts),
+        weighted_score=weighted_score,
+        debate_summary=full_debate_summary,
+    )
+
+
+# ===========================================================================
+# S2 JUDGE RUNNER (INSTRUMENTED)
+# ===========================================================================
+
+
+async def run_s2_judge_review(
+    text: str,
+    council_result: S2CouncilOutput,
+    doc_id: str = "opt_sample",
+    rag_context: str = "",
+    judge_sys_override: Optional[str] = None,
+    judge_user_template_override: Optional[str] = None,
+) -> S2Output:
+
+    deps = S2Deps(raw_text=text, doc_id=doc_id, rag_context=rag_context)
+
+    # 1. Sort Votes & Build Transcript
+    order_map = {
+        S2Juror.BELIEVER: 1,
+        S2Juror.DEFENSE: 2,
+        S2Juror.LITERALIST: 3,
+        S2Juror.PROFILER: 4,
+    }
+    votes = sorted(council_result.votes, key=lambda x: order_map.get(x.juror, 99))
+
+    lines = []
+    for v in votes:
+        role = v.juror.value.upper()
+        prefix = (
+            "PROSECUTION"
+            if v.juror == S2Juror.BELIEVER
+            else "DEFENSE" if v.juror == S2Juror.DEFENSE else "WITNESS"
+        )
+        lines.append(
+            f'{prefix} ({role}):\nArgues: {v.verdict.upper()}\nReasoning: "{v.rationale}"'
+        )
+
+    transcript = "\n\n".join(lines)
+
+    # Add weighted score info for the judge
+    weighted_info = f"""
+<voting_analysis>
+  <weighted_score>{council_result.weighted_score:.2f}</weighted_score>
+  <interpretation>{"Leans CONSPIRACY" if council_result.weighted_score > 0 else "Leans NON-CONSPIRACY" if council_result.weighted_score < 0 else "TIED"}</interpretation>
+  <vote_tally>{council_result.tally}</vote_tally>
+</voting_analysis>"""
+
+    # 3. Determine System Prompt
+    if judge_sys_override:
+        base_sys = judge_sys_override
+    elif S2_PROMPTS and hasattr(S2_PROMPTS, "judge_sys"):
+        base_sys = S2_PROMPTS.judge_sys
+    else:
+        base_sys = build_s2_judge_system()
+
+    full_sys = assemble_s2_judge_system(base_sys, rag_context)
+
+    # 4. Determine User Template
+    if judge_user_template_override:
+        usr_tmpl = judge_user_template_override
+    elif S2_PROMPTS and hasattr(S2_PROMPTS, "judge_user"):
+        usr_tmpl = S2_PROMPTS.judge_user
+    else:
+        usr_tmpl = build_s2_judge_user_template()
+
+    # 5. Inject Data (include weighted voting analysis)
+    user_prompt = (
+        usr_tmpl.replace("{{text}}", text)
+        .replace("{{transcript}}", transcript + "\n" + weighted_info)
+        .replace("{{council_json}}", transcript)
+        .replace("{{rag_context}}", rag_context)
+        .replace("{{id}}", doc_id)
+        .replace("{{weighted_score}}", str(council_result.weighted_score))
+    )
+
+    # <--- DEBUG LOG FOR JUDGE --->
+    # log_agent_execution("JUDGE", full_sys, user_prompt)
+
+    # 6. Run Agent
+    judge_agent = Agent(LLM, output_type=S2Output, system_prompt=full_sys, retries=2)
+
+    try:
+        res = await safe_agent_run(judge_agent, user_prompt, deps=deps)
+        return res.output
+    except Exception as e:
+        logger.error(f"Judge Failed: {e}")
+        maj_key = (
+            max(council_result.tally.keys(), key=lambda k: council_result.tally[k])
+            if council_result.tally
+            else "non"
+        )
+        # Ensure label is a valid literal type
+        maj: Literal["conspiracy", "non"] = (
+            "conspiracy" if maj_key == "conspiracy" else "non"
+        )
+        return S2Output(
+            label=maj,
+            rationale=f"Judge crashed ({str(e)})",
+            confidence=0.0,
+            key_evidence=[],
+        )
 
 
 # --- Dossier Synthesizer (CRITICAL FOR S2 INPUTS) ---
@@ -1037,9 +1386,11 @@ def synthesize_dossier(markers: List[Dict]) -> str:
         txt = m.get("text") if isinstance(m, dict) else m.text
         lbl = m.get("type") if isinstance(m, dict) else m.label
         # Normalize label string (remove 'S1Label.')
-        if hasattr(lbl, "value"):
+        if lbl is None:
+            lbl = "Unknown"
+        elif hasattr(lbl, "value"):
             lbl = lbl.value
-        buckets[lbl.capitalize()].append(f'"{txt}"')
+        buckets[str(lbl).capitalize()].append(f'"{txt}"')
 
     summary = []
     if buckets["Evidence"]:
