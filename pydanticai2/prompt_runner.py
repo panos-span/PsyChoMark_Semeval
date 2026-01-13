@@ -40,6 +40,40 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 LOG_BUFFERS = defaultdict(list)
 
 
+# --- Cost Estimation Helper ---
+class TokenMeter:
+    """Tracks token usage and estimates cost (based on Claude 3.5 Sonnet rates)."""
+
+    def __init__(self):
+        self.input_tokens = 0
+        self.output_tokens = 0
+        # Rates per 1M tokens (Approximate for Sonnet)
+        self.INPUT_RATE = 3.00
+        self.OUTPUT_RATE = 15.00
+
+    def add(self, usage: Dict[str, int]):
+        if not usage:
+            return
+        self.input_tokens += usage.get("input_tokens", 0)
+        self.output_tokens += usage.get("output_tokens", 0)
+
+    def total_cost(self) -> float:
+        in_cost = (self.input_tokens / 1_000_000) * self.INPUT_RATE
+        out_cost = (self.output_tokens / 1_000_000) * self.OUTPUT_RATE
+        return in_cost + out_cost
+
+    def __str__(self):
+        return (
+            f"Tokens: {self.input_tokens + self.output_tokens:,} "
+            f"(In: {self.input_tokens:,}, Out: {self.output_tokens:,}) "
+            f"| Est. Cost: ${self.total_cost():.4f}"
+        )
+
+
+# Global Meter
+GLOBAL_METER = TokenMeter()
+
+
 # ---------- .env loader (no deps) ----------
 def _load_dotenv_into_environ():
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -67,9 +101,14 @@ import pydanticai2.prompt_builder as prompt_builder
 from pydanticai2.prompt_loader import S1_PROMPTS, S2_PROMPTS
 
 
-# Import the new S1 Graph (The "Consensus Engine")
+# Import the S1 Graph (DD-CoT: Generator → Critic → Refiner)
 from pydanticai2.s1_graph import s1_graph
-from pydanticai2.psycomark_graph import s2_graph
+
+# Import S2 Graphs - Legacy (Sequential Debate) and Parallel (Anti-Echo Chamber)
+from pydanticai2.psycomark_graph import (
+    s2_graph,  # Legacy: Sequential Debate
+    s2_parallel_graph,  # New: Anti-Echo Chamber (Parallel Voting)
+)
 
 # --- Logging Configuration ---
 LOG_BUFFERS: Dict[str, List[str]] = {}
@@ -150,6 +189,20 @@ def load_input(path: str, fmt: str) -> List[Dict[str, Any]]:
     return items
 
 
+def append_jsonl(file_name: str, item: Dict):
+    """Crash-proof incremental saving."""
+    with open(file_name, "a", encoding="utf-8") as f:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def finalize_zip(jsonl_name: str, zip_name: str):
+    """Compresses the final output."""
+    if os.path.exists(jsonl_name):
+        with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(jsonl_name)
+        logger.info(f"Compressed {jsonl_name} -> {zip_name}")
+
+
 def save_jsonl(file_name: str, zip_name: str, items: List[Dict]):
     """Saves output to JSONL and immediately zips it for leaderboard submission."""
     with open(file_name, "w", encoding="utf-8") as f:
@@ -194,7 +247,10 @@ async def process_document(
             s1_rag = rag_collections.get("s1")
             few_shots = []
             if s1_rag:
-                few_shots = agents_mod.retrieve_stratified_s1(s1_rag, text)
+                if args.rerank:
+                    few_shots = agents_mod.retrieve_stratified_s1_reranked(s1_rag, text)
+                else:
+                    few_shots = agents_mod.retrieve_stratified_s1(s1_rag, text)
 
             s1_initial_state = {
                 "doc_id": doc_id,
@@ -209,8 +265,33 @@ async def process_document(
             # 2. Invoke S1 Graph
             final_state = await s1_graph.ainvoke(s1_initial_state)
 
+            # [Optimization] Track S1 Tokens
+            if "token_usage" in final_state:
+                GLOBAL_METER.add(final_state["token_usage"])
+
             # 3. Extract Results
             verified_spans = final_state.get("final_spans", [])
+
+            # --- [NEW] Extract Dynamic Metadata from S1 Generator ---
+            # We look for the raw DDCoTExtraction object to get complexity/narrative
+            complexity = "Unknown"
+            narrative = "Unknown"
+
+            # Try to find the generator output in the graph state
+            # Adjust 'generator_output' key based on your s1_graph.py implementation
+            gen_out = final_state.get("generator_output") or final_state.get(
+                "draft_output"
+            )
+
+            if gen_out:
+                # If it's a Pydantic object (DDCoTExtraction)
+                if hasattr(gen_out, "text_complexity"):
+                    complexity = gen_out.text_complexity
+                    narrative = gen_out.dominant_narrative
+                # If it's a dict (serialized state)
+                elif isinstance(gen_out, dict):
+                    complexity = gen_out.get("text_complexity", "Unknown")
+                    narrative = gen_out.get("dominant_narrative", "Unknown")
 
             # 4. Format for Submission
             markers = []
@@ -228,7 +309,9 @@ async def process_document(
 
             # 5. Prepare Evidence for S2
             s1_spans_for_s2 = markers
-            s1_dossier = agents_mod.synthesize_dossier(markers)
+            s1_dossier = agents_mod.synthesize_dossier(
+                markers, complexity=complexity, narrative=narrative
+            )
 
             logger.info(
                 f"[{doc_id}] S1 Complete: Found {len(markers)} consensus markers."
@@ -248,28 +331,55 @@ async def process_document(
             s2_rag = rag_collections.get("s2")
             if s2_rag:
                 # Retrieve specific hard negatives to help the Judge distinguish reporting vs endorsing
-                precedents = agents_mod.retrieve_fewshots(
-                    s2_rag, text, k=4, filters={"is_hard_negative": True}
-                )
+                if args.rerank:
+                    precedents = agents_mod.retrieve_hard_negatives_reranked(
+                        s2_rag, text, k=4, overretrieve_factor=4
+                    )
+                else:
+                    precedents = agents_mod.retrieve_fewshots(
+                        s2_rag, text, k=4, filters={"is_hard_negative": True}
+                    )
                 if precedents:
                     rag_context = json.dumps(precedents, indent=2, ensure_ascii=False)
 
-            # 2. Prepare S2 State
-            s2_initial_state = {
-                "doc_id": doc_id,
-                "text": text,
-                "s1_spans": s1_spans_for_s2,
-                "marker_summary": s1_dossier or "No markers extracted.",
-                "rag_context": rag_context,
-                "juror_temperature": args.s2_temp,  # <--- Pass CLI arg here
-                "metadata": meta,
-                "council_result": None,
-                "final_output": None,
-            }
+            # 2. Prepare S2 State based on mode
+            if args.s2_mode == "parallel":
+                # Anti-Echo Chamber: Parallel Voting State
+                s2_initial_state = {
+                    "doc_id": doc_id,
+                    "text": text,
+                    "s1_spans": s1_spans_for_s2,
+                    "marker_summary": s1_dossier or "No markers extracted.",
+                    "rag_context": rag_context,
+                    "juror_temperature": args.s2_temp,
+                    "metadata": meta,
+                    # Parallel-specific fields
+                    "parallel_council_result": None,
+                    "calibrated_output": None,
+                }
+                # Use Parallel Graph (Anti-Echo Chamber)
+                final_state = await s2_parallel_graph.ainvoke(s2_initial_state)
+                s2_result = final_state.get("calibrated_output")
+            else:
+                # Legacy: Sequential Debate State
+                s2_initial_state = {
+                    "doc_id": doc_id,
+                    "text": text,
+                    "s1_spans": s1_spans_for_s2,
+                    "marker_summary": s1_dossier or "No markers extracted.",
+                    "rag_context": rag_context,
+                    "juror_temperature": args.s2_temp,
+                    "metadata": meta,
+                    "council_result": None,
+                    "final_output": None,
+                }
+                # Use Legacy Graph (Sequential Debate)
+                final_state = await s2_graph.ainvoke(s2_initial_state)
+                s2_result = final_state.get("final_output")
 
-            # 3. Invoke S2 Graph (Council -> Judge)
-            final_state = await s2_graph.ainvoke(s2_initial_state)
-            s2_result = final_state.get("final_output")
+            # [Optimization] Track S2 Tokens
+            if "token_usage" in final_state:
+                GLOBAL_METER.add(final_state["token_usage"])
 
             if s2_result:
                 # 4. Format for Submission
@@ -310,7 +420,7 @@ async def main_async():
     # Task Control
     parser.add_argument("--task", default="both", choices=["s1", "s2", "both"])
 
-    # Config (S1)
+    # Config (S1) - DD-CoT Architecture
     parser.add_argument(
         "--s1-k", type=int, default=3, help="Ensemble size (internal to graph)"
     )
@@ -318,7 +428,29 @@ async def main_async():
         "--s2-temp", type=float, default=0.4, help="Temperature for S2 Jurors"
     )
 
-    # Config (S2)
+    # Config (S2) - Anti-Echo Chamber Architecture
+    parser.add_argument(
+        "--s2-mode",
+        choices=["legacy", "parallel"],
+        default="parallel",
+        help="S2 mode: 'legacy' (Sequential Debate) or 'parallel' (Anti-Echo Chamber, recommended)",
+    )
+
+    # RAG Enhancement
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        default=True,
+        help="Enable cross-encoder reranking for better RAG retrieval quality (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-rerank",
+        action="store_false",
+        dest="rerank",
+        help="Disable cross-encoder reranking (faster but lower quality)",
+    )
+
+    # General Config
     parser.add_argument("--experiment-name", default="PsyCoMark_Dev")
     parser.add_argument("--seed", type=int, default=42)
 
@@ -357,49 +489,76 @@ async def main_async():
     # 4. MLflow Experiment Start
     mlflow.set_experiment(args.experiment_name)
 
+    # Log architecture configuration
+    logger.info("=" * 60)
+    logger.info("🚀 PsyCoMark Pipeline Configuration")
+    logger.info("=" * 60)
+    logger.info(f"   Task: {args.task.upper()}")
+    if args.task in ("s1", "both"):
+        logger.info("   S1 Architecture: DD-CoT (Generator → Critic → Refiner)")
+    if args.task in ("s2", "both"):
+        if args.s2_mode == "parallel":
+            logger.info("   S2 Architecture: Anti-Echo Chamber (Parallel Voting)")
+            logger.info("     → All jurors vote independently and simultaneously")
+            logger.info("     → Calibrated Judge weighs dissent")
+        else:
+            logger.info("   S2 Architecture: Legacy (Sequential Debate)")
+            logger.info("     → Jurors debate in sequence")
+            logger.info("     → Standard Judge review")
+    logger.info("=" * 60)
+
     with mlflow.start_run():
         mlflow.log_params(vars(args))
 
+        logger.info(f"Starting Run: {len(rows)} docs | Mode: {args.s2_mode.upper()}")
+
         # S1 Prompts
         if args.task in ("s1", "both"):
-            # 1. Generator
-            s1_gen_sys = (
-                S1_PROMPTS.gen_system
-                if S1_PROMPTS
-                else prompt_builder.build_s1_discriminative_system()
+            # --- 4. DD-CoT Generator (Optimal) ---
+            s1_ddcot_gen_sys = (
+                getattr(S1_PROMPTS, "ddcot_gen_system", None)
+                or prompt_builder.build_s1_ddcot_system()
             )
-            s1_gen_usr = (
-                S1_PROMPTS.gen_user_template
-                if S1_PROMPTS
-                else prompt_builder.build_s1_user_template()
+            s1_ddcot_gen_usr = (
+                getattr(S1_PROMPTS, "ddcot_gen_user_template", None)
+                or prompt_builder.build_s1_ddcot_user_template()
             )
-            mlflow.log_text(s1_gen_sys, "prompts/s1/s1_generator_optimized.txt")
-            mlflow.log_text(s1_gen_usr, "prompts/s1/s1_user_optimized.txt")
+            mlflow.log_text(
+                s1_ddcot_gen_sys, "prompts/s1/s1_ddcot_generator_optimized.txt"
+            )
+            mlflow.log_text(s1_ddcot_gen_usr, "prompts/s1/s1_ddcot_user_optimized.txt")
 
-            # 2. Critic [NEW]
-            # Use getattr to safely access attributes that might not exist in older loaders
-            s1_crit_sys = (
-                getattr(S1_PROMPTS, "critic_system", None)
-                or prompt_builder.build_s1_critic_system()
+            # --- 5. DD-CoT Critic (Optimal) ---
+            s1_ddcot_crit_sys = (
+                getattr(S1_PROMPTS, "ddcot_critic_system", None)
+                or prompt_builder.build_s1_ddcot_critic_system()
             )
-            s1_crit_usr = (
-                getattr(S1_PROMPTS, "critic_user_template", None)
-                or prompt_builder.build_s1_critic_user_template()
+            s1_ddcot_crit_usr = (
+                getattr(S1_PROMPTS, "ddcot_critic_user_template", None)
+                or prompt_builder.build_s1_ddcot_critic_user_template()
             )
-            mlflow.log_text(s1_crit_sys, "prompts/s1/s1_critic_optimized.txt")
-            mlflow.log_text(s1_crit_usr, "prompts/s1/s1_critic_user_optimized.txt")
+            mlflow.log_text(
+                s1_ddcot_crit_sys, "prompts/s1/s1_ddcot_critic_optimized.txt"
+            )
+            mlflow.log_text(
+                s1_ddcot_crit_usr, "prompts/s1/s1_ddcot_critic_user_optimized.txt"
+            )
 
-            # 3. Refiner [NEW]
-            s1_ref_sys = (
-                getattr(S1_PROMPTS, "refiner_system", None)
-                or prompt_builder.build_s1_refiner_system()
+            # --- 6. DD-CoT Refiner (Optimal) ---
+            s1_ddcot_ref_sys = (
+                getattr(S1_PROMPTS, "ddcot_refiner_system", None)
+                or prompt_builder.build_s1_ddcot_refiner_system()
             )
-            s1_ref_usr = (
-                getattr(S1_PROMPTS, "refiner_user_template", None)
-                or prompt_builder.build_s1_refiner_user_template()
+            s1_ddcot_ref_usr = (
+                getattr(S1_PROMPTS, "ddcot_refiner_user_template", None)
+                or prompt_builder.build_s1_ddcot_refiner_user_template()
             )
-            mlflow.log_text(s1_ref_sys, "prompts/s1/s1_refiner_optimized.txt")
-            mlflow.log_text(s1_ref_usr, "prompts/s1/s1_refiner_user_optimized.txt")
+            mlflow.log_text(
+                s1_ddcot_ref_sys, "prompts/s1/s1_ddcot_refiner_optimized.txt"
+            )
+            mlflow.log_text(
+                s1_ddcot_ref_usr, "prompts/s1/s1_ddcot_refiner_user_optimized.txt"
+            )
 
         # S2 Prompts
         if args.task in ("s2", "both"):
@@ -411,45 +570,106 @@ async def main_async():
                     else fallback_func()
                 )
 
-            # Log System Personas
-            mlflow.log_text(
-                get_s2_p("pros_sys", prompt_builder.build_s2_prosecutor_system),
-                "prompts/s2/sys_prosecutor.txt",
-            )
-            mlflow.log_text(
-                get_s2_p("def_sys", prompt_builder.build_s2_defense_system),
-                "prompts/s2/sys_defense.txt",
-            )
-            mlflow.log_text(
-                get_s2_p("lit_sys", prompt_builder.build_s2_literalist_system),
-                "prompts/s2/sys_literalist.txt",
-            )
-            mlflow.log_text(
-                get_s2_p("prof_sys", prompt_builder.build_s2_profiler_system),
-                "prompts/s2/sys_profiler.txt",
-            )
-            mlflow.log_text(
-                get_s2_p("judge_sys", prompt_builder.build_s2_judge_system),
-                "prompts/s2/sys_judge.txt",
-            )
+            if args.s2_mode == "parallel":
+                # === PARALLEL MODE (Anti-Echo Chamber) ===
+                logger.info("Logging S2 Parallel (Anti-Echo Chamber) Prompts...")
 
-            # Log User Templates
-            mlflow.log_text(
-                get_s2_p("pros_user", prompt_builder.build_s2_prosecutor_user_template),
-                "prompts/s2/user_prosecutor.txt",
-            )
-            mlflow.log_text(
-                get_s2_p("def_user", prompt_builder.build_s2_defense_user_template),
-                "prompts/s2/user_defense.txt",
-            )
-            mlflow.log_text(
-                get_s2_p("judge_user", prompt_builder.build_s2_judge_user_template),
-                "prompts/s2/user_judge.txt",
-            )
+                # Log Parallel Juror System Prompts
+                mlflow.log_text(
+                    get_s2_p(
+                        "parallel_pros_sys",
+                        prompt_builder.build_s2_parallel_prosecutor_system,
+                    ),
+                    "prompts/s2/parallel_prosecutor_sys.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p(
+                        "parallel_def_sys",
+                        prompt_builder.build_s2_parallel_defense_system,
+                    ),
+                    "prompts/s2/parallel_defense_sys.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p(
+                        "parallel_lit_sys",
+                        prompt_builder.build_s2_parallel_literalist_system,
+                    ),
+                    "prompts/s2/parallel_literalist_sys.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p(
+                        "parallel_prof_sys",
+                        prompt_builder.build_s2_parallel_profiler_system,
+                    ),
+                    "prompts/s2/parallel_profiler_sys.txt",
+                )
+
+                # Log Shared User Template (used by all parallel jurors)
+                mlflow.log_text(
+                    get_s2_p(
+                        "parallel_user", prompt_builder.build_s2_parallel_user_template
+                    ),
+                    "prompts/s2/parallel_user.txt",
+                )
+
+                # Log Calibrated Judge Prompts
+                mlflow.log_text(
+                    get_s2_p(
+                        "calibrated_judge_sys",
+                        prompt_builder.build_s2_calibrated_judge_system,
+                    ),
+                    "prompts/s2/calibrated_judge_sys.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p(
+                        "calibrated_judge_user",
+                        prompt_builder.build_s2_calibrated_judge_user_template,
+                    ),
+                    "prompts/s2/calibrated_judge_user.txt",
+                )
+            else:
+                # === LEGACY MODE (Sequential Debate) ===
+                logger.info("📦 Logging S2 Legacy (Sequential Debate) Prompts...")
+
+                # Log System Personas
+                mlflow.log_text(
+                    get_s2_p("pros_sys", prompt_builder.build_s2_prosecutor_system),
+                    "prompts/s2/sys_prosecutor.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p("def_sys", prompt_builder.build_s2_defense_system),
+                    "prompts/s2/sys_defense.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p("lit_sys", prompt_builder.build_s2_literalist_system),
+                    "prompts/s2/sys_literalist.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p("prof_sys", prompt_builder.build_s2_profiler_system),
+                    "prompts/s2/sys_profiler.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p("judge_sys", prompt_builder.build_s2_judge_system),
+                    "prompts/s2/sys_judge.txt",
+                )
+
+                # Log User Templates
+                mlflow.log_text(
+                    get_s2_p(
+                        "pros_user", prompt_builder.build_s2_prosecutor_user_template
+                    ),
+                    "prompts/s2/user_prosecutor.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p("def_user", prompt_builder.build_s2_defense_user_template),
+                    "prompts/s2/user_defense.txt",
+                )
+                mlflow.log_text(
+                    get_s2_p("judge_user", prompt_builder.build_s2_judge_user_template),
+                    "prompts/s2/user_judge.txt",
+                )
 
         # 5. Execution Loop
-        s1_results = []
-        s2_results = []
 
         # Eval Metrics
         correct_s2 = 0
@@ -465,22 +685,28 @@ async def main_async():
 
         tasks = [worker(row) for row in rows]
 
+        # Metrics
+        correct_s2 = 0
+        total_eval_s2 = 0
+
         with tqdm(total=len(rows), desc="Running Pipeline") as pbar:
             for future in asyncio.as_completed(tasks):
                 s1_res, s2_res = await future
 
+                # [Optimization] Incremental Save
                 if s1_res:
-                    s1_results.append(s1_res)
+                    append_jsonl("submission_s1.jsonl", s1_res)
                 if s2_res:
-                    s2_results.append(s2_res)
-                    # Live Accuracy
+                    append_jsonl("submission_s2.jsonl", s2_res)
+
+                # Live Accuracy Update
+                if s2_res and "conspiracy" in s2_res:
                     row_id = s2_res["_id"]
-                    orig_row = next((r for r in rows if r["id"] == row_id), None)
-                    if orig_row and orig_row["metadata"]["label"]:
-                        gt = str(orig_row["metadata"]["label"]).lower()
+                    orig = next((r for r in rows if r["id"] == row_id), None)
+                    if orig and orig["metadata"].get("label"):
+                        gt = str(orig["metadata"]["label"]).lower()
                         gt_norm = "yes" if gt in ["yes", "conspiracy"] else "no"
-                        pred = s2_res["conspiracy"].lower()
-                        if pred == gt_norm:
+                        if s2_res["conspiracy"].lower() == gt_norm:
                             correct_s2 += 1
                         total_eval_s2 += 1
 
@@ -502,23 +728,30 @@ async def main_async():
                     if total_eval_s2 > 0
                     else "Acc: N/A"
                 )
-                pbar.set_postfix_str(acc_str)
+                cost_str = f"${GLOBAL_METER.total_cost():.2f}"
+                pbar.set_postfix_str(f"{acc_str} | {cost_str}")
                 pbar.update(1)
 
+        # Finalize
+        logger.info("=" * 40)
+        logger.info(f" FINAL COST: {GLOBAL_METER}")
+        logger.info("=" * 40)
+
         # 6. Save & Finish
-        if s1_results:
-            save_jsonl("submission.jsonl", "submission_s1.zip", s1_results)
+        if total_eval_s2 > 0:
+            final_acc = correct_s2 / total_eval_s2
+            mlflow.log_metric("s2_accuracy", final_acc)
+            logger.success(f"Final Accuracy: {final_acc:.2%}")
+
+        # Compress & Log Artifacts
+        if os.path.exists("submission_s1.jsonl"):
+            finalize_zip("submission_s1.jsonl", "submission_s1.zip")
             mlflow.log_artifact("submission_s1.zip")
 
-        if s2_results:
-            save_jsonl("submission.jsonl", "submission_s2.zip", s2_results)
+        if os.path.exists("submission_s2.jsonl"):
+            finalize_zip("submission_s2.jsonl", "submission_s2.zip")
             mlflow.log_artifact("submission_s2.zip")
-            if total_eval_s2 > 0:
-                final_acc = correct_s2 / total_eval_s2
-                mlflow.log_metric("s2_accuracy", final_acc)
-                logger.success(f"Final S2 Accuracy: {final_acc:.2%}")
 
-        # [NEW] Upload the full run log as an artifact
         if os.path.exists(log_file):
             mlflow.log_artifact(log_file)
 

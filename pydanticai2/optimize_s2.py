@@ -11,10 +11,47 @@ import asyncio
 import argparse
 import pathlib
 from typing import List, Dict
+import pandas as pd  # <--- NEW
+from datetime import datetime  # <--- NEW
 
-# --- Make repo root importable FIRST ---
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+# Global Feedback Collector for S2
+S2_FEEDBACK_LOG = []  # <--- NEW
 
+import litellm
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
+from litellm.exceptions import RateLimitError, ServiceUnavailableError
+
+# =============================================================================
+# [CRITICAL FIX] Monkey-Patch litellm to force retries for GEPA
+# =============================================================================
+
+# 1. Save the original function
+_original_litellm_completion = litellm.completion
+
+
+# 2. Define the retry logic
+@retry(
+    retry=retry_if_exception_type((RateLimitError, ServiceUnavailableError)),
+    stop=stop_after_attempt(20),  # Try 20 times
+    wait=wait_exponential(multiplier=2, min=5, max=60),  # Wait 5s, 10s... up to 60s
+    reraise=True,
+)
+def _robust_completion(*args, **kwargs):
+    """Wrapper that forces retries on RateLimitErrors"""
+    return _original_litellm_completion(*args, **kwargs)
+
+
+# 3. Apply the patch
+# Now, when 'gepa' calls litellm.completion, it hits our retry loop first.
+litellm.completion = _robust_completion
+
+# Optional: Set global timeouts just in case
+os.environ["LITELLM_REQUEST_TIMEOUT"] = "120"
 # Third-party
 import mlflow
 import mlflow.genai
@@ -47,23 +84,37 @@ _load_dotenv_into_environ()
 
 # Project Modules
 from pydanticai2.psycomark_agents import (
+    # Legacy S2 (Sequential Debate)
     run_s2_sequential_debate,
     run_s2_judge_review,
+    # Anti-Echo Chamber S2 (Parallel Voting) - NEW
+    run_s2_parallel_council,
+    run_s2_calibrated_judge,
+    # Utilities
     get_rag_collection,
     retrieve_fewshots,
     format_s2_rag_to_xml,
 )
 from pydanticai2.prompt_builder import (
-    build_s2_prosecutor_system,  # For Prosecutor
-    build_s2_defense_system,  # For Defense
-    build_s2_literalist_system,  # For Literalist
-    build_s2_profiler_system,  # For Profiler
+    # Legacy prompts
+    build_s2_prosecutor_system,
+    build_s2_defense_system,
+    build_s2_literalist_system,
+    build_s2_profiler_system,
     build_s2_prosecutor_user_template,
     build_s2_defense_user_template,
     build_s2_literalist_user_template,
     build_s2_profiler_user_template,
     build_s2_judge_system,
     build_s2_judge_user_template,
+    # Parallel prompts (Anti-Echo Chamber) - NEW
+    build_s2_parallel_prosecutor_system,
+    build_s2_parallel_defense_system,
+    build_s2_parallel_literalist_system,
+    build_s2_parallel_profiler_system,
+    build_s2_parallel_user_template,
+    build_s2_calibrated_judge_system,
+    build_s2_calibrated_judge_user_template,
 )
 
 
@@ -71,10 +122,19 @@ from pydanticai2.prompt_builder import (
 # 1. Setup
 # -----------------------------------------------------------------------------
 
-# Globals for URIs
+# Legacy URIs
 P_SYS, D_SYS, L_SYS, PR_SYS = None, None, None, None
 P_USER, D_USER, L_USER, PR_USER = None, None, None, None
 JUDGE_SYS, JUDGE_USER = None, None
+
+# Parallel URIs (Anti-Echo Chamber) - NEW
+PARALLEL_P_SYS, PARALLEL_D_SYS, PARALLEL_L_SYS, PARALLEL_PR_SYS = None, None, None, None
+PARALLEL_USER = None  # Shared user template for all parallel jurors
+CALIBRATED_JUDGE_SYS, CALIBRATED_JUDGE_USER = None, None
+
+# Mode flag
+USE_PARALLEL_MODE = False
+
 # RAG Collection (Global)
 S2_RAG_COLLECTION = None
 
@@ -170,101 +230,81 @@ def generate_s2_actionable_feedback(
     gold_label: str,
     pred_label: str,
     council_tally: dict,
-    council_votes: list,  # List of vote dicts with juror, verdict, rationale
+    council_votes: list,
+    confidence: float,
     doc_id: str,
     s2_subtype: str,
     is_hard_negative: bool,
 ) -> str:
     """
-    Generate specific, actionable feedback for the S2 optimizer.
-    Focuses on WHAT went wrong and WHO needs to improve.
-
-    council_votes is a list of dicts: [{"juror": "...", "verdict": "...", "rationale": "..."}, ...]
+    Generate prioritized, concise feedback.
+    PREVENTS OVERFLOW by capping length and focusing on the biggest error.
     """
-    feedback_parts = []
+    # Normalize labels
+    pred_label = str(pred_label).lower().strip()
+    gold_label = str(gold_label).lower().strip()
 
     consp_votes = council_tally.get("conspiracy", 0)
     non_votes = council_tally.get("non", 0) + council_tally.get("non-conspiracy", 0)
     council_consensus = "conspiracy" if consp_votes > non_votes else "non"
 
-    # Tag hard negatives for special attention
+    # =========================================================
+    # 1. POSITIVE ANCHORING (Top Priority: Lock in wins)
+    # =========================================================
+    if pred_label == gold_label:
+        if is_hard_negative:
+            return f"KEEP: Correctly identified Hard Negative ({s2_subtype})."
+        if council_consensus != gold_label:
+            return f"GREAT SAVE: Judge correctly overruled wrong Council ({council_consensus})."
+        return f"PERFECT: Correct Verdict ({gold_label})."
+
+    # =========================================================
+    # 2. NEGATIVE FEEDBACK (Hierarchy of Severity)
+    # =========================================================
+
+    # PRIORITY 1: Calibration (Major Logic Fail)
+    # If the model is wrong but highly confident, this breaks the entire system.
+    if confidence > 0.85:
+        return f"CRITICAL: OVERCONFIDENT ({confidence:.2f}). You are wrong but certain. Reduce certainty on ambiguous texts."
+
+    # PRIORITY 2: Hard Negative Traps (Specific Domain Fail)
+    # These are the "trick questions" the model must learn to recognize.
     if is_hard_negative:
-        feedback_parts.append(f"[HARD_NEGATIVE:{s2_subtype}]")
+        trap_hint = (
+            "Reporting vs Endorsing"
+            if "report" in s2_subtype
+            else "Debunking vs Conspiring"
+        )
+        return f"FAILURE: Fell for Hard Negative Trap ({s2_subtype}). Remember: {trap_hint}."
 
-    # Case A: Judge Fault (Judge overruled correct Council)
+    # PRIORITY 3: Dissent Ignored (The "Hidden Gem" signal)
+    # If a Juror got it right but the Judge ignored them, point that out specifically.
+    if council_consensus != gold_label:
+        # Find the first juror who got it right
+        hero_vote = next(
+            (v for v in council_votes if str(v.get("verdict")).lower() == gold_label),
+            None,
+        )
+        if hero_vote:
+            juror_name = hero_vote.get("juror", "?")
+            # TRUNCATE rationale to 100 chars to save tokens
+            reason = hero_vote.get("rationale", "")[:100]
+            return f"MISSED SIGNAL: The {juror_name} was right! Reason: '{reason}...'"
+
+    # PRIORITY 4: Judge Failure (Judge broke the consensus)
     if council_consensus == gold_label and pred_label != gold_label:
-        feedback_parts.append(
-            f"JUDGE_FAILURE: Council was correct ({council_consensus}), but Judge overruled to {pred_label}."
-        )
-        feedback_parts.append(
-            "FIX: Judge should trust Council consensus on this type of text."
-        )
+        return f"JUDGE ERROR: The Council was right ({council_consensus}), but Judge overruled incorrectly."
 
-    # Case B: Council Fault (Council was wrong)
-    elif council_consensus != gold_label:
-        feedback_parts.append(
-            f"COUNCIL_FAILURE: Debate reached wrong consensus ({council_consensus}). Votes: {council_tally}."
-        )
-
-        if gold_label == "non":
-            # False Positive - Council incorrectly flagged as conspiracy
-            feedback_parts.append(
-                "FALSE_POSITIVE: Defense failed to argue for acquittal."
-            )
-            feedback_parts.append(
-                "FIX: Defense should emphasize: no hidden plot, just normal criticism/reporting."
-            )
-        else:
-            # False Negative - Council missed the conspiracy
-            feedback_parts.append(
-                "FALSE_NEGATIVE: Prosecutor failed to identify the conspiracy."
-            )
-            feedback_parts.append(
-                "FIX: Prosecutor should look for: hidden actors, secret plots, cover-up language."
-            )
-
-        # Identify which council member(s) voted wrong
-        wrong_voters = []
-        for vote in council_votes:
-            if isinstance(vote, dict):
-                juror_name = vote.get("juror", "unknown")
-                vote_verdict = str(vote.get("verdict", "")).lower()
-            else:
-                # Handle object attributes if not serialized
-                juror_name = getattr(vote, "juror", "unknown")
-                vote_verdict = str(getattr(vote, "verdict", "")).lower()
-
-            if "conspiracy" in vote_verdict and gold_label == "non":
-                wrong_voters.append(f"{juror_name}(voted conspiracy)")
-            elif "non" in vote_verdict and gold_label == "conspiracy":
-                wrong_voters.append(f"{juror_name}(voted non)")
-
-        if wrong_voters:
-            feedback_parts.append(f"WRONG_VOTERS: {', '.join(wrong_voters[:2])}")
-
-    # Case C: Judge agreed with wrong Council (total failure)
-    else:
-        feedback_parts.append(
-            f"TOTAL_SYSTEM_FAILURE: Everyone got it wrong. Votes: {council_tally}"
-        )
-
-    return " | ".join(feedback_parts)
+    # PRIORITY 5: Generic Failure (Last Resort)
+    return f"WRONG: Pred {pred_label} != Gold {gold_label}. Votes: {consp_votes} vs {non_votes}. Re-evaluate evidence."
 
 
 @scorer
 def s2_rich_scorer(outputs, expectations):
     """
-    Enhanced Diagnostic Scorer with:
-    1. Trojan Horse pattern - reads gold from outputs
-    2. Detailed failure analysis by component
-    3. Actionable feedback for optimization
+    Gradient Scorer: Rewards partial consensus to guide the optimizer up the hill.
     """
-    # 1. Extract prediction
-    pred_label = str(outputs.get("final_label", "non")).lower().strip()
-    council_tally = outputs.get("council_tally", {})
-    council_votes = outputs.get("council_votes", [])  # List of vote dicts
-
-    # --- UNPACK FROM WRAPPER OUTPUT (Trojan Horse) ---
+    # 1. Unpack Data (Trojan Horse)
     gold_label = "non"
     doc_id = "unknown"
     s2_subtype = "unknown"
@@ -278,51 +318,77 @@ def s2_rich_scorer(outputs, expectations):
             doc_id = data.get("doc_id", "unknown")
             s2_subtype = data.get("s2_subtype", "unknown")
             is_hard_negative = data.get("is_hard_negative", False)
-        else:
-            logger.warning("Scorer: Missing 'passthrough_gold_ref' in model outputs.")
-            # Fallback to expectations if available
-            gold_label = str(expectations.get("gold_label", "non")).lower().strip()
     except Exception as e:
         logger.error(f"Scorer Unpack Failed: {e}")
-        gold_label = str(expectations.get("gold_label", "non")).lower().strip()
 
-    # Calculate Consensus
+    # 2. Extract Predictions
+    pred_label = str(outputs.get("final_label", "non")).lower().strip()
+    pred_conf = outputs.get(
+        "final_confidence", 0.0
+    )  # Need to ensure wrapper returns this
+    council_tally = outputs.get("council_tally", {})
+
+    # Calculate Vote Ratios for Gradient Scoring
+    total_votes = sum(council_tally.values()) if council_tally else 1
     consp_votes = council_tally.get("conspiracy", 0)
     non_votes = council_tally.get("non", 0) + council_tally.get("non-conspiracy", 0)
+
+    consp_ratio = consp_votes / total_votes
+    non_ratio = non_votes / total_votes
+
+    # 3. CALCULATE GRADIENT SCORE
+    # We reward the model for getting CLOSER to the truth (more votes), even if it fails.
+    score = 0.0
+
+    if gold_label == "conspiracy":
+        # Target: Maximize Conspiracy Votes
+        score = consp_ratio
+        # Bonus: If Judge correctly ruled Conspiracy despite split, boost to 1.0
+        if pred_label == "conspiracy":
+            score = 1.0
+    else:  # gold_label == "non"
+        # Target: Maximize Non Votes
+        score = non_ratio
+        if pred_label == "non":
+            score = 1.0
+
+    # 4. Generate Feedback (The "Why")
+    rationale = generate_s2_actionable_feedback(
+        gold_label,
+        pred_label,
+        council_tally,
+        outputs.get("council_votes", []),
+        pred_conf,
+        doc_id,
+        s2_subtype,
+        is_hard_negative,
+    )
+
     council_consensus = "conspiracy" if consp_votes > non_votes else "non"
 
-    # Log scoring details
+    # ---------------------------------------------------------
+    # [NEW] Collect Feedback for Analysis
+    # ---------------------------------------------------------
+    S2_FEEDBACK_LOG.append(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "doc_id": doc_id,
+            "score": float(score),
+            "gold_label": gold_label,
+            "pred_label": pred_label,
+            "consensus": council_consensus,
+            "tally": str(council_tally),  # Log the raw votes too
+            "rationale": rationale,
+            "subtype": s2_subtype,  # Helpful for hard negative analysis
+        }
+    )
+
+    # 5. Log & Return
     logger.info(
-        f"[{doc_id}] SCORING: pred={pred_label}, gold={gold_label}, "
-        f"consensus={council_consensus}, tally={council_tally}"
+        f"[{doc_id}] Grade: {score:.2f} (Gold: {gold_label} | Votes: {consp_votes}-{non_votes})"
     )
 
-    # 2. Success Case
-    if pred_label == gold_label:
-        # Bonus feedback for correct predictions
-        if is_hard_negative:
-            rationale = f"CORRECT [HARD_NEGATIVE:{s2_subtype}]: Verdict={pred_label}, Consensus={council_consensus}, Tally={council_tally}"
-        else:
-            rationale = f"CORRECT: Verdict={pred_label}, Consensus={council_consensus}, Tally={council_tally}"
-
-        logger.info(f"[{doc_id}] ✅ Score: 1.0 | {rationale}")
-        return Feedback(value=1.0, rationale=rationale)
-
-    # 3. Failure Analysis with Actionable Feedback
-    rationale = generate_s2_actionable_feedback(
-        gold_label=gold_label,
-        pred_label=pred_label,
-        council_tally=council_tally,
-        council_votes=council_votes,  # Pass list of vote dicts
-        doc_id=doc_id,
-        s2_subtype=s2_subtype,
-        is_hard_negative=is_hard_negative,
-    )
-
-    logger.warning(
-        f"[{doc_id}] ❌ Score: 0.0 | Consensus={council_consensus} | {rationale}"
-    )
-    return Feedback(value=0.0, rationale=rationale)
+    return Feedback(value=float(score), rationale=rationale)
 
 
 # -----------------------------------------------------------------------------
@@ -417,80 +483,154 @@ def predict_wrapper(
         pass
 
     try:
-        # 5. Run Council Debate
-        logger.debug(f"[{doc_id}] Running S2 Council Debate...")
-        council_res = asyncio.run(
-            run_s2_sequential_debate(
-                text=text,
-                s1_spans=s1_spans,
-                marker_summary=marker_summary,
-                prosecutor_sys_override=p_s,
-                rag_context="",  # Already injected into prompts
-                defense_sys_override=d_s,
-                literalist_sys_override=l_s,
-                profiler_sys_override=pr_s,
-                prosecutor_user_template_override=p_u,
-                defense_user_template_override=d_u,
-                literalist_user_template_override=l_u,
-                profiler_user_template_override=pr_u,
+        # =====================================================================
+        # PARALLEL MODE (Anti-Echo Chamber - Optimal Architecture)
+        # =====================================================================
+        if USE_PARALLEL_MODE:
+            logger.debug(f"[{doc_id}] Running PARALLEL Council (Anti-Echo Chamber)...")
+
+            # Load parallel prompts
+            par_p_s = safe_fmt(PARALLEL_P_SYS, rag_context=rag_str)
+            par_d_s = safe_fmt(PARALLEL_D_SYS, rag_context=rag_str)
+            par_l_s = safe_fmt(PARALLEL_L_SYS, rag_context=rag_str)
+            par_pr_s = safe_fmt(PARALLEL_PR_SYS, rag_context=rag_str)
+            par_user = safe_fmt(PARALLEL_USER, rag_context=rag_str)
+            cal_j_s = safe_fmt(CALIBRATED_JUDGE_SYS, rag_context=rag_str)
+            cal_j_u = safe_fmt(CALIBRATED_JUDGE_USER, rag_context=rag_str)
+
+            # Run Parallel Council
+            council_res = asyncio.run(
+                run_s2_parallel_council(
+                    text=text,
+                    s1_spans=s1_spans,
+                    marker_summary=marker_summary,
+                    rag_context="",  # Already injected into prompts
+                    prosecutor_sys_override=par_p_s,
+                    defense_sys_override=par_d_s,
+                    literalist_sys_override=par_l_s,
+                    profiler_sys_override=par_pr_s,
+                    parallel_user_template_override=par_user,
+                )
             )
-        )
 
-        logger.debug(f"[{doc_id}] Council Tally: {council_res.tally}")
-
-        # 6. Run Judge Review
-        logger.debug(f"[{doc_id}] Running S2 Judge Review...")
-        judge_res = asyncio.run(
-            run_s2_judge_review(
-                text=text,
-                council_result=council_res,
-                rag_context=rag_context,
-                judge_sys_override=j_s,
-                judge_user_template_override=j_u,
+            logger.debug(
+                f"[{doc_id}] Parallel Council: {council_res.tally}, "
+                f"Consensus: {council_res.consensus_level}"
             )
-        )
 
-        logger.debug(f"[{doc_id}] Judge Verdict: {judge_res.label}")
+            # Run Calibrated Judge
+            logger.debug(f"[{doc_id}] Running Calibrated Judge...")
+            judge_res = asyncio.run(
+                run_s2_calibrated_judge(
+                    text=text,
+                    council_result=council_res,
+                    rag_context=rag_context,
+                    judge_sys_override=cal_j_s,
+                    judge_user_template_override=cal_j_u,
+                )
+            )
 
-        # 7. Serialize council votes to list of dicts for scorer
-        council_votes = []
-        if hasattr(council_res, "votes") and council_res.votes:
+            logger.debug(
+                f"[{doc_id}] Calibrated Judge: {judge_res.label} "
+                f"(override={judge_res.council_override})"
+            )
+
+            # Serialize votes
+            council_votes = []
             for vote in council_res.votes:
-                if hasattr(vote, "model_dump"):
-                    # Pydantic model - serialize properly
-                    vote_dict = vote.model_dump()
-                    # Convert enum to string
-                    if hasattr(vote_dict.get("juror"), "value"):
-                        vote_dict["juror"] = vote_dict["juror"].value
-                    elif isinstance(vote_dict.get("juror"), str):
-                        pass  # Already string
-                    council_votes.append(vote_dict)
-                elif isinstance(vote, dict):
-                    council_votes.append(vote)
-                else:
-                    # Fallback: extract attributes
-                    council_votes.append(
-                        {
-                            "juror": str(getattr(vote, "juror", "unknown")),
-                            "verdict": str(getattr(vote, "verdict", "unknown")),
-                            "rationale": str(getattr(vote, "rationale", "")),
-                        }
-                    )
+                vote_dict = vote.model_dump() if hasattr(vote, "model_dump") else vote
+                if hasattr(vote_dict.get("juror"), "value"):
+                    vote_dict["juror"] = vote_dict["juror"].value
+                council_votes.append(vote_dict)
 
-        return {
-            "final_label": judge_res.label,
-            "final_rationale": judge_res.rationale,
-            "council_tally": council_res.tally,
-            "council_votes": council_votes,  # List of dicts
-            # --- THE TUNNEL EXIT ---
-            # We explicitly return the gold data so the scorer can see it in 'outputs'
-            "passthrough_gold_ref": passthrough_gold,
-        }
+            return {
+                "final_label": judge_res.label,
+                "final_rationale": judge_res.rationale,
+                "final_confidence": judge_res.confidence,
+                "council_tally": council_res.tally,
+                "council_votes": council_votes,
+                # Parallel-specific fields
+                "consensus_level": council_res.consensus_level,
+                "dissent_strength": council_res.dissent_strength,
+                "council_override": judge_res.council_override,
+                "borderline_flag": judge_res.borderline_flag,
+                # Tunnel exit
+                "passthrough_gold_ref": passthrough_gold,
+            }
+
+        # =====================================================================
+        # LEGACY MODE (Sequential Debate - Backward Compatibility)
+        # =====================================================================
+        else:
+            logger.debug(f"[{doc_id}] Running S2 Council Debate (Legacy)...")
+            council_res = asyncio.run(
+                run_s2_sequential_debate(
+                    text=text,
+                    s1_spans=s1_spans,
+                    marker_summary=marker_summary,
+                    prosecutor_sys_override=p_s,
+                    rag_context="",  # Already injected into prompts
+                    defense_sys_override=d_s,
+                    literalist_sys_override=l_s,
+                    profiler_sys_override=pr_s,
+                    prosecutor_user_template_override=p_u,
+                    defense_user_template_override=d_u,
+                    literalist_user_template_override=l_u,
+                    profiler_user_template_override=pr_u,
+                )
+            )
+
+            logger.debug(f"[{doc_id}] Council Tally: {council_res.tally}")
+
+            # Run Judge Review
+            logger.debug(f"[{doc_id}] Running S2 Judge Review...")
+            judge_res = asyncio.run(
+                run_s2_judge_review(
+                    text=text,
+                    council_result=council_res,
+                    rag_context=rag_context,
+                    judge_sys_override=j_s,
+                    judge_user_template_override=j_u,
+                )
+            )
+
+            logger.debug(f"[{doc_id}] Judge Verdict: {judge_res.label}")
+
+            # Serialize council votes
+            council_votes = []
+            if hasattr(council_res, "votes") and council_res.votes:
+                for vote in council_res.votes:
+                    if hasattr(vote, "model_dump"):
+                        vote_dict = vote.model_dump()
+                        if hasattr(vote_dict.get("juror"), "value"):
+                            vote_dict["juror"] = vote_dict["juror"].value
+                        council_votes.append(vote_dict)
+                    elif isinstance(vote, dict):
+                        council_votes.append(vote)
+                    else:
+                        council_votes.append(
+                            {
+                                "juror": str(getattr(vote, "juror", "unknown")),
+                                "verdict": str(getattr(vote, "verdict", "unknown")),
+                                "rationale": str(getattr(vote, "rationale", "")),
+                            }
+                        )
+
+            return {
+                "final_label": judge_res.label,
+                "final_rationale": judge_res.rationale,
+                "final_confidence": judge_res.confidence,
+                "council_tally": council_res.tally,
+                "council_votes": council_votes,
+                # Tunnel exit
+                "passthrough_gold_ref": passthrough_gold,
+            }
 
     except Exception as e:
         logger.error(f"[{doc_id}] Prediction Wrapper Failed: {e}", exc_info=True)
         return {
             "final_label": "non",  # Safe default
+            "final_confidence": 0.0,
             "final_rationale": f"SYSTEM_ERROR: {str(e)[:100]}",
             "council_tally": {},
             "council_votes": [],  # Empty list
@@ -514,17 +654,46 @@ def main():
     parser.add_argument("--experiment", default="GEPA_S2_Optimization")
     parser.add_argument(
         "--model-reflector",
-        default="bedrock:/eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        default="bedrock:/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     )
     parser.add_argument(
         "--phase",
-        choices=["all", "judge", "council", "core"],
-        default="core",
+        choices=[
+            # Legacy phases (Sequential Debate)
+            "all",
+            "judge",
+            "council",
+            "core",
+            # Parallel phases (Anti-Echo Chamber) - RECOMMENDED
+            "parallel-all",
+            "parallel-judge",
+            "parallel-council",
+            "parallel-core",
+            # [NEW] Isolated Juror Phases
+            "parallel-prosecutor",
+            "parallel-defense",
+            "parallel-literalist",
+            "parallel-profiler",
+        ],
+        default="parallel-core",
         help="""Optimization phase:
-            'all'     = Optimize all 10 prompts (not recommended - huge search space)
-            'judge'   = Optimize only Judge (2 prompts - most impactful)
-            'council' = Optimize only Council members (8 prompts - requires optimized Judge)
-            'core'    = Optimize only system prompts, skip user templates (5 prompts - recommended)
+            === LEGACY (Sequential Debate) ===
+            'all'             = Optimize all 10 prompts (not recommended - huge search space)
+            'judge'           = Optimize only Judge (2 prompts - most impactful)
+            'council'         = Optimize only Council members (8 prompts - requires optimized Judge)
+            'core'            = Optimize only system prompts, skip user templates (5 prompts)
+            
+            === PARALLEL (Anti-Echo Chamber) - RECOMMENDED ===
+            'parallel-all'    = Optimize all 8 parallel prompts (4 jurors + shared user + calibrated judge)
+            'parallel-judge'  = Optimize only Calibrated Judge (2 prompts - most impactful)
+            'parallel-council'= Optimize only parallel jurors (5 prompts - 4 sys + 1 shared user)
+            'parallel-core'   = Optimize only system prompts (5 prompts - recommended)
+            
+            === ISOLATED JURORS (Fine-Tuning) ===
+            'parallel-prosecutor' = Optimize ONLY Prosecutor System Prompt
+            'parallel-defense'    = Optimize ONLY Defense System Prompt
+            'parallel-literalist' = Optimize ONLY Literalist System Prompt
+            'parallel-profiler'   = Optimize ONLY Profiler System Prompt
         """,
     )
     args = parser.parse_args()
@@ -540,6 +709,9 @@ def main():
     global P_SYS, D_SYS, L_SYS, PR_SYS
     global P_USER, D_USER, L_USER, PR_USER
     global JUDGE_SYS, JUDGE_USER
+    global PARALLEL_P_SYS, PARALLEL_D_SYS, PARALLEL_L_SYS, PARALLEL_PR_SYS
+    global PARALLEL_USER, CALIBRATED_JUDGE_SYS, CALIBRATED_JUDGE_USER
+    global USE_PARALLEL_MODE
     global S2_RAG_COLLECTION
 
     # Initialize RAG
@@ -617,15 +789,75 @@ def main():
             "s2_judge_user", build_s2_judge_user_template()
         ).uri
 
-        logger.success("Baseline Prompts Registered.")
+        logger.success("Legacy Baseline Prompts Registered.")
+
+        # 4b. Register Parallel (Anti-Echo Chamber) Prompts
+        logger.info("Registering Parallel Anti-Echo Chamber Prompts...")
+
+        parallel_pros_sys_str = build_s2_parallel_prosecutor_system()
+        parallel_def_sys_str = build_s2_parallel_defense_system()
+        parallel_lit_sys_str = build_s2_parallel_literalist_system()
+        parallel_prof_sys_str = build_s2_parallel_profiler_system()
+        parallel_user_str = build_s2_parallel_user_template()
+        calibrated_judge_sys_str = build_s2_calibrated_judge_system()
+        calibrated_judge_user_str = build_s2_calibrated_judge_user_template()
+
+        # Log baselines for parallel prompts
+        mlflow.log_text(
+            parallel_pros_sys_str, "baseline_prompts/s2_parallel_prosecutor.txt"
+        )
+        mlflow.log_text(
+            parallel_def_sys_str, "baseline_prompts/s2_parallel_defense.txt"
+        )
+        mlflow.log_text(
+            parallel_lit_sys_str, "baseline_prompts/s2_parallel_literalist.txt"
+        )
+        mlflow.log_text(
+            parallel_prof_sys_str, "baseline_prompts/s2_parallel_profiler.txt"
+        )
+        mlflow.log_text(parallel_user_str, "baseline_prompts/s2_parallel_user.txt")
+        mlflow.log_text(
+            calibrated_judge_sys_str, "baseline_prompts/s2_calibrated_judge.txt"
+        )
+        mlflow.log_text(
+            calibrated_judge_user_str, "baseline_prompts/s2_calibrated_judge_user.txt"
+        )
+
+        PARALLEL_P_SYS = mlflow.genai.register_prompt(
+            "s2_parallel_pros_sys", parallel_pros_sys_str
+        ).uri
+        PARALLEL_D_SYS = mlflow.genai.register_prompt(
+            "s2_parallel_def_sys", parallel_def_sys_str
+        ).uri
+        PARALLEL_L_SYS = mlflow.genai.register_prompt(
+            "s2_parallel_lit_sys", parallel_lit_sys_str
+        ).uri
+        PARALLEL_PR_SYS = mlflow.genai.register_prompt(
+            "s2_parallel_prof_sys", parallel_prof_sys_str
+        ).uri
+        PARALLEL_USER = mlflow.genai.register_prompt(
+            "s2_parallel_user", parallel_user_str
+        ).uri
+        CALIBRATED_JUDGE_SYS = mlflow.genai.register_prompt(
+            "s2_calibrated_judge_sys", calibrated_judge_sys_str
+        ).uri
+        CALIBRATED_JUDGE_USER = mlflow.genai.register_prompt(
+            "s2_calibrated_judge_user", calibrated_judge_user_str
+        ).uri
+
+        logger.success("Parallel Anti-Echo Chamber Prompts Registered.")
 
         # 5. Build Prompt URI List Based on Phase
+        # Determine if parallel mode is requested
+        is_parallel_phase = args.phase.startswith("parallel-")
+        USE_PARALLEL_MODE = is_parallel_phase
+
         if args.phase == "judge":
-            # Phase 1: Optimize only Judge (most impactful, final decision maker)
+            # Legacy: Optimize only Judge (most impactful, final decision maker)
             prompt_uris_to_optimize = [JUDGE_SYS, JUDGE_USER]
-            logger.info("📌 Phase: JUDGE - Optimizing 2 prompts (Judge only)")
+            logger.info("📌 Phase: JUDGE (Legacy) - Optimizing 2 prompts (Judge only)")
         elif args.phase == "council":
-            # Phase 2: Optimize Council members (requires optimized Judge)
+            # Legacy: Optimize Council members (requires optimized Judge)
             prompt_uris_to_optimize = [
                 P_SYS,
                 P_USER,
@@ -636,13 +868,15 @@ def main():
                 PR_SYS,
                 PR_USER,
             ]
-            logger.info("📌 Phase: COUNCIL - Optimizing 8 prompts (All jurors)")
+            logger.info(
+                "📌 Phase: COUNCIL (Legacy) - Optimizing 8 prompts (All jurors)"
+            )
         elif args.phase == "core":
-            # Recommended: Optimize only system prompts (user templates are mostly data injection)
+            # Legacy: Optimize only system prompts
             prompt_uris_to_optimize = [P_SYS, D_SYS, L_SYS, PR_SYS, JUDGE_SYS]
-            logger.info("📌 Phase: CORE - Optimizing 5 system prompts (recommended)")
-        else:  # "all"
-            # Full optimization (not recommended - huge search space)
+            logger.info("📌 Phase: CORE (Legacy) - Optimizing 5 system prompts")
+        elif args.phase == "all":
+            # Legacy: Full optimization (not recommended)
             prompt_uris_to_optimize = [
                 P_SYS,
                 P_USER,
@@ -656,7 +890,87 @@ def main():
                 JUDGE_USER,
             ]
             logger.warning(
-                "⚠️ Phase: ALL - Optimizing all 10 prompts (large search space!)"
+                "⚠️ Phase: ALL (Legacy) - Optimizing all 10 prompts (large search space!)"
+            )
+        # ===== PARALLEL PHASES (Anti-Echo Chamber) =====
+        elif args.phase == "parallel-judge":
+            # Parallel: Optimize only Calibrated Judge
+            prompt_uris_to_optimize = [CALIBRATED_JUDGE_SYS, CALIBRATED_JUDGE_USER]
+            logger.info(
+                "📌 Phase: PARALLEL-JUDGE - Optimizing 2 prompts (Calibrated Judge)"
+            )
+        elif args.phase == "parallel-council":
+            # Parallel: Optimize parallel jurors + shared user template
+            prompt_uris_to_optimize = [
+                PARALLEL_P_SYS,
+                PARALLEL_D_SYS,
+                PARALLEL_L_SYS,
+                PARALLEL_PR_SYS,
+                PARALLEL_USER,  # Shared user template
+            ]
+            logger.info(
+                "📌 Phase: PARALLEL-COUNCIL - Optimizing 5 prompts (4 juror sys + 1 shared user)"
+            )
+        elif args.phase == "parallel-core":
+            # Parallel Recommended: Only system prompts (no user templates)
+            prompt_uris_to_optimize = [
+                PARALLEL_P_SYS,
+                PARALLEL_D_SYS,
+                PARALLEL_L_SYS,
+                PARALLEL_PR_SYS,
+                CALIBRATED_JUDGE_SYS,
+            ]
+            logger.info(
+                "🚀 Phase: PARALLEL-CORE - Optimizing 5 system prompts (RECOMMENDED)"
+            )
+        elif args.phase == "parallel-all":
+            # Parallel: Full optimization
+            prompt_uris_to_optimize = [
+                PARALLEL_P_SYS,
+                PARALLEL_D_SYS,
+                PARALLEL_L_SYS,
+                PARALLEL_PR_SYS,
+                PARALLEL_USER,
+                CALIBRATED_JUDGE_SYS,
+                CALIBRATED_JUDGE_USER,
+            ]
+            logger.warning("⚠️ Phase: PARALLEL-ALL - Optimizing all 7 parallel prompts")
+        # [NEW] Isolated Juror Phases
+        # We optimize ONLY the System Prompt to avoid breaking the shared User Template for others.
+        elif args.phase == "parallel-prosecutor":
+            prompt_uris_to_optimize = [PARALLEL_P_SYS]
+            logger.info(
+                "🎯 Phase: PARALLEL-PROSECUTOR - Optimizing 1 prompt (Prosecutor Sys)"
+            )
+
+        elif args.phase == "parallel-defense":
+            prompt_uris_to_optimize = [PARALLEL_D_SYS]
+            logger.info(
+                "🎯 Phase: PARALLEL-DEFENSE - Optimizing 1 prompt (Defense Sys)"
+            )
+
+        elif args.phase == "parallel-literalist":
+            prompt_uris_to_optimize = [PARALLEL_L_SYS]
+            logger.info(
+                "🎯 Phase: PARALLEL-LITERALIST - Optimizing 1 prompt (Literalist Sys)"
+            )
+
+        elif args.phase == "parallel-profiler":
+            prompt_uris_to_optimize = [PARALLEL_PR_SYS]
+            logger.info(
+                "🎯 Phase: PARALLEL-PROFILER - Optimizing 1 prompt (Profiler Sys)"
+            )
+        else:
+            logger.error(f"Unknown phase: {args.phase}")
+            sys.exit(1)
+
+        if USE_PARALLEL_MODE:
+            logger.info(
+                "🔄 Mode: PARALLEL (Anti-Echo Chamber) - Independent voting enabled"
+            )
+        else:
+            logger.info(
+                "📜 Mode: LEGACY (Sequential Debate) - Traditional council debate"
             )
 
         logger.info(
@@ -679,6 +993,21 @@ def main():
             scorers=[s2_rich_scorer],
         )
 
+        if S2_FEEDBACK_LOG:
+            csv_path = "s2_feedback_history.csv"
+            # Create DataFrame
+            df = pd.DataFrame(S2_FEEDBACK_LOG)
+            # Save to local CSV
+            df.to_csv(csv_path, index=False)
+            # Log as MLflow Artifact
+            mlflow.log_artifact(csv_path)
+
+            # Optional: Calculate quick stats for the logs
+            avg_score = df["score"].mean()
+            logger.success(
+                f"Feedback Analysis saved to {csv_path} ({len(df)} records). Avg Score: {avg_score:.2f}"
+            )
+
         logger.success("Optimization Complete!")
         if os.path.exists(log_file):
             mlflow.log_artifact(log_file)
@@ -698,6 +1027,7 @@ def main():
         optimized_list = results.optimized_prompts
 
     name_map = {
+        # Legacy prompts (Sequential Debate)
         "s2_pros_sys": "s2_prosecutor_optimized.txt",
         "s2_pros_user": "s2_prosecutor_user_optimized.txt",
         "s2_def_sys": "s2_defense_optimized.txt",
@@ -708,6 +1038,14 @@ def main():
         "s2_prof_user": "s2_profiler_user_optimized.txt",
         "s2_judge_sys": "s2_judge_optimized.txt",
         "s2_judge_user": "s2_judge_user_optimized.txt",
+        # Parallel prompts (Anti-Echo Chamber)
+        "s2_parallel_pros_sys": "s2_parallel_prosecutor_optimized.txt",
+        "s2_parallel_def_sys": "s2_parallel_defense_optimized.txt",
+        "s2_parallel_lit_sys": "s2_parallel_literalist_optimized.txt",
+        "s2_parallel_prof_sys": "s2_parallel_profiler_optimized.txt",
+        "s2_parallel_user": "s2_parallel_user_optimized.txt",
+        "s2_calibrated_judge_sys": "s2_calibrated_judge_optimized.txt",
+        "s2_calibrated_judge_user": "s2_calibrated_judge_user_optimized.txt",
     }
 
     saved_count = 0

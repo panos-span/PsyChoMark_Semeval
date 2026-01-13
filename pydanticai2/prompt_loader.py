@@ -65,6 +65,10 @@ def load_prompt_or_default(
 
 class S1Prompts:
     def __init__(self):
+        # ===========================================================
+        # LEGACY PROMPTS (backward compatibility)
+        # ===========================================================
+
         # 1. Generator System
         self.gen_system = load_prompt_or_default(
             "s1_generator_optimized.txt", build_s1_discriminative_system, S1_PROMPT_DIRS
@@ -97,6 +101,54 @@ class S1Prompts:
             S1_PROMPT_DIRS,
         )
 
+        # ===========================================================
+        # DD-CoT PROMPTS (Optimal Architecture)
+        # ===========================================================
+        from pydanticai2.prompt_builder import (
+            build_s1_ddcot_system,
+            build_s1_ddcot_user_template,
+            build_s1_ddcot_critic_system,
+            build_s1_ddcot_critic_user_template,
+            build_s1_ddcot_refiner_system,
+            build_s1_ddcot_refiner_user_template,
+        )
+
+        # DD-CoT Generator
+        self.ddcot_gen_system = load_prompt_or_default(
+            "s1_ddcot_generator_optimized.txt",
+            build_s1_ddcot_system,
+            S1_PROMPT_DIRS,
+        )
+        self.ddcot_gen_user_template = load_prompt_or_default(
+            "s1_ddcot_user_optimized.txt",
+            build_s1_ddcot_user_template,
+            S1_PROMPT_DIRS,
+        )
+
+        # DD-CoT Critic (Enhanced)
+        self.ddcot_critic_system = load_prompt_or_default(
+            "s1_ddcot_critic_optimized.txt",
+            build_s1_ddcot_critic_system,
+            S1_PROMPT_DIRS,
+        )
+        self.ddcot_critic_user_template = load_prompt_or_default(
+            "s1_ddcot_critic_user_optimized.txt",
+            build_s1_ddcot_critic_user_template,
+            S1_PROMPT_DIRS,
+        )
+
+        # DD-CoT Refiner
+        self.ddcot_refiner_system = load_prompt_or_default(
+            "s1_ddcot_refiner_optimized.txt",
+            build_s1_ddcot_refiner_system,
+            S1_PROMPT_DIRS,
+        )
+        self.ddcot_refiner_user_template = load_prompt_or_default(
+            "s1_ddcot_refiner_user_optimized.txt",
+            build_s1_ddcot_refiner_user_template,
+            S1_PROMPT_DIRS,
+        )
+
 
 # Singleton instance
 S1_PROMPTS = S1Prompts()
@@ -104,6 +156,10 @@ S1_PROMPTS = S1Prompts()
 
 class S2Prompts:
     def __init__(self):
+        # ===========================================================
+        # LEGACY PROMPTS (Sequential Debate - backward compatibility)
+        # ===========================================================
+
         # --- System Prompts (Personas) ---
         self.pros_sys = load_prompt_or_default(
             "s2_prosecutor_optimized.txt",
@@ -146,6 +202,60 @@ class S2Prompts:
         )
         self.judge_user = load_prompt_or_default(
             "s2_judge_user_optimized.txt", build_s2_judge_user_template, S2_PROMPT_DIRS
+        )
+
+        # ===========================================================
+        # PARALLEL PROMPTS (Anti-Echo Chamber - Optimal Architecture)
+        # ===========================================================
+        from pydanticai2.prompt_builder import (
+            build_s2_parallel_prosecutor_system,
+            build_s2_parallel_defense_system,
+            build_s2_parallel_literalist_system,
+            build_s2_parallel_profiler_system,
+            build_s2_parallel_user_template,
+            build_s2_calibrated_judge_system,
+            build_s2_calibrated_judge_user_template,
+        )
+
+        # Parallel Juror System Prompts
+        self.parallel_pros_sys = load_prompt_or_default(
+            "s2_parallel_prosecutor_optimized.txt",
+            build_s2_parallel_prosecutor_system,
+            S2_PROMPT_DIRS,
+        )
+        self.parallel_def_sys = load_prompt_or_default(
+            "s2_parallel_defense_optimized.txt",
+            build_s2_parallel_defense_system,
+            S2_PROMPT_DIRS,
+        )
+        self.parallel_lit_sys = load_prompt_or_default(
+            "s2_parallel_literalist_optimized.txt",
+            build_s2_parallel_literalist_system,
+            S2_PROMPT_DIRS,
+        )
+        self.parallel_prof_sys = load_prompt_or_default(
+            "s2_parallel_profiler_optimized.txt",
+            build_s2_parallel_profiler_system,
+            S2_PROMPT_DIRS,
+        )
+
+        # Shared Parallel User Template
+        self.parallel_user = load_prompt_or_default(
+            "s2_parallel_user_optimized.txt",
+            build_s2_parallel_user_template,
+            S2_PROMPT_DIRS,
+        )
+
+        # Calibrated Judge (Anti-Echo Chamber)
+        self.calibrated_judge_sys = load_prompt_or_default(
+            "s2_calibrated_judge_optimized.txt",
+            build_s2_calibrated_judge_system,
+            S2_PROMPT_DIRS,
+        )
+        self.calibrated_judge_user = load_prompt_or_default(
+            "s2_calibrated_judge_user_optimized.txt",
+            build_s2_calibrated_judge_user_template,
+            S2_PROMPT_DIRS,
         )
 
 

@@ -16,6 +16,9 @@ import argparse
 import pathlib
 from typing import List, Dict
 
+import pandas as pd  # <--- NEW
+from datetime import datetime  # <--- NEW
+
 # --- Make repo root importable FIRST ---
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -51,23 +54,35 @@ _load_dotenv_into_environ()
 # Project Modules
 from pydanticai2.psycomark_agents import (
     run_s1_discriminative,
+    run_s1_ddcot,  # NEW: DD-CoT pipeline
     get_rag_collection,
     retrieve_stratified_s1,
     find_best_span,  # For span localization
     format_s1_fewshots_to_xml,  # For few-shot formatting
 )
 from pydanticai2.prompt_builder import (
+    # Legacy prompts
     build_s1_discriminative_system,
     build_s1_critic_system,
     build_s1_refiner_system,
     build_s1_user_template,
     build_s1_critic_user_template,
     build_s1_refiner_user_template,
+    # DD-CoT prompts (NEW)
+    build_s1_ddcot_system,
+    build_s1_ddcot_user_template,
+    build_s1_ddcot_critic_system,
+    build_s1_ddcot_critic_user_template,
+    build_s1_ddcot_refiner_system,
+    build_s1_ddcot_refiner_user_template,
 )
 
 # -----------------------------------------------------------------------------
 # 1. Setup & Data Loading (The Injection)
 # -----------------------------------------------------------------------------
+
+# Global Feedback Collector
+FEEDBACK_LOG = []  # <--- NEW
 
 
 def load_eval_data(path: str, limit: int = 20) -> List[Dict]:
@@ -226,48 +241,81 @@ def generate_actionable_feedback(
     gold_matched: set,
     pred_matched: set,
     label_errors: list,
+    boundary_warnings: list,
+    hallucinated_not_in_text: list,  # Added to integrate into structure
     doc_id: str,
 ) -> str:
     """
-    Generate specific, actionable feedback for the optimizer.
-    Focuses on WHAT to fix and HOW.
+    Generate structured, numbered feedback with positive reinforcement.
+    Format:
+    1. SUCCESS (Positive Reinforcement)
+    2. CRITICAL (Logic Errors)
+    3. REFINEMENT (Boundaries)
+    4. RECALL (Missed)
+    5. NOISE (Hallucinations)
     """
-    feedback_parts = []
+    sections = []
+    idx = 1
 
-    # 1. Label errors - be specific about what the correct label should be
+    # --- 1. Positive Reinforcement (Anchor) ---
+    # Crucial for GEPA: Tells the optimizer what NOT to change
+    if gold_matched:
+        good_examples = []
+        for i in list(gold_matched):
+            g = gold_spans[i]
+            good_examples.append(f"'{g.get('text', '')}'")
+
+        msg = f"KEEP DOING: Correctly extracted {len(gold_matched)}/{len(gold_spans)} spans (e.g., {', '.join(good_examples)})."
+        sections.append(f"{idx}. {msg}")
+        idx += 1
+
+    # --- 2. Logic Errors (High Impact) ---
     if label_errors:
-        feedback_parts.append(f"FIX LABELS: {'; '.join(label_errors[:3])}")
+        sections.append(f"{idx}. FIX LABELS: {'; '.join(label_errors)}")
+        idx += 1
 
-    # 2. Missed spans - show what should have been extracted WITH labels
+    # --- 3. Boundary Issues (Precision) ---
+    if boundary_warnings:
+        sections.append(f"{idx}. TIGHTEN BOUNDARIES: {'; '.join(boundary_warnings)}")
+        idx += 1
+
+    # --- 4. Missed Spans (Recall) ---
     missed_indices = [i for i in range(len(gold_spans)) if i not in gold_matched]
     if missed_indices:
         missed_details = []
-        for idx in missed_indices[:3]:
-            g = gold_spans[idx]
-            g_text = g.get("text", "")[:50]  # Truncate for readability
-            g_label = g.get("label", "Unknown")
+        for i in missed_indices:
+            g = gold_spans[i]
+            g_text = g.get("text", "")
+            g_label = g.get("label", "?")
             missed_details.append(f"{g_label}:'{g_text}'")
-        feedback_parts.append(f"EXTRACT MISSING: {'; '.join(missed_details)}")
+        sections.append(f"{idx}. EXTRACT MISSING: {'; '.join(missed_details)}")
+        idx += 1
 
-    # 3. Hallucinations - only flag if they don't partially match anything
+    # --- 5. Hallucinations (Noise) ---
     halluc_indices = [i for i in range(len(pred_spans)) if i not in pred_matched]
+    noise_msgs = []
+
+    # A. Spans not in text (Fabrication)
+    if hallucinated_not_in_text:
+        noise_msgs.append(f"NOT IN TEXT: {'; '.join(hallucinated_not_in_text)}")
+
+    # B. Spans in text but irrelevant (False Positive)
     if halluc_indices:
-        # Filter out very short hallucinations that might be annotation noise
-        significant_halluc = []
-        for idx in halluc_indices[:3]:
-            p = pred_spans[idx]
-            p_text = p.get("text", "")
-            # Only report if it's substantial (not just "it", "he", etc.)
-            if len(p_text) > 3:
-                significant_halluc.append(f"'{p_text[:40]}'")
+        fps = []
+        for i in halluc_indices:
+            p = pred_spans[i]
+            if len(p.get("text", "")) > 3:
+                fps.append(f"'{p.get('text', '')}'")
+        if fps:
+            noise_msgs.append(f"IRRELEVANT: {', '.join(fps)}")
 
-        if significant_halluc:
-            feedback_parts.append(f"REMOVE: {'; '.join(significant_halluc)}")
+    if noise_msgs:
+        sections.append(f"{idx}. REMOVE NOISE: {' | '.join(noise_msgs)}")
 
-    if not feedback_parts:
+    if not sections:
         return "PERFECT: All spans correctly extracted and labeled."
 
-    return " | ".join(feedback_parts)
+    return "\n".join(sections)
 
 
 @scorer
@@ -317,9 +365,7 @@ def s1_rich_scorer(outputs, expectations):
 
     if gold_spans and not pred_spans:
         # Format expected spans with labels for better feedback
-        expected = [
-            f"{g.get('label', '?')}:'{g.get('text', '')[:30]}'" for g in gold_spans[:3]
-        ]
+        expected = [f"{g.get('label', '?')}:'{g.get('text', '')}'" for g in gold_spans]
         logger.debug(f"[{doc_id}] S1 Score: 0.0 | FAILED (Recall). Missed: {expected}")
         return Feedback(
             value=0.0,
@@ -327,7 +373,7 @@ def s1_rich_scorer(outputs, expectations):
         )
 
     if pred_spans and not gold_spans:
-        halluc = [f"'{p.get('text', '')[:30]}'" for p in pred_spans[:3]]
+        halluc = [f"'{p.get('text', '')}'" for p in pred_spans]
         logger.debug(
             f"[{doc_id}] S1 Score: 0.0 | FAILED (Precision). Hallucinated: {halluc}"
         )
@@ -343,27 +389,21 @@ def s1_rich_scorer(outputs, expectations):
     gold_matched = set()
     pred_matched = set()
 
-    # Track different types of matches
-    exact_matches = 0  # Correct text AND label
-    partial_matches = 0  # Correct text, wrong label (partial credit)
+    exact_matches = 0
+    partial_score_sum = 0.0
     label_errors = []
+    boundary_warnings = []
 
-    # Filter out hallucinated spans (start == -1 means not found in text)
-    valid_pred_spans = []
-    hallucinated_not_in_text = []
-    for p in pred_spans:
-        if p.get("start", 0) == -1:
-            hallucinated_not_in_text.append(p.get("text", "")[:30])
-        else:
-            valid_pred_spans.append(p)
+    valid_pred_spans = [p for p in pred_spans if p.get("start", 0) != -1]
+    # Collect these for the feedback generator
+    hallucinated_not_in_text = [
+        p.get("text", "") for p in pred_spans if p.get("start", 0) == -1
+    ]
 
-    # Match predictions to gold spans
     for p_idx, p in enumerate(valid_pred_spans):
         p_text = p.get("text", "")
         p_lbl = normalize_label(p.get("label", ""))
-        p_start = p.get("start")
-        p_end = p.get("end")
-        p_pos = (p_start, p_end) if p_start is not None and p_end is not None else None
+        p_pos = (p.get("start"), p.get("end")) if p.get("start") is not None else None
 
         best_score = 0.0
         best_g_idx = -1
@@ -372,19 +412,16 @@ def s1_rich_scorer(outputs, expectations):
             if g_idx in gold_matched:
                 continue
             g_text = g.get("text", "")
-            g_start = g.get("start")
-            g_end = g.get("end")
             g_pos = (
-                (g_start, g_end) if g_start is not None and g_end is not None else None
+                (g.get("start"), g.get("end")) if g.get("start") is not None else None
             )
 
-            # Use position-based matching when available
             score = compute_overlap_score(p_text, g_text, p_pos, g_pos)
             if score > best_score:
                 best_score = score
                 best_g_idx = g_idx
 
-        # Match threshold: 0.4 for partial credit, allows for split entities
+        # Threshold: 0.4 for any credit
         if best_score >= 0.4 and best_g_idx >= 0:
             g_target = gold_spans[best_g_idx]
             g_lbl = normalize_label(g_target.get("label", ""))
@@ -393,31 +430,34 @@ def s1_rich_scorer(outputs, expectations):
             pred_matched.add(p_idx)
 
             if p_lbl == g_lbl:
-                # Full match: correct text AND label
-                exact_matches += 1
+                if best_score > 0.9:
+                    exact_matches += 1
+                else:
+                    # Boundary Error (Partial Credit)
+                    partial_score_sum += best_score
+                    boundary_warnings.append(
+                        f"'{p_text}' should be '{g_target.get('text','')[:20]}'"
+                    )
             else:
-                # Partial match: found the span but wrong label
-                partial_matches += 1
-                label_errors.append(f"'{p_text[:30]}' → change {p_lbl} to {g_lbl}")
+                # Label Error (Penalized Credit)
+                partial_score_sum += best_score * 0.5
+                label_errors.append(f"'{p_text}' (Is: {p_lbl}, Should be: {g_lbl})")
 
     # ---------------------------------------------------------
-    # SCORING (Weighted F-beta with partial credit)
+    # SCORING (Weighted F-beta)
     # ---------------------------------------------------------
 
-    fn = len(gold_spans) - len(gold_matched)  # Missed gold spans
-    # Hallucinated = unmatched valid predictions + spans not found in text
+    fn = len(gold_spans) - len(gold_matched)
     fp = (len(valid_pred_spans) - len(pred_matched)) + len(hallucinated_not_in_text)
 
-    # Give partial credit for correct span with wrong label
-    tp_effective = exact_matches + (partial_matches * 0.5)
+    tp_effective = exact_matches + partial_score_sum
 
-    total_positive = tp_effective + fp + (partial_matches * 0.5)
+    total_positive = tp_effective + fp
     precision = tp_effective / total_positive if total_positive > 0 else 0
 
-    total_relevant = tp_effective + fn + (partial_matches * 0.5)
+    total_relevant = tp_effective + fn
     recall = tp_effective / total_relevant if total_relevant > 0 else 0
 
-    # F2 score (recall-weighted)
     beta = 2.0
     f_beta = (
         (1 + beta**2) * (precision * recall) / ((beta**2 * precision) + recall)
@@ -426,18 +466,33 @@ def s1_rich_scorer(outputs, expectations):
     )
 
     # ---------------------------------------------------------
-    # ACTIONABLE FEEDBACK
+    # STRUCTURED FEEDBACK GENERATION
     # ---------------------------------------------------------
 
     rationale = generate_actionable_feedback(
-        gold_spans, valid_pred_spans, gold_matched, pred_matched, label_errors, doc_id
+        gold_spans,
+        valid_pred_spans,
+        gold_matched,
+        pred_matched,
+        label_errors,
+        boundary_warnings,
+        hallucinated_not_in_text,  # Pass this explicitly now
+        doc_id,
     )
 
-    # Add info about spans not found in text
-    if hallucinated_not_in_text:
-        rationale += f" | NOT_IN_TEXT: {'; '.join(hallucinated_not_in_text[:2])}"
+    # [NEW] Collect Feedback for Analysis
+    FEEDBACK_LOG.append(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "doc_id": doc_id,
+            "score": float(f_beta),
+            "rationale": rationale,
+            "n_gold": len(gold_spans),
+            "n_pred": len(pred_spans),
+        }
+    )
 
-    logger.debug(f"[{doc_id}] S1 Score: {f_beta:.2f} | {rationale}")
+    logger.info(f"[{doc_id}] S1 Score: {f_beta:.2f} |\n{rationale}")
     return Feedback(value=float(f_beta), rationale=rationale)
 
 
@@ -445,14 +500,24 @@ def s1_rich_scorer(outputs, expectations):
 # 3. Prediction Wrapper (The Tunnel)
 # -----------------------------------------------------------------------------
 
+# Legacy prompt URIs
 GEN_SYS_URI, GEN_USER_URI = None, None
 CRITIC_SYS_URI, CRITIC_USER_URI = None, None
 REFINER_SYS_URI, REFINER_USER_URI = None, None
+
+# DD-CoT prompt URIs (NEW)
+DDCOT_GEN_SYS_URI, DDCOT_GEN_USER_URI = None, None
+DDCOT_CRITIC_SYS_URI, DDCOT_CRITIC_USER_URI = None, None
+DDCOT_REFINER_SYS_URI, DDCOT_REFINER_USER_URI = None, None
+
 S1_RAG_COLLECTION = None
+USE_DDCOT_MODE = False  # Flag to switch between legacy and DD-CoT
 
 
 def predict_wrapper(text: str, passthrough_gold: str = "{}"):
     """
+    Unified prediction wrapper supporting both Legacy and DD-CoT modes.
+
     Args:
         text: The input text for the model.
         passthrough_gold: The hidden JSON payload containing gold labels.
@@ -478,44 +543,92 @@ def predict_wrapper(text: str, passthrough_gold: str = "{}"):
             logger.warning(f"Failed to load prompt from {uri}: {e}")
             return None
 
-    # 3. Load Prompts (system prompts with few-shot injection)
-    g_sys = load_with_context(GEN_SYS_URI)
-    c_sys = load_with_context(CRITIC_SYS_URI)
-    r_sys = load_with_context(REFINER_SYS_URI)
-
-    # Load User Templates (no few-shot injection needed)
-    g_usr = mlflow.genai.load_prompt(GEN_USER_URI).template if GEN_USER_URI else None
-    c_usr = (
-        mlflow.genai.load_prompt(CRITIC_USER_URI).template if CRITIC_USER_URI else None
-    )
-    r_usr = (
-        mlflow.genai.load_prompt(REFINER_USER_URI).template
-        if REFINER_USER_URI
-        else None
-    )
-
-    # Debug: Log prompts being used
-    logger.debug(
-        f"Using gen_sys prompt (first 200 chars): {g_sys[:200] if g_sys else 'None'}..."
-    )
-    logger.debug(f"Using g_usr template: {g_usr[:100] if g_usr else 'None'}...")
-    logger.debug(f"Few shots count: {len(few_shots)}")
-
     try:
-        # Note: few_shots are already injected into g_sys via load_with_context,
-        # so we pass empty list to avoid double-injection in assemble_s1_system_prompt
-        spans = asyncio.run(
-            run_s1_discriminative(
-                text,
-                gen_prompt_override=g_sys,
-                few_shots=[],  # Already injected into g_sys
-                user_prompt_template_override=g_usr,
-                critic_prompt_override=c_sys,
-                critic_user_template_override=c_usr,
-                refiner_prompt_override=r_sys,
-                refiner_user_template_override=r_usr,
+        # =====================================================================
+        # DD-CoT MODE (Optimal Architecture)
+        # =====================================================================
+        if USE_DDCOT_MODE:
+            logger.debug("[DD-CoT Mode] Loading prompts...")
+
+            # Load DD-CoT prompts
+            g_sys = load_with_context(DDCOT_GEN_SYS_URI)
+            c_sys = load_with_context(DDCOT_CRITIC_SYS_URI)
+            r_sys = load_with_context(DDCOT_REFINER_SYS_URI)
+
+            g_usr = (
+                mlflow.genai.load_prompt(DDCOT_GEN_USER_URI).template
+                if DDCOT_GEN_USER_URI
+                else None
             )
-        )
+            c_usr = (
+                mlflow.genai.load_prompt(DDCOT_CRITIC_USER_URI).template
+                if DDCOT_CRITIC_USER_URI
+                else None
+            )
+            r_usr = (
+                mlflow.genai.load_prompt(DDCOT_REFINER_USER_URI).template
+                if DDCOT_REFINER_USER_URI
+                else None
+            )
+
+            logger.debug(f"[DD-CoT] Few shots count: {len(few_shots)}")
+
+            # Run DD-CoT pipeline
+            spans = asyncio.run(
+                run_s1_ddcot(
+                    text,
+                    few_shots=[],  # Already injected into g_sys
+                    gen_prompt_override=g_sys,
+                    gen_user_template_override=g_usr,
+                    critic_prompt_override=c_sys,
+                    critic_user_template_override=c_usr,
+                    refiner_prompt_override=r_sys,
+                    refiner_user_template_override=r_usr,
+                )
+            )
+
+        # =====================================================================
+        # LEGACY MODE (Backward Compatibility)
+        # =====================================================================
+        else:
+            logger.debug("[Legacy Mode] Loading prompts...")
+
+            # Load Legacy prompts
+            g_sys = load_with_context(GEN_SYS_URI)
+            c_sys = load_with_context(CRITIC_SYS_URI)
+            r_sys = load_with_context(REFINER_SYS_URI)
+
+            g_usr = (
+                mlflow.genai.load_prompt(GEN_USER_URI).template
+                if GEN_USER_URI
+                else None
+            )
+            c_usr = (
+                mlflow.genai.load_prompt(CRITIC_USER_URI).template
+                if CRITIC_USER_URI
+                else None
+            )
+            r_usr = (
+                mlflow.genai.load_prompt(REFINER_USER_URI).template
+                if REFINER_USER_URI
+                else None
+            )
+
+            logger.debug(f"[Legacy] Few shots count: {len(few_shots)}")
+
+            # Run legacy pipeline
+            spans = asyncio.run(
+                run_s1_discriminative(
+                    text,
+                    gen_prompt_override=g_sys,
+                    few_shots=[],  # Already injected into g_sys
+                    user_prompt_template_override=g_usr,
+                    critic_prompt_override=c_sys,
+                    critic_user_template_override=c_usr,
+                    refiner_prompt_override=r_sys,
+                    refiner_user_template_override=r_usr,
+                )
+            )
 
         # Debug: Log what the model returned
         logger.debug(f"Model returned {len(spans)} spans")
@@ -560,14 +673,14 @@ def predict_wrapper(text: str, passthrough_gold: str = "{}"):
                     assigned_count[key] = nth + 1
                 else:
                     # Span not found in text - mark as potential hallucination
-                    logger.warning(f"Span not found in text: '{span_text[:50]}...'")
+                    logger.warning(f"Span not found in text: '{span_text}'")
                     span_dict["start"] = -1
                     span_dict["end"] = -1
 
             final_spans.append(span_dict)
 
         logger.debug(
-            f"Final spans to return: {final_spans[:2] if final_spans else 'empty'}"
+            f"Final spans to return: {final_spans if final_spans else 'empty'}"
         )
 
         return {
@@ -605,11 +718,12 @@ def main():
     )
     parser.add_argument(
         "--model-reflector",
-        default="bedrock:/eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        default="bedrock:/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     )
     parser.add_argument(
         "--phase",
         choices=[
+            # ===== LEGACY PHASES =====
             "all",
             "generator",
             "critic",
@@ -617,16 +731,34 @@ def main():
             "gen-sys",
             "critic-sys",
             "refiner-sys",
+            # ===== DD-CoT PHASES (Optimal Architecture) =====
+            "ddcot-all",
+            "ddcot-gen",
+            "ddcot-critic",
+            "ddcot-refiner",
+            "ddcot-gen-sys",
+            "ddcot-critic-sys",
+            "ddcot-refiner-sys",
         ],
-        default="all",
+        default="ddcot-gen-sys",
         help="""Optimization phase - optimize ONE prompt at a time:
-            'all'         = Optimize all 6 prompts (large search space)
-            'generator'   = Optimize Generator system + user (2 prompts)
-            'critic'      = Optimize Critic system + user (2 prompts)
-            'refiner'     = Optimize Refiner system + user (2 prompts)
-            'gen-sys'     = Optimize ONLY Generator system (1 prompt - recommended)
-            'critic-sys'  = Optimize ONLY Critic system (1 prompt)
-            'refiner-sys' = Optimize ONLY Refiner system (1 prompt)
+            === LEGACY PHASES ===
+            'all'             = Optimize all 6 legacy prompts
+            'generator'       = Optimize Legacy Generator (sys + user)
+            'critic'          = Optimize Legacy Critic (sys + user)
+            'refiner'         = Optimize Legacy Refiner (sys + user)
+            'gen-sys'         = Optimize ONLY Legacy Generator system
+            'critic-sys'      = Optimize ONLY Legacy Critic system
+            'refiner-sys'     = Optimize ONLY Legacy Refiner system
+            
+            === DD-CoT PHASES (Recommended) ===
+            'ddcot-all'       = Optimize all 6 DD-CoT prompts
+            'ddcot-gen'       = Optimize DD-CoT Generator (sys + user)
+            'ddcot-critic'    = Optimize DD-CoT Critic (sys + user)
+            'ddcot-refiner'   = Optimize DD-CoT Refiner (sys + user)
+            'ddcot-gen-sys'   = Optimize ONLY DD-CoT Generator system (RECOMMENDED)
+            'ddcot-critic-sys'= Optimize ONLY DD-CoT Critic system
+            'ddcot-refiner-sys'= Optimize ONLY DD-CoT Refiner system
         """,
     )
     args = parser.parse_args()
@@ -665,6 +797,13 @@ def main():
     global GEN_SYS_URI, GEN_USER_URI
     global CRITIC_SYS_URI, CRITIC_USER_URI
     global REFINER_SYS_URI, REFINER_USER_URI
+    global DDCOT_GEN_SYS_URI, DDCOT_GEN_USER_URI
+    global DDCOT_CRITIC_SYS_URI, DDCOT_CRITIC_USER_URI
+    global DDCOT_REFINER_SYS_URI, DDCOT_REFINER_USER_URI
+    global USE_DDCOT_MODE
+
+    # Determine mode based on phase
+    USE_DDCOT_MODE = args.phase.startswith("ddcot")
 
     with mlflow.start_run():
         mlflow.log_params(vars(args))
@@ -695,9 +834,41 @@ def main():
         REFINER_USER_URI = mlflow.genai.register_prompt(
             "s1_refiner_user", build_s1_refiner_user_template()
         ).uri
-        logger.success("Baseline Prompts Registered.")
+        logger.success("Legacy Baseline Prompts Registered.")
+
+        # ===== DD-CoT Prompts Registration =====
+        logger.info("Registering DD-CoT Prompts...")
+        ddcot_gen_template = build_s1_ddcot_system()
+        ddcot_critic_template = build_s1_ddcot_critic_system()
+        ddcot_refiner_template = build_s1_ddcot_refiner_system()
+
+        # Snapshot DD-CoT baselines
+        mlflow.log_text(ddcot_gen_template, "baseline_prompts/s1_ddcot_generator.txt")
+        mlflow.log_text(ddcot_critic_template, "baseline_prompts/s1_ddcot_critic.txt")
+        mlflow.log_text(ddcot_refiner_template, "baseline_prompts/s1_ddcot_refiner.txt")
+
+        DDCOT_GEN_SYS_URI = mlflow.genai.register_prompt(
+            "s1_ddcot_gen_sys", ddcot_gen_template
+        ).uri
+        DDCOT_GEN_USER_URI = mlflow.genai.register_prompt(
+            "s1_ddcot_gen_user", build_s1_ddcot_user_template()
+        ).uri
+        DDCOT_CRITIC_SYS_URI = mlflow.genai.register_prompt(
+            "s1_ddcot_critic_sys", ddcot_critic_template
+        ).uri
+        DDCOT_CRITIC_USER_URI = mlflow.genai.register_prompt(
+            "s1_ddcot_critic_user", build_s1_ddcot_critic_user_template()
+        ).uri
+        DDCOT_REFINER_SYS_URI = mlflow.genai.register_prompt(
+            "s1_ddcot_refiner_sys", ddcot_refiner_template
+        ).uri
+        DDCOT_REFINER_USER_URI = mlflow.genai.register_prompt(
+            "s1_ddcot_refiner_user", build_s1_ddcot_refiner_user_template()
+        ).uri
+        logger.success("DD-CoT Prompts Registered.")
 
         # Build Prompt URI List Based on Phase
+        # ===== LEGACY PHASES =====
         if args.phase == "generator":
             prompt_uris_to_optimize = [GEN_SYS_URI, GEN_USER_URI]
             logger.info(
@@ -723,6 +894,45 @@ def main():
             prompt_uris_to_optimize = [REFINER_SYS_URI]
             logger.info(
                 "📌 Phase: REFINER-SYS - Optimizing 1 prompt (Refiner system only)"
+            )
+        # ===== DD-CoT PHASES (Optimal Architecture) =====
+        elif args.phase == "ddcot-all":
+            prompt_uris_to_optimize = [
+                DDCOT_GEN_SYS_URI,
+                DDCOT_GEN_USER_URI,
+                DDCOT_CRITIC_SYS_URI,
+                DDCOT_CRITIC_USER_URI,
+                DDCOT_REFINER_SYS_URI,
+                DDCOT_REFINER_USER_URI,
+            ]
+            logger.info("🎯 Phase: DDCOT-ALL - Optimizing all 6 DD-CoT prompts")
+        elif args.phase == "ddcot-gen":
+            prompt_uris_to_optimize = [DDCOT_GEN_SYS_URI, DDCOT_GEN_USER_URI]
+            logger.info(
+                "🎯 Phase: DDCOT-GEN - Optimizing DD-CoT Generator (sys + user)"
+            )
+        elif args.phase == "ddcot-critic":
+            prompt_uris_to_optimize = [DDCOT_CRITIC_SYS_URI, DDCOT_CRITIC_USER_URI]
+            logger.info(
+                "🎯 Phase: DDCOT-CRITIC - Optimizing DD-CoT Critic (sys + user)"
+            )
+        elif args.phase == "ddcot-refiner":
+            prompt_uris_to_optimize = [DDCOT_REFINER_SYS_URI, DDCOT_REFINER_USER_URI]
+            logger.info(
+                "🎯 Phase: DDCOT-REFINER - Optimizing DD-CoT Refiner (sys + user)"
+            )
+        elif args.phase == "ddcot-gen-sys":
+            prompt_uris_to_optimize = [DDCOT_GEN_SYS_URI]
+            logger.info(
+                "🎯 Phase: DDCOT-GEN-SYS - Optimizing DD-CoT Generator system (RECOMMENDED)"
+            )
+        elif args.phase == "ddcot-critic-sys":
+            prompt_uris_to_optimize = [DDCOT_CRITIC_SYS_URI]
+            logger.info("🎯 Phase: DDCOT-CRITIC-SYS - Optimizing DD-CoT Critic system")
+        elif args.phase == "ddcot-refiner-sys":
+            prompt_uris_to_optimize = [DDCOT_REFINER_SYS_URI]
+            logger.info(
+                "🎯 Phase: DDCOT-REFINER-SYS - Optimizing DD-CoT Refiner system"
             )
         else:  # "all"
             prompt_uris_to_optimize = [
@@ -755,6 +965,15 @@ def main():
             scorers=[s1_rich_scorer],
         )
 
+        # [NEW] Save Automated Feedback Analysis
+        if FEEDBACK_LOG:
+            csv_path = "feedback_history.csv"
+            pd.DataFrame(FEEDBACK_LOG).to_csv(csv_path, index=False)
+            mlflow.log_artifact(csv_path)
+            logger.success(
+                f"Feedback Analysis saved to {csv_path} ({len(FEEDBACK_LOG)} records)"
+            )
+
         logger.success("Optimization Complete!")
         if os.path.exists(log_file):
             mlflow.log_artifact(log_file)
@@ -774,12 +993,20 @@ def main():
         optimized_list = results.optimized_prompts
 
     name_to_filename = {
+        # ===== Legacy Prompts =====
         "s1_gen_sys": "s1_generator_optimized.txt",
         "s1_gen_user": "s1_user_optimized.txt",
         "s1_critic_sys": "s1_critic_optimized.txt",
         "s1_critic_user": "s1_critic_user_optimized.txt",
         "s1_refiner_sys": "s1_refiner_optimized.txt",
         "s1_refiner_user": "s1_refiner_user_optimized.txt",
+        # ===== DD-CoT Prompts (Optimal Architecture) =====
+        "s1_ddcot_gen_sys": "s1_ddcot_generator_optimized.txt",
+        "s1_ddcot_gen_user": "s1_ddcot_user_optimized.txt",
+        "s1_ddcot_critic_sys": "s1_ddcot_critic_optimized.txt",
+        "s1_ddcot_critic_user": "s1_ddcot_critic_user_optimized.txt",
+        "s1_ddcot_refiner_sys": "s1_ddcot_refiner_optimized.txt",
+        "s1_ddcot_refiner_user": "s1_ddcot_refiner_user_optimized.txt",
     }
 
     for prompt_obj in optimized_list:
