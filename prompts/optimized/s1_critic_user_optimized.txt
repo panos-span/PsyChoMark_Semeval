@@ -1,0 +1,12 @@
+
+<document_context>
+{{text}}
+</document_context>
+
+<draft_extraction>
+{{draft_json}}
+</draft_extraction>
+
+<audit_instruction>
+Audit the extraction above. Return a list of specific errors.
+</audit_instruction>

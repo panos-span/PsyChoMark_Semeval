@@ -1,0 +1,16 @@
+
+<document_context>
+{{text}}
+</document_context>
+
+<draft_spans>
+{{draft_json}}
+</draft_spans>
+
+<critique_feedback>
+{{critique_json}}
+</critique_feedback>
+
+<patch_instruction>
+Apply the feedback to fix the spans. Ensure VERBATIM extraction.
+</patch_instruction>

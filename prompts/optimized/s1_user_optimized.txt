@@ -1,0 +1,13 @@
+
+<document_to_analyze>
+{{text}}
+</document_to_analyze>
+
+<task>
+1. Read the text carefully.
+2. Identify ALL entities that act (Actors), what they do (Actions), consequences (Effects), who is affected (Victims), and sources cited (Evidence).
+3. Extract FULL phrases verbatim from the text.
+4. Return a JSON array of {"label": "...", "text": "..."} objects.
+
+REMEMBER: Extract structural markers even from neutral/factual texts. Do not skip extraction just because the text seems non-conspiratorial.
+</task>

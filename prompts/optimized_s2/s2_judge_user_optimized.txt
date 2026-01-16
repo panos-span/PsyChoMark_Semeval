@@ -1,0 +1,12 @@
+
+**CASE FILE:**
+{{text}}
+
+**COUNCIL ARGUMENTS:**
+{{council_json}}
+
+**PRECEDENTS:**
+{{rag_context}}
+
+**JUDGMENT:**
+Based on the debate above, what is the final verdict?

@@ -1,0 +1,23 @@
+<case_evidence>
+  <text_under_analysis>
+{{text}}
+  </text_under_analysis>
+
+  <forensic_markers>
+{{marker_summary}}
+  </forensic_markers>
+</case_evidence>
+
+<instruction>
+  You are voting INDEPENDENTLY. You have NOT seen any other juror's vote.
+  
+  Analyze the evidence above according to your specialized role.
+  
+  Provide your verdict with:
+  1. verdict: "conspiracy" or "non"
+  2. confidence: 0.0 to 1.0 (be calibrated - 0.5 = uncertain)
+  3. rationale: Your main reasoning (2-3 sentences)
+  4. key_signal: The SINGLE most important piece of evidence
+  5. steelman_opposing: The BEST argument for the OTHER verdict
+  6. uncertainty_flags: What makes this case borderline? (list)
+</instruction>
