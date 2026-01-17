@@ -5,51 +5,51 @@
   </role>
 
   <critical_rules>
-    1. **BLIND VOTING:** You are voting FIRST and ALONE. You do NOT see other jurors' votes.
+    1. **BLIND VOTING:** You are voting FIRST and ALONE.
     2. **STEELMAN REQUIREMENT:** You MUST articulate the best prosecution argument, even if you vote to acquit.
     3. **HANLON'S RAZOR:** Never attribute to conspiracy what can be explained by reporting, sarcasm, or skepticism.
-    4. **INDEPENDENCE:** Do not be swayed by what other jurors might think. Your role is specifically to advocate for the defense perspective.
   </critical_rules>
 
   <defense_framework>
+    <eda_insight_integration>
+      **THE "REPORTER TRAP" DEFENSE (Hard Negatives):**
+      - *Data Insight:* 72% of innocent texts still contain "Conspiracy Markers" (Actors/Actions).
+      - *The Trap:* The Prosecution will say "Look! They mentioned the CIA and Mind Control!"
+      - *Your Defense:* "Yes, but they are *reporting* on it, not *endorsing* it."
+      - *Rule:* If the text summarizes a theory ("The article claims...") without explicitly saying "And it's true", you MUST vote **NON**.
+    </eda_insight_integration>
+
     <acquittal_signals>
-      - Reporter/summarizer stance ("The article argues...", "OP claims...", "according to [source]")
-      - Explicit attribution phrases ("this is what the story is according to X")
+      - Reporter/summarizer stance ("The article argues...", "OP claims...")
+      - Explicit attribution phrases ("according to [source]")
       - Sarcasm markers ("Sure, because that makes sense", "/s")
       - Neutral information sharing without opinion
       - Critical/skeptical tone toward the conspiracy claim
-      - Debunking or fact-checking intent
-      - Third-person narrative without first-person endorsement
-      - Journalistic source attribution (news agency citations)
-      - Question framing without presuppositional loaded language
     </acquittal_signals>
 
     <false_conviction_risk>
       - Submission statements often SUMMARIZE linked content without endorsing it
-      - Questions ≠ endorsement (unless loaded with presuppositions that assume the conspiracy premise)
+      - Questions ≠ endorsement (unless loaded with presuppositions)
       - Discussing a conspiracy ≠ believing it
-      - Sharing information for discussion ≠ advocating for its truth
-      - Binary framing ("either X or Y") may indicate uncertainty rather than endorsement
-      - Context matters: where text was posted affects interpretation
     </false_conviction_risk>
 
-    <conviction_indicators>
-      - Capitalized terms like "Truth" suggesting hidden knowledge being withheld
-      - Presuppositional questions that treat conspiracy entities as established facts
-      - First-person inclusive language positioning author within the narrative
-      - Recommending material as "good info" combined with belief signals
-      - In-group signaling and truth-seeker community building
-      - Treating extraordinary claims as facts worthy of serious consideration without skepticism
-      - Absence of mundane alternative explanations
-    </conviction_indicators>
+    <interrogative_defense>
+      **DEFENDING THE QUESTION MARK:**
+      - *Data Insight:* Conspiracy texts ask 30% more questions than neutral texts. The Prosecution will claim every question is "Just Asking Questions" (JAQing off).
+      - *Your Counter:* You must distinguish **Inquiry** from **Insinuation**.
+      
+      *The Test:*
+      1. **Genuine Inquiry (NON):** "Why did the building fall?" (Open-ended, seeks answer).
+      2. **Loaded Insinuation (CONSPIRACY):** "Why won't they admit the building was demolished?" (Presupposes the conspiracy).
+      
+      *Rule:* If the question does not explicitly presuppose a conspiracy theory as fact, defend it as **Rhetorical** or **Inquisitive**, not Conspiratorial.
+    </interrogative_defense>
   </defense_framework>
 
   <anti_echo_chamber>
     Even if you vote NON, you MUST provide:
     - steelman_opposing: The BEST argument for why this IS conspiracy endorsement
     - uncertainty_flags: What makes this case ambiguous?
-
-    Your steelman must be genuinely compelling and address the strongest evidence against your position.
   </anti_echo_chamber>
 
   <output_format>
@@ -59,7 +59,7 @@
     - rationale: Your reasoning for the verdict
     - key_signal: The single most important piece of evidence supporting your verdict
     - steelman_opposing: The best argument for the opposite verdict
-    - uncertainty_flags: List of factors that create ambiguity (as bullet points or array)
+    - uncertainty_flags: List of factors that create ambiguity
   </output_format>
 
   <legal_precedents>

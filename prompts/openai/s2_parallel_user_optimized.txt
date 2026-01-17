@@ -1,0 +1,46 @@
+## CASE EVIDENCE (PRIMARY SOURCE)
+
+### Text Under Analysis
+{{text}}
+
+### Forensic Markers (S1 Extraction)
+{{marker_summary}}
+
+---
+
+## INSTRUCTIONS (BLIND & INDEPENDENT VOTE)
+
+You are voting **INDEPENDENTLY**.
+You have **NOT** seen any other juror’s vote or analysis.
+
+Analyze the evidence **only** according to your assigned role and framework.
+
+Do **NOT** infer intent beyond what your role permits.
+Do **NOT** assume endorsement unless justified by your role’s standards.
+
+---
+
+## REQUIRED OUTPUT FORMAT (STRICT)
+
+Provide **all** of the following fields:
+
+- **verdict:** `"conspiracy"` or `"non"`
+- **confidence:** Float between `0.0` and `1.0`  
+  - `0.5` = genuinely uncertain
+- **rationale:**  
+  - 2–3 sentences  
+  - Reference the **text**, not other jurors
+- **key_signal:**  
+  - The **single most important phrase, pattern, or signal**
+- **steelman_opposing:**  
+  - The **strongest argument** for the opposite verdict
+- **uncertainty_flags:**  
+  - Bullet list of factors that make this case ambiguous or borderline
+
+---
+
+## CALIBRATION REMINDER
+
+- Questions ≠ endorsement unless **presuppositional**
+- Reporting ≠ belief unless **affirmed**
+- Ambiguity should be reflected in **confidence**, not ignored

@@ -1,0 +1,74 @@
+## CASE FILE
+
+### Text Under Analysis
+{{text}}
+
+---
+
+## COUNCIL VOTES (RAW)
+
+{{transcript}}
+
+---
+
+## COUNCIL ANALYSIS (SUMMARIZED)
+
+{{council_analysis}}
+
+---
+
+## JUDICIAL INSTRUCTIONS (FINAL VERDICT)
+
+You are the **FINAL ARBITER**.
+You must render a verdict **after weighing all council votes**, not counting them.
+
+### You MUST explicitly consider:
+1. **STEELMAN ARGUMENTS**  
+   - What did the *losing side* get right?
+2. **UNCERTAINTY FLAGS**  
+   - Were the same doubts raised by multiple jurors?
+3. **DISSENT QUALITY**  
+   - Is the dissent *more compelling* than the majority?
+4. **COUNCIL SPLIT**  
+   - If split or weak majority, your confidence should decrease
+
+---
+
+## OVERRIDE AUTHORITY
+
+You MAY override the council majority **only if**:
+- Minority reasoning is more evidence-aligned
+- Majority misinterpreted intent, tone, or endorsement
+- Structural or systemic malice was underweighted
+- Source context strongly shifts priors
+
+If you override, you must **explicitly justify why**.
+
+---
+
+## REQUIRED OUTPUT FORMAT (STRICT)
+
+Your output **must include all fields below**:
+
+- **label:** `"conspiracy"` or `"non"`
+- **confidence:** Float `0.0–1.0`  
+  - LOWER if council was split or conflicted
+- **rationale:**  
+  - Reference **both majority and minority views**
+- **dissent_considered:**  
+  - `"yes"` or `"no"`  
+  - Be honest
+- **key_evidence:**  
+  - 1–3 **verbatim quotes** from the text that sealed the verdict
+- **council_override:**  
+  - `"yes"` or `"no"`
+- **borderline_flag:**  
+  - `"yes"` or `"no"`  
+  - Use `"yes"` if reasonable experts could disagree
+
+---
+
+## CALIBRATION WARNING
+
+Do **NOT** default to `"non"` due to uncertainty alone.
+When ambiguity aligns with known conspiracy framing patterns, reflect that in **confidence and rationale**, not silence.

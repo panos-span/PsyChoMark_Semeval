@@ -17,6 +17,23 @@
   </calibration_principles>
 
   <decision_framework>
+    <definition_expansion>
+      **THE "OVERT TYRANNY" CLAUSE (Critical Patch):**
+      - A "Conspiracy" does not always need to be secret.
+      - If a text alleges that a Government/Corporation is **openly acting with malice** to oppress, enslave, or harm the population (e.g., "The government is trying to kill us with these laws"), this IS a conspiracy claim.
+      - *Distinction:*
+        - "This law is bad economics" -> Policy Critique (NON).
+        - "This law is a weapon against the people" -> Tyranny/Conspiracy (YES).
+    </definition_expansion>
+
+    <silent_conspiracy_check>
+      **THE "DOG WHISTLE" CHECK:**
+      - *Trigger:* Council votes "Non" (Unanimous or Majority), BUT S1 found **>5 Forensic Markers**.
+      - *Risk:* The text is using coded language that fooled the Literalist.
+      - *Action:* Re-read the **KEY EVIDENCE** from the Prosecutor.
+      - *Override Condition:* If the Prosecutor points out "Insinuation" or "Leading Questions," you MAY override the Council to **CONSPIRACY** (Low Confidence) or flag as **BORDERLINE**.
+    </silent_conspiracy_check>
+
     <unanimous_council>
       - High confidence in following the council
       - But still check: Did anyone flag uncertainties?
@@ -29,11 +46,73 @@
     </strong_majority>
     
     <split_council>(2-2)
-      - LOW confidence required (0.5-0.7 max)
-      - Weight by: confidence scores, key_signal quality
-      - Flag as borderline for review
+      - CRITICAL TIE-BREAKER REQUIRED.
+      - Do NOT just default to "Non" because of doubt.
+      - You MUST consult the **Jurisprudence Matrix** below to decide which jurors to trust based on text type.
     </split_council>
+
+    <safety_overrides>
+      **THE "HIGH STRUCTURE / LOW CONVICTION" CHECK:**
+      - *Trigger:* The Council voted **NON** (Majority or Unanimous).
+      - *Evidence:* The S1 Extraction list contains **>5 items** (Actors/Actions).
+      - *Diagnosis:* The text is discussing a conspiracy in detail. The Council may have mistaken "Implied Endorsement" for "Reporting."
+      - *Action:* Look at the **PROSECUTOR'S** argument again. Did they flag "Insinuation" or "Dog Whistles"?
+      
+      <systemic_malice_override>
+        **THE "STRUCTURAL CONSPIRACY" CHECK (Disney/Indoctrination Trap):**
+        - *Trigger:* Council votes **NON** on a text about Corporations, Media, or Education (often looking like political critique).
+        - *Check:* Does the text claim **INTENTIONAL MALICE** behind a negative social outcome?
+        - *Example:* "Capitalism creates poverty" (Critique/Non) vs "They designed Capitalism to enslave us" (Conspiracy).
+        - *Action:* If the text alleges that an Institution is **deliberately engineering** psychology or society for harm, **OVERRIDE TO CONSPIRACY**.
+      </systemic_malice_override>
+    </safety_overrides>
+
+    <syntax_weighting>
+      **When the Council is Split (2-2), look at the SYNTAX:**
+      
+      1. **Hedge Density:**
+        - If the text is full of "maybe/seems/might", the author is uncertain.
+        - *Ruling:* Benefit of the doubt -> **NON**.
+        
+      2. **Absolutist Density:**
+        - If the text uses "undeniable/truth/proven", the author is a believer.
+        - *Ruling:* Intent is clear -> **CONSPIRACY**.
+        
+      3. **Pronoun Vaguery:**
+        - If the text relies on "They" without antecedents.
+        - *Ruling:* Conspiracy Framing -> **CONSPIRACY**.
+    </syntax_weighting>
   </decision_framework>
+
+  <recall_calibration>
+    **CRITICAL CALIBRATION FOR "FALSE NEGATIVES":**
+    - *Observation:* The Council tends to over-acquit "Implied" conspiracies.
+    - *Action:* Check the **Source Context** provided in the user message (from `metadata`).
+    
+    **The "Source Prior" Tie-Breaker:**
+    1. If the Council is SPLIT (2-2) or WEAK MAJORITY (3-1 Non):
+    2. Check: Is the source a known **Conspiracy Hub** (e.g., r/conspiracy, r/HighStrangeness, r/Wuhan_Flu)?
+    3. **Rule:** If Source = Conspiracy Hub -> **OVERRIDE TO CONSPIRACY**.
+       - *Rationale:* Users in these spaces rarely post "neutral reporting" without explicit debunking. Ambiguity here usually means "In-Group Signaling."
+    4. If Source = Mainstream (r/news, r/skeptic) -> **UPHOLD ACQUITTAL**.
+       - *Rationale:* Ambiguity here usually means "Sarcasm" or "Poor Phrasing."
+  </recall_calibration>
+
+  <jurisprudence_matrix>
+    **Use this to break ties or resolve ambiguous cases:**
+
+    **SCENARIO A: Low Complexity / Social Media / Rant Frame** (e.g., Short comments, Tweets)
+    * *Signals:* High emotion, "Us vs Them" language, short length, informal tone.
+    * *Trust:* **PROFILER** and **PROSECUTOR**.
+    * *Distrust:* **LITERALIST** (Informal texts rarely meet strict evidentiary standards).
+    * *Verdict Strategy:* **CONVICT** if the text uses Vague Enemy ("They") + Victimhood ("Us") + High Emotion.
+
+    **SCENARIO B: High Complexity / Academic / Reporting Frame** (e.g., Articles, Analysis)
+    * *Signals:* Structured argument, citations, neutral/analytical tone, 3rd person.
+    * *Trust:* **LITERALIST** and **DEFENSE**.
+    * *Distrust:* **PROFILER** (Journalistic tone can be misread as "insider" language).
+    * *Verdict Strategy:* **ACQUIT** unless there is explicit first-person endorsement or Systemic Malice (see Overrides).
+  </jurisprudence_matrix>
 
   <hard_negative_awareness>
     Hard negatives are texts that LOOK like conspiracy but are actually:
@@ -41,6 +120,22 @@
     - Mocking/satirizing conspiracy thinking FROM AN EXTERNAL PERSPECTIVE
     - Neutral academic discussion
     
+    <policy_vs_conspiracy_trap>
+      **Distinguishing Political Criticism from Conspiracy:**
+      - *Political Criticism (NON):* "Lockdowns are bad policy because they destroy the economy." (Specific arg, no hidden enemy).
+      - *Conspiracy Framing (YES):* "They know lockdowns destroy the economy and are doing it on purpose to enslave us." (Malice, Hidden Enemy, "Criminal").
+      
+      **Rule:** If the text alleges **INTENTIONAL MALICE** or **CRIMINAL INTENT** by a vague group ("They", "The Elite") regarding public policy, it is **CONSPIRACY**, not just criticism.
+    </policy_vs_conspiracy_trap>
+
+    <systemic_malice_exception>
+      **When "Policy Analysis" becomes "Conspiracy":**
+      - Normal Policy Critique: "This law has bad outcomes for disabled kids."
+      - Conspiracy Framing: "This law is *designed* to purge disabled kids." (Attributing intent/malice to the system).
+      
+      *Rule:* If the text implies that a Government/Corporation is **INTENTIONALLY TARGETING** a specific group for harm (rather than just being incompetent), treat it as a Conspiracy claim.
+    </systemic_malice_exception>
+
     CRITICAL DISTINCTION - First-person conspiracy language can be:
     1. **External mockery** (NON): Someone outside the conspiracy community satirizing believers
        - Targets "these guys" / "conspiracy theorists" as the subject of ridicule
@@ -57,11 +152,6 @@
     - Check: Is this mocking conspiracy theorists, OR is it conspiracy theorists speaking as if they are the conspirators?
     - Check: Does the gold label indicate "con_insider" subtype? This means genuine conspiracy content.
     - If ambiguous between external satire and insider roleplay, examine WHO is being positioned as foolish
-    
-    When in doubt about political criticism vs conspiracy:
-    - Political hyperbole with "lies" = NON (unless alleging secret coordination)
-    - Public policy criticism = NON
-    - Hidden plots, secret agendas, coordinated deception = CONSPIRACY
   </hard_negative_awareness>
 
   <legal_precedents>

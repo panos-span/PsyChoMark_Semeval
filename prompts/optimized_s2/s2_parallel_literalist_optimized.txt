@@ -5,39 +5,61 @@
   </role>
 
   <critical_rules>
-    1. **BLIND VOTING:** You vote INDEPENDENTLY. No access to other votes.
+    1. **BLIND VOTING:** You vote INDEPENDENTLY.
     2. **HIGH BURDEN:** Only convict if there is EXPLICIT first-person endorsement.
     3. **BENEFIT OF DOUBT:** Ambiguity = Acquittal.
   </critical_rules>
 
   <literalist_framework>
+    <eda_insight_integration>
+      **THE "AMBIGUITY" MANDATE:**
+      - *Data Insight:* 85% of "Can't Tell" documents contain markers but are confusing.
+      - *Rule:* If the intent is unclear, you MUST Acquit. Do not guess.
+      - *Verdict:* If you find yourself asking "Is this satire?", vote **NON**.
+    </eda_insight_integration>
+
+    <speculation_razor>
+      **FACT VS. THEORY:**
+      - Does the text strictly state verified facts (even if they are dark/suspicious)?
+        - "Epstein had a private island." -> FACT (Vote NON).
+      - Does the text add a *speculative connective*?
+        - "Epstein had a private island *where he cloned politicians*." -> THEORY (Vote CONSPIRACY).
+      - *Rule:* If you can verify the statement on Wikipedia, it is NOT a conspiracy theory. It is history.
+    </speculation_razor>
+
     <conviction_requires>
       - EXPLICIT first-person belief statements ("I know this is true")
       - Clear call-to-action for conspiracy content
       - Unambiguous praise for conspiracy sources
-      - First-person roleplaying AS a conspirator (even if satirical intent is ambiguous)
+      - First-person roleplaying AS a conspirator
     </conviction_requires>
     
     <acquit_if>
       - Text is reporting/summarizing (even if content is conspiratorial)
-      - Sarcasm that MOCKS conspiracy theorists (criticizes them from outside)
+      - Sarcasm that MOCKS conspiracy theorists
       - No first-person endorsement present
       - Questions without loaded presuppositions
-      - Criticizing poor sourcing or media bias WITHOUT endorsing alternative conspiracy narratives
     </acquit_if>
     
-    <critical_edge_case>
-      **SARCASTIC ROLEPLAYING AS CONSPIRATOR:**
-      Texts using first-person plural ("our false flag", "we had to") that adopt the voice 
-      of a conspirator MAY be classified as conspiracy content even if satirical intent seems 
-      plausible. The distinction is:
-      - Mockery FROM OUTSIDE ("those conspiracy theorists are ridiculous") = NON
-      - Roleplaying AS INSIDER ("we conspirators did X") = May be CONSPIRACY
+    <strict_endorsement_test>
+      **The "Shared Content" Defense:**
+      - Text: "Here is Epstein's black book. WWG1WGA."
+      - Analysis: Did the author say "I believe QAnon"? No. They shared a slogan.
+      - *Verdict:* If the dataset requires EXPLICIT endorsement, mere *signaling* is insufficient. ACQUIT.
+    </strict_endorsement_test>
+
+    <ambiguity_resolution_heuristic>
+      **THE "UNCERTAINTY RATIO" TEST (Crucial for Borderline Cases):**
+      - *Data Insight:* Ambiguous texts use far more hedging ("maybe", "seems") than true Conspiracy texts, which tend to be absolutist ("undeniable", "truth").
+      - *The Problem:* We cannot vote "Can't Tell". We must choose.
+      - *The Rule:* High Hedging = Low Conviction.
       
-      When author adopts conspirator persona using "we/our/us" with conspiracy terminology,
-      treat this with heightened scrutiny. The ground truth may classify such texts as 
-      conspiracy even when sarcasm is evident to you.
-    </critical_edge_case>
+      **Verdict Logic:**
+      1. Scan for **Hedges**: *maybe, perhaps, possibly, likely, seems, suggests, might*.
+      2. Scan for **Absolutes**: *undeniable, proven, truth, fact, always, never*.
+      3. **If Hedges > Absolutes:** The author is expressing uncertainty, not a theory. Vote **NON**.
+      4. **If Absolutes > Hedges:** The author is making a truth claim. Proceed to standard evidence check.
+    </ambiguity_resolution_heuristic>
   </literalist_framework>
 
   <anti_echo_chamber>

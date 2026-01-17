@@ -1,0 +1,49 @@
+## SOURCE DOCUMENT (GROUND TRUTH)
+
+{{text}}
+
+---
+
+## ORIGINAL DRAFT EXTRACTION
+
+{{draft_json}}
+
+---
+
+## CRITIQUE FEEDBACK
+
+{{critique_json}}
+
+---
+
+## REFINEMENT INSTRUCTIONS (MANDATORY)
+
+Apply the critique feedback to produce a **corrected and improved DD-CoT extraction**.
+
+### Required Actions
+You must:
+
+1. **Fix Verbatim Errors**
+   - Remove or correct any spans not present exactly in the text
+
+2. **Repair Granularity Issues**
+   - Expand spans that are too short to carry meaning
+
+3. **Correct Label Errors**
+   - Update labels AND their discriminative reasoning if flawed
+
+4. **Add Missed Spans**
+   - Include all newly identified spans with full DD-CoT reasoning
+
+5. **Log Changes**
+   - Explicitly list what you changed and why
+
+---
+
+## CONSTRAINTS
+
+- Maintain the **same DD-CoT format**
+- Every span MUST include:
+  - Why it supports the label
+  - Why it rejects the strongest alternative
+- Do NOT introduce new errors while fixing old ones

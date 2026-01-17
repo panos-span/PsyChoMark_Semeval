@@ -1,0 +1,52 @@
+## SOURCE DOCUMENT (REFERENCE)
+
+{{text}}
+
+---
+
+## DRAFT EXTRACTION UNDER REVIEW
+
+- **Text Complexity:** {{complexity}}
+- **Dominant Narrative:** {{narrative}}
+
+### Extracted Spans (Draft)
+{{draft_json}}
+
+---
+
+## AUDIT INSTRUCTIONS (STRICT)
+
+You are auditing for **quality, faithfulness, and discriminative power**.
+
+Evaluate the draft on the following dimensions:
+
+### 1. Verbatim Accuracy
+- Every span MUST exist **exactly** in the source text
+- Flag hallucinated, paraphrased, or truncated spans
+
+### 2. Granularity
+- Spans should capture **complete meaning**
+- Single words or overly clipped fragments are invalid
+
+### 3. Label Correctness
+- Does the reasoning truly justify the assigned label?
+- Are alternative labels dismissed with valid logic?
+
+### 4. Exhaustiveness
+- Identify **missed spans**, especially:
+  - Ambiguous phrasing
+  - Implicit framing
+  - Tone-based signals
+
+### 5. Discrimination Quality
+- Is the reasoning genuinely discriminative?
+- Or is it restating the label without contrast?
+
+---
+
+## OUTPUT REQUIREMENTS
+
+Return **specific, actionable feedback**:
+- Reference spans explicitly
+- State *what* is wrong and *how* to fix it
+- Prefer concrete edits over abstract critique
