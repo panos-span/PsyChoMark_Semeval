@@ -820,31 +820,19 @@ def build_s1_ddcot_user_template() -> str:
 {{text}}
 </document_to_analyze>
 
-<contrastive_examples>
-Pay attention to these discrimination patterns:
-
-EXAMPLE 1 - Actor vs Victim:
-  Text: "The media manipulates the public"
-  "The media" -> Actor (performs "manipulates")
-  "the public" -> Victim (receives manipulation)
-  NOT reversed because: Actor is the agent of the verb
-
-EXAMPLE 2 - Action vs Effect:
-  Text: "They suppress information to control the narrative"
-  "suppress information" -> Action (the verb phrase)
-  "to control the narrative" -> Effect (the purpose/outcome)
-  NOT reversed because: Effect is the PURPOSE clause
-
-EXAMPLE 3 - Evidence vs Actor:
-  Text: "The leaked documents prove the conspiracy"
-  "The leaked documents" -> Evidence (cited as proof)
-  NOT Actor because: It's a SOURCE, not an agent performing action
-</contrastive_examples>
-
 <task>
-1. Assess text complexity and narrative type
-2. Extract all spans with DISCRIMINATIVE reasoning
-3. For each span, explain:
+1. Assess text complexity and narrative type.
+2. Extract all spans with DISCRIMINATIVE reasoning.
+3. **CRITICAL:** For every extraction, you MUST include `preceding_context` and `following_context` (3-5 words each) so we can locate the exact instance in the text.
+   - Example: If text is "...policy that the government hidden...", extract:
+     {
+       "text": "the government",
+       "preceding_context": "policy that",
+       "following_context": "hidden",
+       "label": "Actor",
+       ...
+     }
+4. For each span, explain:
    - Why it IS the assigned label
    - Why it is NOT the most plausible alternative label(s)
 </task>

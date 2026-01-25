@@ -23,6 +23,9 @@ import re
 import json
 import asyncio
 import sys
+import openai
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 import pathlib
 from enum import Enum
 from typing import List, Optional, Tuple, Dict, Any, Literal, Union
@@ -34,11 +37,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from pydanticai2.prompt_loader import S2_PROMPTS
 
 # Pydantic & Pydantic-AI
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 import boto3
 import threading
 from botocore.config import Config  # Import Config
 from pydantic_ai import Agent, RunContext, ModelSettings, ModelRetry
+from pydantic_ai.models.openai import OpenAIResponsesModel
+from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.models.bedrock import BedrockConverseModel
 from pydantic_ai.providers.bedrock import BedrockProvider
 import chromadb
@@ -104,14 +109,46 @@ _bedrock_client = boto3.client(
 logger.remove()
 logger.add(sys.stderr, level="DEBUG")
 
-_GLOBAL_BEDROCK_SEMAPHORE = threading.Semaphore(1)
+# _GLOBAL_BEDROCK_SEMAPHORE = threading.Semaphore(1)
+_GLOBAL_OPENAI_SEMAPHORE = asyncio.Semaphore(3)  # Allow more concurrent OpenAI calls
+# _GLOBAL_OPENAI_SEMAPHORE = threading.Semaphore(1)  # Allow more concurrent OpenAI calls
 
 # Create a standard logger for tenacity to use
 tenacity_logger = logging.getLogger("tenacity")
 tenacity_logger.setLevel(logging.WARNING)
 
-_provider = BedrockProvider(region_name=AWS_REGION, bedrock_client=_bedrock_client)
-LLM = BedrockConverseModel(BEDROCK_MODEL_ID, provider=_provider)
+# _provider = BedrockProvider(region_name=AWS_REGION, bedrock_client=_bedrock_client)
+# LLM = BedrockConverseModel(BEDROCK_MODEL_ID, provider=_provider)
+
+# --- CHANGED: OpenAI Config ---
+# Ensure OPENAI_API_KEY is available in os.environ
+if "OPENAI_API_KEY" not in os.environ:
+    logger.warning("OPENAI_API_KEY not found in environment variables.")
+
+# Mapping "GPT 5.2" to the actual available model name.
+OPENAI_MODEL_ID = "gpt-5.2"
+
+# --- CHANGED: Initialize OpenAI Model ---
+# The OpenAIModel automatically reads OPENAI_API_KEY from env.
+# It handles retries internally, but we can configure settings if needed.
+# --- Programmatic Provider Instantiation ---
+# We instantiate the provider explicitly to pass configuration (like base_url or custom headers)
+# if needed, and to ensure stricter typing for the model.
+_openai_provider = OpenAIProvider(
+    # explicit api_key is optional if OPENAI_API_KEY env var is set,
+    # but useful if you need to rotate keys or load from a secret manager.
+    api_key=os.environ.get("OPENAI_API_KEY"),
+)
+
+## --- Model Instantiation ---
+## We use OpenAIResponsesModel to target the /v1/responses endpoint
+## which is optimized for Pydantic/Structured outputs.
+LLM = OpenAIResponsesModel(
+    model_name=OPENAI_MODEL_ID,
+    provider=_openai_provider,
+    # System instructions in the Responses API are treated strictly.
+    # You can pass global settings here if needed.
+)
 
 
 def is_throttling_error(exception):
@@ -123,15 +160,32 @@ def is_throttling_error(exception):
 
 
 # Retry configuration: Exponential backoff (1s, 2s, 4s...) up to 60s, max 15 attempts.
+# @retry(
+#    retry=retry_if_exception_type(ClientError),
+#    stop=stop_after_attempt(20),
+#    wait=wait_exponential(multiplier=1, min=2, max=60),
+#    reraise=True,
+#    before_sleep=before_sleep_log(tenacity_logger, logging.WARNING),
+# )
+# async def safe_agent_run(agent, message, deps):
+#    """Wraps PydanticAI agent.run with explicit Throttling retries."""
+#    return await agent.run(message, deps=deps)
+
+
+# Update the retry filter to catch OpenAI errors instead of AWS ClientError
 @retry(
-    retry=retry_if_exception_type(ClientError),
-    stop=stop_after_attempt(20),
+    retry=retry_if_exception_type(
+        (openai.RateLimitError, openai.APIConnectionError, openai.InternalServerError)
+    ),
+    stop=stop_after_attempt(10),  # OpenAI limits are usually stricter, 10 is plenty
     wait=wait_exponential(multiplier=1, min=2, max=60),
     reraise=True,
     before_sleep=before_sleep_log(tenacity_logger, logging.WARNING),
 )
 async def safe_agent_run(agent, message, deps):
-    """Wraps PydanticAI agent.run with explicit Throttling retries."""
+    """Wraps PydanticAI agent.run with explicit OpenAI Retries."""
+    # Note: PydanticAI has internal retries, but this outer wrapper
+    # protects against network/API level crashes.
     return await agent.run(message, deps=deps)
 
 
@@ -183,7 +237,10 @@ class BedrockTitanEmbeddingFunction(embedding_functions.EmbeddingFunction):
 def get_rag_collection(path: str, name: str) -> Collection:
     """Initializes Chroma client and returns the collection."""
     client = chromadb.PersistentClient(path=path)
-    ef = BedrockTitanEmbeddingFunction()
+    # ef = BedrockTitanEmbeddingFunction()
+    ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=os.environ.get("OPENAI_API_KEY"), model_name="text-embedding-3-small"
+    )
     logger.info(
         f"  - Loading Index {name} ({client.get_collection(name=name, embedding_function=ef).count()} docs)"
     )
@@ -210,6 +267,15 @@ class S1Span(BaseModel):
     """
 
     label: S1Label
+
+    # NEW: Context Anchors to disambiguate duplicates
+    preceding_context: Optional[str] = Field(
+        None, description="The 3-5 words immediately BEFORE the span."
+    )
+    following_context: Optional[str] = Field(
+        None, description="The 3-5 words immediately AFTER the span."
+    )
+
     text: str = Field(
         ..., description="The exact verbatim substring found in the text."
     )
@@ -231,6 +297,7 @@ class S1Deps(BaseModel):
     text: str = Field(..., alias="raw_text")  # The document content
     doc_id: Optional[str] = None
     few_shots: List[Dict[str, Any]] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ===========================================================================
@@ -267,6 +334,19 @@ class DDCoTSpan(BaseModel):
         description="Assigned label (Actor/Action/Effect/Victim/Evidence)"
     )
 
+    # --- [NEW] Context Anchors ---
+    preceding_context: Optional[str] = Field(
+        None, description="The 3-5 words immediately BEFORE the span."
+    )
+    following_context: Optional[str] = Field(
+        None, description="The 3-5 words immediately AFTER the span."
+    )
+    # -----------------------------
+
+    # [FIX 1] Add these fields so the Validator can store the indices here
+    start: Optional[int] = None
+    end: Optional[int] = None
+
     # Discriminative reasoning (the key DD-CoT innovation)
     why_this_label: str = Field(
         description="Why this span IS this label type (1-2 sentences)."
@@ -279,6 +359,22 @@ class DDCoTSpan(BaseModel):
         default_factory=dict,
         description="For each plausible alternative label, why it's NOT that. E.g., {'Victim': 'NOT Victim because it performs the action, not receives it'}",
     )
+
+    # 2. Validator to normalize String -> Dict
+    @field_validator("why_not_other_labels", mode="before")
+    @classmethod
+    def normalize_why_not(cls, v: Any) -> Dict[str, str]:
+        """
+        Fixes LLM outputting a simple string instead of a dictionary.
+        """
+        if isinstance(v, str):
+            # Wrap the string in a generic key
+            return {"Alternative": v}
+        if v is None:
+            return {}
+        return v
+
+    # --- [FIX ENDS HERE] ---
 
     confidence: float = Field(
         default=0.8,
@@ -354,7 +450,7 @@ class EnhancedS1Critique(BaseModel):
         default_factory=list,
         description="Spans that are too short (e.g., single-word Actions).",
     )
-    label_errors: List[str] = Field(
+    label_errors: List[Union[str, Dict[str, str]]] = Field(
         default_factory=list,
         description="Wrong label assignments (e.g., 'The media' labeled as Evidence instead of Actor).",
     )
@@ -616,23 +712,76 @@ def format_s1_fewshots_to_xml(few_shots: List[Dict]) -> str:
 
 
 # --- 1. Shared Prompt Assembler ---
-def assemble_s1_system_prompt(base_instruction: str, few_shots: List[Dict]) -> str:
+def assemble_s1_system_prompt(
+    base_instruction: str,
+    few_shots: List[Dict],
+    metadata: Dict = {},
+    use_markdown: bool = True,
+) -> str:
     """
-    Smart Assembler:
-    1. Formats the few-shots into XML.
-    2. If {{few_shot_examples}} exists in template -> Replaces it.
-    3. If NOT -> Appends to end (Legacy Fallback).
+    Injects Few-Shots AND Contextual Priors into the S1 System Prompt.
+    Supports both XML (Anthropic) and Markdown (OpenAI) formats.
     """
-    xml_str = format_s1_fewshots_to_xml(few_shots)
+    prompt = base_instruction
 
-    if "{{few_shot_examples}}" in base_instruction:
-        return base_instruction.replace("{{few_shot_examples}}", xml_str)
+    # --- 1. PREPARE SOURCE CONTEXT ---
+    subreddit = metadata.get("subreddit") or metadata.get("source") or "Unknown"
 
-    # Fallback: Append if variable is missing (and we have content)
-    if xml_str:
-        return f"{base_instruction}\n\n{xml_str}"
+    # Define Context Block based on Format
+    if use_markdown:
+        context_block = (
+            f"## Source Context\n"
+            f"**Source:** r/{subreddit}\n"
+            f"> Use this to determine Narrative Frame (A vs B).\n"
+            f"> If 'r/conspiracy', assume **Promotion**.\n"
+            f"> If 'r/news', assume **Reporting**."
+        )
+    else:
+        context_block = (
+            f"SOURCE: r/{subreddit}\n"
+            f"(Use this to help determine Narrative Frame A vs B. "
+            f"If 'r/conspiracy', assume promotion. If 'r/news', assume reporting.)"
+        )
 
-    return base_instruction
+    # --- 2. INJECT SOURCE CONTEXT ---
+    if "{{source_context}}" in prompt:
+        prompt = prompt.replace("{{source_context}}", context_block)
+    else:
+        # Fallback Injection
+        if use_markdown:
+            # Markdown: Prepend as a Header Section
+            prompt = f"{context_block}\n\n{prompt}"
+        else:
+            # XML: Inject inside directives or wrap tags
+            if "<system_directive>" in prompt:
+                prompt = prompt.replace(
+                    "<system_directive>",
+                    f"<system_directive>\n<source_context>\n{context_block}\n</source_context>",
+                )
+            else:
+                prompt = (
+                    f"<source_context>\n{context_block}\n</source_context>\n\n{prompt}"
+                )
+
+    # --- 3. INJECT FEW-SHOT EXAMPLES ---
+    if use_markdown:
+        formatted_examples = format_s1_fewshots_to_markdown(few_shots)
+    else:
+        formatted_examples = format_s1_fewshots_to_xml(few_shots)
+
+    if "{{few_shot_examples}}" in prompt:
+        prompt = prompt.replace("{{few_shot_examples}}", formatted_examples)
+    else:
+        # Fallback Append
+        if use_markdown:
+            prompt = f"{prompt}\n\n{formatted_examples}"
+        else:
+            prompt = f"{prompt}\n\n<reference_examples>\n{formatted_examples}\n</reference_examples>"
+
+    logger.info(
+        f"[S1 Assembler] Mode: {'Markdown' if use_markdown else 'XML'} | Length: {len(prompt)}"
+    )
+    return prompt
 
 
 @s1_discriminative_agent.system_prompt
@@ -643,9 +792,10 @@ def generate_s1_system_prompt(ctx: RunContext[S1Deps]) -> str:
     # 1. Base System Instruction
     # Load the optimized text file (or fallback to default)
     optimized_base = S1_PROMPTS.gen_system
-
-    # Combine with context
-    return assemble_s1_system_prompt(optimized_base, ctx.deps.few_shots)
+    # Pass metadata from deps
+    return assemble_s1_system_prompt(
+        optimized_base, ctx.deps.few_shots, ctx.deps.metadata
+    )
 
 
 # In psycomark_agents.py
@@ -815,6 +965,8 @@ def ddcot_span_to_s1_span(ddcot_span: DDCoTSpan) -> S1Span:
     return S1Span(
         label=ddcot_span.label,
         text=ddcot_span.text,
+        start=ddcot_span.start,  # [FIX 3] Pass start
+        end=ddcot_span.end,  # [FIX 3] Pass end
         why=ddcot_span.why_this_label,  # Preserve reasoning in 'why' field
     )
 
@@ -823,42 +975,50 @@ def validate_ddcot_extraction(
     extraction: DDCoTExtraction, raw_text: str
 ) -> Tuple[DDCoTExtraction, List[str]]:
     """
-    Post-extraction validator for DD-CoT spans.
-
-    Unlike the legacy @output_validator, this runs AFTER extraction and:
-    1. Filters out hallucinated spans (not found in text)
-    2. Flags short Actions (logged but not removed - let Critic handle)
-    3. Returns cleaned extraction + list of issues found
-
-    Returns:
-        (cleaned_extraction, issues_list)
+    Post-extraction validator.
+    [FIX] Relaxed to allow fuzzy matching. Does NOT delete spans if they are 'close enough'.
     """
     valid_spans = []
     issues = []
 
     for span in extraction.extractions:
-        # Rule 1: Verbatim Check
+        # [FIX] Use robust search, not exact find
         start, end = find_best_span(raw_text, span.text)
 
         if start == -1:
-            issues.append(
-                f"[HALLUCINATION] Span '{span.text[:50]}...' not found in text - REMOVED"
-            )
-            continue  # Skip hallucinated spans
+            # Try one more fallback: Case-insensitive normalize
+            norm_text = " ".join(raw_text.split())
+            norm_span = " ".join(span.text.split())
+            if norm_span in norm_text:
+                # It exists but whitespace/newlines differed.
+                # We can't easily get exact indices here without complex mapping,
+                # but we should NOT delete it.
+                # Heuristic: Find approximate location
+                start, end = find_best_span(
+                    raw_text, span.text.split()[0]
+                )  # Anchor on first word
+                if start != -1:
+                    # Expand end to length of full span
+                    end = min(len(raw_text), start + len(span.text))
+                    issues.append(
+                        f"[FIXED] Span '{span.text[:30]}...' whitespace mismatch - KEPT"
+                    )
+                else:
+                    issues.append(
+                        f"[HALLUCINATION] Span '{span.text[:30]}...' not found - REMOVED"
+                    )
+                    continue
+            else:
+                issues.append(
+                    f"[HALLUCINATION] Span '{span.text[:30]}...' not found - REMOVED"
+                )
+                continue
 
-        # Rule 2: Minimum Length for Actions (warn but don't remove)
-        word_count = len(span.text.split())
-        if span.label == S1Label.Action and word_count < 2:
-            issues.append(
-                f"[GRANULARITY] Action '{span.text}' is very short - flagged for Critic"
-            )
+        # Save indices
+        span.start = start
+        span.end = end
 
         valid_spans.append(span)
-
-    if issues:
-        logger.warning(f"[DD-CoT Validator] Found {len(issues)} issues")
-        for issue in issues:
-            logger.debug(f"  - {issue}")
 
     cleaned = DDCoTExtraction(
         text_complexity=extraction.text_complexity,
@@ -871,6 +1031,7 @@ def validate_ddcot_extraction(
 async def run_s1_ddcot(
     text: str,
     few_shots: Optional[List[Dict]] = None,
+    metadata: Optional[Dict] = None,
     # Overrides for GEPA Optimization
     gen_prompt_override: Optional[str] = None,
     gen_user_template_override: Optional[str] = None,
@@ -903,6 +1064,7 @@ async def run_s1_ddcot(
         build_s1_ddcot_user_template,
         build_s1_ddcot_critic_user_template,
         build_s1_ddcot_refiner_user_template,
+        build_s1_ddcot_system,
     )
 
     deps = S1Deps(raw_text=text, few_shots=few_shots or [])
@@ -918,23 +1080,37 @@ async def run_s1_ddcot(
             total_usage["output_tokens"] += u.response_tokens or 0
             total_usage["total_tokens"] += u.total_tokens or 0
 
-    with _GLOBAL_BEDROCK_SEMAPHORE:
+    async with _GLOBAL_OPENAI_SEMAPHORE:
+        # with _GLOBAL_OPENAI_SEMAPHORE:
         try:
-            # STEP 1: DD-CoT GENERATOR
-            gen_agent = get_s1_ddcot_generator(gen_prompt_override)
-
+            # STEP 1: PREPARE SYSTEM PROMPT
+            # Determine the base template source
+            base_sys = ""
             if gen_prompt_override:
-                effective_sys = assemble_s1_system_prompt(
-                    gen_prompt_override, few_shots or []
-                )
-                gen_agent = Agent(
-                    LLM,
-                    output_type=DDCoTExtraction,
-                    deps_type=S1Deps,
-                    system_prompt=effective_sys,
-                    model_settings=ModelSettings(temperature=0.7),
-                )
+                base_sys = gen_prompt_override
+            elif hasattr(S1_PROMPTS, "ddcot_gen_system"):
+                base_sys = S1_PROMPTS.ddcot_gen_system
+            else:
+                base_sys = build_s1_ddcot_system()
 
+            # Assemble: Inject Metadata, Context, and RAG Examples ({{few_shot_examples}})
+            final_system_prompt = assemble_s1_system_prompt(
+                base_sys, few_shots or [], metadata=metadata or {}
+            )
+
+            # STEP 2: CONFIGURE AGENT
+            # Instantiate the agent explicitly to ensure it uses our hydrated prompt
+            gen_agent = Agent(
+                LLM,
+                output_type=DDCoTExtraction,
+                deps_type=S1Deps,
+                system_prompt=final_system_prompt,
+                model_settings=ModelSettings(temperature=0.7),
+            )
+
+            # STEP 3: PREPARE USER MESSAGE
+            # The User message should strictly be the target text now.
+            gen_user_msg = ""
             if gen_user_template_override:
                 gen_user_msg = gen_user_template_override.replace("{{text}}", text)
             elif hasattr(S1_PROMPTS, "ddcot_gen_user_template"):
@@ -944,13 +1120,17 @@ async def run_s1_ddcot(
             else:
                 gen_user_msg = build_s1_ddcot_user_template().replace("{{text}}", text)
 
-            if "{{few_shot_examples}}" in gen_user_msg:
-                few_shot_xml = format_s1_fewshots_to_xml(few_shots or [])
-                gen_user_msg = gen_user_msg.replace(
-                    "{{few_shot_examples}}", few_shot_xml
-                )
+            # [REMOVED] Legacy code that injected {{few_shot_examples}} into gen_user_msg
+            # The examples are now safely inside final_system_prompt via assemble_s1_system_prompt
 
-            logger.debug("[DD-CoT] Running Generator...")
+            # STEP 4: LOGGING
+            # Use DEBUG to keep console clean, or INFO if you are debugging prompts
+            # logger.debug(
+            #    f"[DD-CoT] Final Generator System Prompt:\n{final_system_prompt}"
+            # )
+            # logger.debug(f"[DD-CoT] Generator User Message:\n{gen_user_msg}")
+
+            logger.info("[DD-CoT] Running Generator...")
             gen_result = await safe_agent_run(gen_agent, gen_user_msg, deps)
             _acc_usage(gen_result)  # <--- Track Usage
             draft_extraction: DDCoTExtraction = gen_result.output
@@ -1058,19 +1238,26 @@ async def run_s1_ddcot(
             return (val, total_usage) if return_usage else val
 
         except Exception as e:
-            logger.warning(f"[DD-CoT] Pipeline Failed: {e}")
-            import traceback
+            logger.error(f"S1 DD-CoT Failed: {e}")
 
-            traceback.print_exc()
-            # Return empty result with whatever usage we captured so far
-            val = (
-                DDCoTExtraction(
-                    text_complexity="error", dominant_narrative="error", extractions=[]
-                )
-                if return_full_extraction
-                else []
+            # --- [FIX START] Use VALID literals for fallback ---
+            fallback = DDCoTExtraction(
+                text_complexity="complex",  # Use a valid Literal, not "error"
+                dominant_narrative="neutral",  # Use a valid Literal, not "error"
+                extractions=[],
             )
-            return (val, total_usage) if return_usage else val
+            # --- [FIX END] ---
+
+            usage_dict = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+            if return_full_extraction:
+                if return_usage:
+                    return fallback, usage_dict
+                return fallback
+
+            if return_usage:
+                return [], usage_dict
+            return []
 
 
 # ===========================================================================
@@ -1329,45 +1516,56 @@ def find_span_with_context(
     raw_text: str, snippet: str, left_ctx: str = "", right_ctx: str = "", nth: int = 0
 ) -> Tuple[int, int]:
     """
-    Use left/right context anchors to disambiguate location.
-    Useful when snippet appears multiple times but context differs.
-
-    Args:
-        raw_text: Source document
-        snippet: Text to locate
-        left_ctx: Expected text immediately before snippet (5-10 chars)
-        right_ctx: Expected text immediately after snippet (5-10 chars)
-        nth: Which occurrence to find (0-indexed)
-
-    Returns:
-        (start, end) tuple, or (-1, -1) if not found
+    Robust context-aware finder.
+    Improvements:
+    1. Whitespace Agnostic: Matches "The\nGovernment" against "The Government".
+    2. Full Anchor Usage: Uses full provided context words instead of slicing chars.
     """
     if not left_ctx and not right_ctx:
-        # No context provided, fall back to standard search
         return find_best_span(raw_text, snippet, nth=nth)
 
-    # Build a pattern that includes context
+    # Helper: Convert "hello world" -> "hello\s+world" (escaped and whitespace-flexible)
+    def to_flexible_pattern(s: str) -> str:
+        if not s:
+            return ""
+        # Split by whitespace, escape parts, join with \s+
+        parts = [re.escape(part) for part in s.split()]
+        return r"\s+".join(parts)
+
+    # 1. Build the flexible regex
+    # We use non-capturing groups (?:...) for context, capturing (...) for snippet
     pattern_parts = []
+
     if left_ctx:
-        pattern_parts.append(re.escape(left_ctx[-10:]))  # Last 10 chars of left context
-    pattern_parts.append(f"({re.escape(snippet)})")
+        # Match left context (allowing trailing whitespace)
+        p_left = to_flexible_pattern(left_ctx)
+        pattern_parts.append(f"(?:{p_left})\\s*")
+
+    # The Snippet (Capture Group 1)
+    p_snip = to_flexible_pattern(snippet)
+    pattern_parts.append(f"({p_snip})")
+
     if right_ctx:
-        pattern_parts.append(
-            re.escape(right_ctx[:10])
-        )  # First 10 chars of right context
+        # Match right context (allowing leading whitespace)
+        p_right = to_flexible_pattern(right_ctx)
+        pattern_parts.append(f"\\s*(?:{p_right})")
 
     pattern = "".join(pattern_parts)
 
     try:
+        # 2. Search
         matches = list(re.finditer(pattern, raw_text, re.IGNORECASE))
         if len(matches) > nth:
             match = matches[nth]
-            # Return the capture group (the snippet itself)
+            # Return indices of the snippet capture group (Group 1)
+            # This excludes the context characters from the span
             return match.start(1), match.end(1)
-    except re.error:
-        pass  # Pattern failed, fall back
 
-    # Context search failed, use standard method
+    except re.error as e:
+        logger.warning(f"Context Regex failed: {e}")
+
+    # 3. Fallback: If context fails (e.g. LLM hallucinated the context slightly),
+    # fall back to the standard robust finder on just the snippet.
     return find_best_span(raw_text, snippet, nth=nth)
 
 
@@ -1528,22 +1726,25 @@ def verify_span_boundaries(spans: List[Dict], raw_text: str) -> List[Dict]:
 
 # Lazy-loaded singleton for cross-encoder (avoids loading if not used)
 _CROSS_ENCODER = None
-_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
+_CROSS_ENCODER_MODEL = "BAAI/bge-reranker-v2-m3"
 
 
 def get_cross_encoder():
     """
     Lazy-load cross-encoder model for reranking.
-    Uses a lightweight but effective MS MARCO model.
+    Uses BAAI/bge-reranker-base which handles 'instruction' style queries better than MS MARCO.
     """
     global _CROSS_ENCODER
     if _CROSS_ENCODER is None:
         try:
             from sentence_transformers import CrossEncoder
+            import torch
 
             logger.info(f"[Reranker] Loading cross-encoder: {_CROSS_ENCODER_MODEL}")
-            _CROSS_ENCODER = CrossEncoder(_CROSS_ENCODER_MODEL)
-            logger.success("[Reranker] Cross-encoder loaded successfully")
+            # Use CUDA if available for speed
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _CROSS_ENCODER = CrossEncoder(_CROSS_ENCODER_MODEL, device=device)
+            logger.success(f"[Reranker] Cross-encoder loaded on {device}")
         except ImportError:
             logger.warning(
                 "[Reranker] sentence-transformers not installed. "
@@ -1556,58 +1757,182 @@ def get_cross_encoder():
     return _CROSS_ENCODER
 
 
+def mmr_selection(
+    docs: List[Dict[str, Any]],
+    relevance_scores: np.ndarray,
+    doc_embeddings: np.ndarray = None,
+    top_k: int = 5,
+    lambda_mult: float = 0.6,
+) -> List[Dict[str, Any]]:
+    """
+    Selects documents using Maximal Marginal Relevance (MMR).
+
+    Args:
+        relevance_scores: Normalized (0-1) scores from the CrossEncoder.
+        doc_embeddings: Vector embeddings of the candidate documents.
+        lambda_mult: Diversity control.
+                     1.0 = Pure Relevance (Standard Reranking)
+                     0.5 = Balanced
+                     0.0 = Pure Diversity
+    """
+    if not docs:
+        return []
+
+    # If we don't have embeddings, fallback to simple top-k
+    if doc_embeddings is None or len(doc_embeddings) == 0:
+        logger.warning(
+            "[MMR] No embeddings provided. Falling back to standard relevance."
+        )
+        # Sort by relevance indices
+        sorted_indices = np.argsort(relevance_scores)[::-1][:top_k]
+        return [docs[i] for i in sorted_indices]
+
+    selected_indices = []
+    candidate_indices = list(range(len(docs)))
+
+    while len(selected_indices) < top_k and candidate_indices:
+        best_mmr_score = -float("inf")
+        best_idx = -1
+
+        for idx in candidate_indices:
+            # 1. Relevance Score (from CrossEncoder)
+            rel_score = relevance_scores[idx]
+
+            # 2. Diversity Penalty (Similarity to already selected)
+            if not selected_indices:
+                redundancy_score = 0.0
+            else:
+                # Calculate sim between this doc and all selected docs
+                candidate_emb = doc_embeddings[idx].reshape(1, -1)
+                selected_embs = doc_embeddings[selected_indices]
+                # Max similarity represents the "worst case" redundancy
+                sims = cosine_similarity(candidate_emb, selected_embs)
+                redundancy_score = np.max(sims)
+
+            # MMR Equation
+            # Score = λ * Relevance - (1 - λ) * Redundancy
+            mmr_score = (lambda_mult * rel_score) - (
+                (1 - lambda_mult) * redundancy_score
+            )
+
+            if mmr_score > best_mmr_score:
+                best_mmr_score = mmr_score
+                best_idx = idx
+
+        # Select the winner
+        if best_idx != -1:
+            selected_indices.append(best_idx)
+            candidate_indices.remove(best_idx)
+
+    return [docs[i] for i in selected_indices]
+
+
 def rerank_documents(
     query: str,
     documents: List[Dict[str, Any]],
     top_k: int,
     text_field: str = "text",
+    use_mmr: bool = True,
 ) -> List[Dict[str, Any]]:
     """
-    Rerank documents using cross-encoder for better semantic matching.
-
-    Args:
-        query: The query text
-        documents: List of document dicts with text_field
-        top_k: Number of top documents to return
-        text_field: Key containing the document text
-
-    Returns:
-        Top-k documents sorted by cross-encoder relevance score
+    Reranks documents using CrossEncoder + MMR for diversity.
     """
     if not documents:
         return []
 
-    if len(documents) <= top_k:
-        return documents
-
     cross_encoder = get_cross_encoder()
     if cross_encoder is None:
-        # Fallback: return first top_k without reranking
-        logger.debug("[Reranker] Cross-encoder unavailable, returning original order")
         return documents[:top_k]
 
     try:
-        # Create query-document pairs
+        # --- FORENSIC LOGGING START ---
+        if documents:
+            logger.debug(
+                f"[Reranker Debug] Query: '{query[:50]}...' (Len: {len(query)})"
+            )
+            # Check for empty text field mapping
+            if not documents[0].get(text_field):
+                logger.warning(
+                    f"[Reranker WARNING] Text field '{text_field}' is empty/missing in docs!"
+                )
+
+        # 1. Score pairs
         pairs = [(query, doc.get(text_field, "")) for doc in documents]
 
-        # Score all pairs
-        scores = cross_encoder.predict(pairs)
+        # [FIX] Switch from Sigmoid to Min-Max Normalization
+        # BGE outputs raw logits (e.g., -10 to +10).
+        # Sigmoid squashes negative logits to ~0.0, killing the MMR relevance term.
+        # Min-Max forces the range to [0, 1] relative to THIS batch.
+        raw_scores = cross_encoder.predict(pairs)
 
-        # Sort by score (descending) and take top_k
-        scored_docs = list(zip(documents, scores))
-        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        if len(raw_scores) > 1:
+            min_s = np.min(raw_scores)
+            max_s = np.max(raw_scores)
 
-        reranked = [doc for doc, score in scored_docs[:top_k]]
+            # If variance is effectively zero (all docs score identical)
+            if (max_s - min_s) < 1e-9:
+                scores = np.ones_like(raw_scores) * 0.5
+            else:
+                # Stretch the distribution: Worst -> 0.0, Best -> 1.0
+                scores = (raw_scores - min_s) / (max_s - min_s)
+        else:
+            scores = np.array([1.0])
 
+        # Debug logging
+        if len(raw_scores) > 0:
+            logger.debug(
+                f"[Reranker] Raw Logit Range: {np.min(raw_scores):.4f} to {np.max(raw_scores):.4f}"
+            )
+            logger.debug(f"[Reranker] Min-Max Top Score: {np.max(scores):.4f}")
+
+        # 2. Extract Embeddings (Assumes 'embeddings' key exists in docs from Chroma)
+        embeddings = None
+        first_doc = documents[0]
+
+        target_key = None
+        if "embeddings" in first_doc and first_doc["embeddings"] is not None:
+            target_key = "embeddings"
+        elif "embedding" in first_doc and first_doc["embedding"] is not None:
+            target_key = "embedding"
+
+        if target_key:
+            # Convert to consistent numpy array
+            try:
+                embeddings = np.array([d[target_key] for d in documents])
+            except Exception:
+                logger.warning("[Reranker] Could not stack embeddings. Disabling MMR.")
+                embeddings = None
+
+        # 3. Select
+        if use_mmr and embeddings is not None:
+            final_docs = mmr_selection(
+                documents, scores, embeddings, top_k=top_k, lambda_mult=0.6
+            )
+            logger.debug("[Reranker] Used MMR for selection.")
+        else:
+            # Standard Top-K Sort
+            scored_docs = list(zip(documents, scores))
+            scored_docs.sort(key=lambda x: x[1], reverse=True)
+            final_docs = [doc for doc, score in scored_docs[:top_k]]
+
+        # --- CRITICAL FIX START ---
+        # Remove embeddings from the output objects.
+        # They served their purpose for MMR; we don't need them in the JSON logs.
+        for doc in final_docs:
+            doc.pop("embeddings", None)
+            doc.pop("embedding", None)  # Safety check for singular key
+        # --- CRITICAL FIX END ---
+
+        # Logging for debugging
+        top_score = np.max(scores) if len(scores) > 0 else 0
         logger.debug(
-            f"[Reranker] Reranked {len(documents)} → {top_k} docs. "
-            f"Top score: {scored_docs[0][1]:.3f}, Bottom retained: {scored_docs[top_k-1][1]:.3f}"
+            f"[Reranker] Top Normalized Score: {top_score:.3f} | MMR Active: {use_mmr}"
         )
 
-        return reranked
+        return final_docs
 
     except Exception as e:
-        logger.warning(f"[Reranker] Reranking failed: {e}. Returning original order.")
+        logger.warning(f"[Reranker] Failed: {e}. Returning original.")
         return documents[:top_k]
 
 
@@ -1620,12 +1945,27 @@ def retrieve_fewshots(
     collection: Collection, query_text: str, k: int = 8, filters: Optional[dict] = None
 ) -> List[dict]:
     try:
-        results = collection.query(query_texts=[query_text], n_results=k, where=filters)
+        results = collection.query(
+            query_texts=[query_text],
+            n_results=k,
+            where=filters,
+            include=["metadatas", "documents", "embeddings"],  # <--- You asked for them
+        )
         examples = []
         if results["documents"] and results["metadatas"]:
+            # Safe access to embeddings
+            embeddings_batch = results.get("embeddings", [])
+
             for i in range(len(results["documents"][0])):
                 metadata = results["metadatas"][0][i] if results["metadatas"][0] else {}
                 ex = {"text": results["documents"][0][i], **metadata}
+
+                # --- CRITICAL FIX START ---
+                # Capture the embedding so MMR can use it later
+                if embeddings_batch and len(embeddings_batch) > 0:
+                    ex["embeddings"] = embeddings_batch[0][i]
+                # --- CRITICAL FIX END ---
+
                 if "spans_json" in ex:
                     ex["spans"] = json.loads(ex.pop("spans_json"))
                 examples.append(ex)
@@ -1695,6 +2035,11 @@ def retrieve_stratified_s1(
     return stratified
 
 
+# ===========================================================================
+# ENHANCED RETRIEVAL WITH RERANKING & AMBIGUITY HANDLING
+# ===========================================================================
+
+
 def retrieve_stratified_s1_reranked(
     collection: Collection,
     query_text: str,
@@ -1702,41 +2047,97 @@ def retrieve_stratified_s1_reranked(
     overretrieve_factor: int = 3,
 ) -> List[Dict]:
     """
-    Retrieves balanced Conspiracy AND Non-Conspiracy examples with reranking.
+    Retrieves balanced Conspiracy, Non-Conspiracy, AND Ambiguous examples.
 
-    Each class is over-retrieved and reranked separately to maintain balance.
+    New Strategy:
+    - 40% Positive (Conspiracy)
+    - 40% Negative (Non)
+    - 20% Ambiguous (Can't Tell) -> Acts as "Soft Decision Boundary"
+
+    If 'cant_tell' examples are missing in the index, it falls back to 50/50.
     """
     if not collection:
         return []
 
-    half = k_total // 2
+    # Calculate quotas
+    k_ambiguous = max(1, k_total // 5)  # Ensure at least 1 ambiguous if k>=5
+    k_remaining = k_total - k_ambiguous
+    k_pos = k_remaining // 2
+    k_neg = k_remaining - k_pos
 
-    # Over-retrieve and rerank each class separately
+    # 1. Retrieve Positives (Conspiracy)
     pos = retrieve_fewshots_reranked(
         collection,
         query_text,
-        k=half,
+        k=k_pos,
         overretrieve_factor=overretrieve_factor,
         filters={"label": "conspiracy"},
     )
+
+    # 2. Retrieve Negatives (Non)
     neg = retrieve_fewshots_reranked(
         collection,
         query_text,
-        k=half,
+        k=k_neg,
         overretrieve_factor=overretrieve_factor,
         filters={"label": "non"},
     )
 
-    # Interleave for balanced context
+    # 3. Retrieve Ambiguous (Can't Tell) - [NEW]
+    # We filter by label OR by the specific metadata tag we added
+    ambiguous = retrieve_fewshots_reranked(
+        collection,
+        query_text,
+        k=k_ambiguous,
+        overretrieve_factor=overretrieve_factor,
+        filters={"label": "cant_tell"},  # Matches the 'clean_label' from EDA
+    )
+
+    if not ambiguous:
+        logger.info("[RAG] No 'cant_tell' found. Trying 'ambiguous' tag...")
+        ambiguous = retrieve_fewshots_reranked(
+            collection,
+            query_text,
+            k=k_ambiguous,
+            overretrieve_factor=overretrieve_factor,
+            filters={"label": "ambiguous"},
+        )
+
+    # Fallback to Negatives if still empty
+    if not ambiguous:
+        logger.info("[RAG] No ambiguous examples found, filling with extra negatives.")
+        extra_neg = retrieve_fewshots_reranked(
+            collection,
+            query_text,
+            k=k_ambiguous,
+            overretrieve_factor=overretrieve_factor,
+            filters={"label": "non"},
+        )
+        neg.extend(extra_neg)
+
+    # 4. Interleave for optimal context window attention
+    # Order: [Pos, Neg, Ambiguous, Pos, Neg...]
     stratified = []
+
+    # Zip the main pair
     for p, n in zip(pos, neg):
         stratified.extend([p, n])
+
+    # Append leftovers from main pair
     if len(pos) > len(neg):
         stratified.extend(pos[len(neg) :])
     elif len(neg) > len(pos):
         stratified.extend(neg[len(pos) :])
 
-    return stratified
+    # Inject Ambiguous examples at the END (Recency Bias) or MIDDLE?
+    # Middle is best to prevent "recency bias" from making the model too unsure.
+    # But usually, appending them is fine if instructions are strong.
+    # Let's insert them at index 2 (after the first pair) to establish boundary early.
+    if ambiguous:
+        insert_idx = min(len(stratified), 2)
+        stratified[insert_idx:insert_idx] = ambiguous
+
+    return stratified[:k_total]
 
 
 def retrieve_hard_negatives_reranked(
@@ -1988,22 +2389,83 @@ def format_s2_rag_to_xml(rag_context: str) -> str:
 
 
 # --- Updated Assembler S2 ---
-def assemble_s2_system_prompt(base_instruction: str, rag_context: str) -> str:
+def assemble_s2_system_prompt(
+    base_system_prompt: str,
+    rag_context: str,
+    metadata: dict,
+    use_markdown: bool = True,
+) -> str:
     """
-    Injects RAG context into variable or appends.
+    Hydrates S2 System Prompts with RAG Context & Metadata.
+    Supports toggle between XML (Legacy/Anthropic) and Markdown (OpenAI).
     """
-    # 1. Prepare content (ensure it's not empty if we are going to replace)
-    # Note: If rag_context is empty, we replace the variable with an empty string/note.
-    content = format_s2_rag_to_xml(rag_context) if rag_context else ""
+    final_prompt = base_system_prompt
 
-    if "{{rag_context}}" in base_instruction:
-        return base_instruction.replace("{{rag_context}}", content)
+    # --- 1. PREPARE RAG CONTEXT ---
+    rag_content = (
+        rag_context
+        if rag_context and len(rag_context) > 10
+        else "No relevant legal precedents found."
+    )
 
-    # Fallback
-    if content:
-        return f"{base_instruction}\n\n{content}"
+    # --- 2. PREPARE SOURCE CONTEXT ---
+    subreddit = metadata.get("subreddit") or metadata.get("source") or "Unknown"
+    if subreddit.startswith("r/"):
+        subreddit = subreddit[2:]
 
-    return base_instruction
+    is_conspiracy_hub = subreddit.lower() in ["conspiracy", "highstrangeness"]
+    prior_text = "Conspiracy Hub" if is_conspiracy_hub else "Mainstream/Neutral"
+
+    # --- 3. INJECTION (Format Specific) ---
+
+    if use_markdown:
+        # === MARKDOWN INJECTION ===
+
+        # Inject RAG
+        # We explicitly wrap the RAG content in a Markdown block
+        md_rag = f"## Legal Precedents (RAG Context)\n{rag_content}"
+
+        if "{{rag_context}}" in final_prompt:
+            final_prompt = final_prompt.replace("{{rag_context}}", md_rag)
+        else:
+            final_prompt += f"\n\n{md_rag}"
+
+        # Inject Source
+        md_source = (
+            f"## Source Context\n"
+            f"**Source:** r/{subreddit}\n"
+            f"**Contextual Prior:** {prior_text}"
+        )
+
+        if "{{source_context}}" in final_prompt:
+            final_prompt = final_prompt.replace("{{source_context}}", md_source)
+        else:
+            # Prepend for high visibility
+            final_prompt = f"{md_source}\n\n{final_prompt}"
+
+    else:
+        # === XML INJECTION (Legacy) ===
+
+        # Inject RAG
+        if "{{rag_context}}" in final_prompt:
+            final_prompt = final_prompt.replace("{{rag_context}}", rag_content)
+
+        # Inject Source
+        xml_source = (
+            f"<source_context>\n"
+            f"  SOURCE: r/{subreddit}\n"
+            f"  (Contextual Prior: {prior_text})\n"
+            f"</source_context>"
+        )
+
+        if "{{source_context}}" in final_prompt:
+            final_prompt = final_prompt.replace("{{source_context}}", xml_source)
+        elif "<system_directive>" in final_prompt:
+            final_prompt = final_prompt.replace(
+                "<system_directive>", f"<system_directive>\n{xml_source}"
+            )
+
+    return final_prompt
 
 
 # --- Helper: Factory for Jurors ---
@@ -2056,7 +2518,7 @@ def create_juror_agent_optimized(
     # 2. Assemble with Dynamic RAG
     # We use deps.rag_context which holds retrieved precedents
     # (Ensure assemble_s2_system_prompt is defined above this function)
-    full_sys = assemble_s2_system_prompt(base, deps.rag_context)
+    full_sys = assemble_s2_system_prompt(base, deps.rag_context, deps.metadata)
 
     # 3. Return Typed Agent
     return Agent(
@@ -2433,7 +2895,7 @@ async def run_s2_judge_review(
     )
 
     # <--- DEBUG LOG FOR JUDGE --->
-    # log_agent_execution("JUDGE", full_sys, user_prompt)
+    log_agent_execution("JUDGE", full_sys, user_prompt)
 
     # 6. Run Agent
     judge_agent = Agent(LLM, output_type=S2Output, system_prompt=full_sys, retries=2)
@@ -2508,7 +2970,7 @@ def create_parallel_juror_agent(
             base = build_s2_parallel_profiler_system()
 
     # Inject RAG context
-    full_sys = assemble_s2_system_prompt(base, deps.rag_context)
+    full_sys = assemble_s2_system_prompt(base, deps.rag_context, deps.metadata)
 
     return Agent(
         LLM,
@@ -2520,12 +2982,65 @@ def create_parallel_juror_agent(
     )
 
 
+def retrieve_balanced_precedents(
+    collection: Collection,
+    query_text: str,
+    k: int = 4,  # Total examples (will get k/2 Yes and k/2 No)
+    overretrieve_factor: int = 3,
+) -> List[dict]:
+    """
+    Retrieves a MIX of Conspiracy and Non-Conspiracy precedents.
+    Crucial for the S2 Judge to see the *boundary* between classes.
+    """
+    half_k = max(1, k // 2)
+
+    # 1. Retrieve "Prosecution Precedents" (Similar Conspiracies)
+    # We filter for label='conspiracy' to show the Judge what a Guilty verdict looks like
+    positives = retrieve_fewshots_reranked(
+        collection,
+        query_text,
+        k=half_k,
+        overretrieve_factor=overretrieve_factor,
+        filters={"label": "conspiracy"},
+    )
+
+    # 2. Retrieve "Defense Precedents" (Hard Negatives / Similar Nons)
+    # We filter for label='non' to show the Judge what an Acquittal looks like
+    negatives = retrieve_fewshots_reranked(
+        collection,
+        query_text,
+        k=half_k,
+        overretrieve_factor=overretrieve_factor,
+        filters={"label": "non"},
+    )
+
+    # 3. Interleave Results (Yes, No, Yes, No...)
+    balanced = []
+    for p, n in zip(positives, negatives):
+        balanced.append(p)
+        balanced.append(n)
+
+    # Handle odd numbers or uneven results
+    if len(positives) > len(negatives):
+        balanced.extend(positives[len(negatives) :])
+    elif len(negatives) > len(positives):
+        balanced.extend(negatives[len(positives) :])
+
+    # 4. Rerank the final combined list to ensure the *most relevant* of the balanced set are top
+    # (Optional: You might want to skip this if you strictly want 2 Yes / 2 No.
+    #  But reranking again helps if one side retrieved irrelevant junk.)
+    balanced = rerank_documents(query_text, balanced, top_k=k, text_field="text")
+
+    return balanced[:k]
+
+
 async def run_s2_parallel_council(
     text: str,
     s1_spans: List[dict],
     marker_summary: str,
     rag_context: str = "",
     temperature: float = 0.4,
+    metadata: Dict = {},  # <--- [FIX 1] ADD THIS ARGUMENT
     # GEPA System Overrides (Parallel versions)
     prosecutor_sys_override: Optional[str] = None,
     defense_sys_override: Optional[str] = None,
@@ -2567,32 +3082,23 @@ async def run_s2_parallel_council(
     # Initialize Usage
     total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-    # async def _run_juror(
-    #    role: S2Juror, sys_override: Optional[str]
-    # ) -> Optional[EnhancedS2Vote]:
-    #    try:
-    #        agent = create_parallel_juror_agent(role, deps, sys_override, temperature)
-    #        res = await safe_agent_run(agent, user_msg, deps)
-    #        if res:
-    #            vote = res.output
-    #            vote.juror = role
-    #            return vote
-    #    except Exception as e:
-    #        logger.warning(f"[Parallel Council] {role.value} failed: {e}")
-    #    return None
+    # [FIX 2] Helper to resolve & hydrate prompts
+    def get_hydrated_sys(role_enum, override):
+        # 1. Select Base Template
+        base = override
+        if not base:
+            if role_enum == S2Juror.BELIEVER:
+                base = S2_PROMPTS.parallel_pros_sys
+            elif role_enum == S2Juror.DEFENSE:
+                base = S2_PROMPTS.parallel_def_sys
+            elif role_enum == S2Juror.LITERALIST:
+                base = S2_PROMPTS.parallel_def_sys
+            elif role_enum == S2Juror.PROFILER:
+                base = S2_PROMPTS.parallel_prof_sys
 
-    # Run ALL jurors in parallel (no sequential influence!)
-    # tasks = [
-    #    _run_juror(S2Juror.BELIEVER, prosecutor_sys_override),
-    #    _run_juror(S2Juror.DEFENSE, defense_sys_override),
-    #    _run_juror(S2Juror.LITERALIST, literalist_sys_override),
-    #    _run_juror(S2Juror.PROFILER, profiler_sys_override),
-    # ]
-    # with _GLOBAL_BEDROCK_SEMAPHORE:
-    #    results = await asyncio.gather(*tasks)
-    # valid_votes = [v for v in results if v is not None]
+        # 2. Hydrate with RAG + Metadata
+        return assemble_s2_system_prompt(base, rag_context, metadata)
 
-    # [CHANGE 1] Define the list of juror configs to run
     juror_configs = [
         (S2Juror.BELIEVER, prosecutor_sys_override),
         (S2Juror.DEFENSE, defense_sys_override),
@@ -2604,13 +3110,14 @@ async def run_s2_parallel_council(
 
     # [CHANGE 2] Use the Global Semaphore around a SERIAL loop
     # This prevents the "Burst of 4" that kills your rate limit.
-    with _GLOBAL_BEDROCK_SEMAPHORE:
+    async with _GLOBAL_OPENAI_SEMAPHORE:
+        # with _GLOBAL_OPENAI_SEMAPHORE:
         for role, sys_override in juror_configs:
             try:
+                # [FIX 3] Hydrate the prompt BEFORE creating the agent
+                final_sys = get_hydrated_sys(role, sys_override)
                 # Run one juror
-                agent = create_parallel_juror_agent(
-                    role, deps, sys_override, temperature
-                )
+                agent = create_parallel_juror_agent(role, deps, final_sys, temperature)
                 res = await safe_agent_run(agent, user_msg, deps)
 
                 # Track Usage
@@ -2714,6 +3221,7 @@ async def run_s2_calibrated_judge(
     judge_sys_override: Optional[str] = None,
     judge_user_template_override: Optional[str] = None,
     return_usage: bool = False,
+    metadata: Dict[str, Any] = {},
 ) -> Union[CalibratedJudgeOutput, Tuple[CalibratedJudgeOutput, Dict[str, int]]]:
     """
     Calibrated Judge: Makes final decision with DISSENT AWARENESS.
@@ -2728,6 +3236,21 @@ async def run_s2_calibrated_judge(
         build_s2_calibrated_judge_system,
         build_s2_calibrated_judge_user_template,
     )
+
+    # [NEW] Extract Subreddit for Contextual Prior
+    subreddit = metadata.get("subreddit", "Unknown")
+
+    # Optional: You can hardcode your "Kill Zone" list here or load it
+    kill_zones = ["conspiracy", "HighStrangeness", "Wuhan_Flu", "LockdownSkepticism"]
+    safe_zones = ["news", "worldnews", "science", "skeptic"]
+
+    context_note = ""
+    if subreddit in kill_zones:
+        context_note = f"\n<context_alert>Source: r/{subreddit} (High Probability Conspiracy). Scrutinize 'Non' verdicts closely.</context_alert>"
+    elif subreddit in safe_zones:
+        context_note = f"\n<context_alert>Source: r/{subreddit} (High Probability Reporting). Scrutinize 'Conspiracy' verdicts closely.</context_alert>"
+    else:
+        context_note = f"\n<source_context>Subreddit: r/{subreddit}</source_context>"
 
     deps = S2Deps(raw_text=text, doc_id=doc_id, rag_context=rag_context)
 
@@ -2783,7 +3306,7 @@ async def run_s2_calibrated_judge(
     user_prompt = (
         usr_tmpl.replace("{{text}}", text)
         .replace("{{transcript}}", transcript)
-        .replace("{{council_analysis}}", council_analysis)
+        .replace("{{council_analysis}}", council_analysis + context_note)
         .replace("{{rag_context}}", rag_context)
         .replace("{{id}}", doc_id)
     )
@@ -2799,7 +3322,8 @@ async def run_s2_calibrated_judge(
     usage_dict = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
     try:
-        with _GLOBAL_BEDROCK_SEMAPHORE:
+        async with _GLOBAL_OPENAI_SEMAPHORE:
+            # with _GLOBAL_OPENAI_SEMAPHORE:
             res = await safe_agent_run(judge_agent, user_prompt, deps=deps)
 
             # Track Usage
@@ -2850,6 +3374,56 @@ async def run_s2_calibrated_judge(
         return (fallback, usage_dict) if return_usage else fallback
 
 
+def format_s1_fewshots_to_markdown(few_shots: List[Dict]) -> str:
+    """
+    Formats few-shot examples using Markdown headers and bolding.
+    Optimized for OpenAI GPT-4o/5.2 structure adherence.
+    """
+    if not few_shots:
+        return ""
+
+    examples_md = ["# Reference Examples"]
+
+    for idx, ex in enumerate(few_shots):
+        spans_to_show = ex.get("spans", [])
+
+        # Determine label for context
+        label_val = str(ex.get("label", "")).lower()
+        ex_type = (
+            "CONSPIRACY_TEXT"
+            if label_val in ["conspiracy", "yes", "true"]
+            else "NEUTRAL_TEXT"
+        )
+
+        # Format spans as compact JSON strings for readability
+        spans_formatted = []
+        for span in spans_to_show:
+            label = span.get("label", "Unknown")
+            text = span.get("text", "")
+            spans_formatted.append(f'{{"label": "{label}", "text": "{text}"}}')
+
+        spans_block = (
+            "[\n  " + ",\n  ".join(spans_formatted) + "\n]" if spans_formatted else "[]"
+        )
+
+        # Add note only if relevant
+        note_str = ""
+        if ex_type == "NEUTRAL_TEXT" and spans_to_show:
+            note_str = "\n> **Note:** This NEUTRAL text still has structural markers - extract them!"
+
+        # Markdown Block Construction
+        examples_md.append(
+            f"## Example {idx+1} ({ex_type})\n"
+            f"**Input Text:**\n"
+            f"> {ex.get('text', '').strip()[:500]}{'...' if len(ex.get('text', '')) > 500 else ''}\n\n"
+            f"**Expected Output:**\n"
+            f"```json\n{spans_block}\n```"
+            f"{note_str}"
+        )
+
+    return "\n\n".join(examples_md)
+
+
 # --- Dossier Synthesizer (CRITICAL FOR S2 INPUTS) ---
 def synthesize_dossier(
     markers: List[Dict], complexity: str = "Unknown", narrative: str = "Unknown"
@@ -2858,33 +3432,44 @@ def synthesize_dossier(
     if not markers:
         return "No markers found."
 
-    buckets = defaultdict(list)
+    buckets = defaultdict(set)
     for m in markers:
-        # Handle both dicts and S1Span objects
         txt = m.get("text") if isinstance(m, dict) else m.text
         lbl = m.get("type") if isinstance(m, dict) else m.label
-        # Normalize label string (remove 'S1Label.')
+
+        # Clean up text (remove excessive whitespace from greedy spans)
+        txt = " ".join(txt.split())
+
         if lbl is None:
             lbl = "Unknown"
         elif hasattr(lbl, "value"):
             lbl = lbl.value
-        buckets[str(lbl).capitalize()].append(f'"{txt}"')
+
+        buckets[str(lbl).capitalize()].add(f'"{txt}"')
 
     summary = []
-    # --- 1. Inject Dynamic Assessment (The New Capability) ---
-    # This gives S2 jurors the "meta-context" they lacked before
+    # --- 1. Inject Dynamic Assessment (Meta-Context) ---
     summary.append(
         f"DYNAMIC ASSESSMENT: Complexity={complexity.upper()} | Narrative={narrative.upper()}"
     )
     summary.append("-" * 40)
+
+    # --- 2. Forensic Triples (Simpler for S2 to Digest) ---
     if buckets["Evidence"]:
-        summary.append(f"EPISTEMICS: Relies on {', '.join(buckets['Evidence'])}")
+        summary.append(f"EVIDENTIAL BASIS: {', '.join(buckets['Evidence'])}")
     else:
-        summary.append("EPISTEMICS: Assertion only (No evidence).")
+        summary.append("EVIDENTIAL BASIS: None (Assertion only).")
 
     if buckets["Actor"]:
-        summary.append(f"ACCUSED: {', '.join(buckets['Actor'])}")
+        summary.append(f"ALLEGED PERPETRATORS (Actors): {', '.join(buckets['Actor'])}")
+
     if buckets["Action"]:
-        summary.append(f"METHODS: {', '.join(buckets['Action'])}")
+        summary.append(f"ALLEGED METHODS (Actions): {', '.join(buckets['Action'])}")
+
+    if buckets["Effect"]:
+        summary.append(f"ALLEGED OUTCOMES (Effects): {', '.join(buckets['Effect'])}")
+
+    if buckets["Victim"]:
+        summary.append(f"ALLEGED VICTIMS: {', '.join(buckets['Victim'])}")
 
     return "\n".join(summary)

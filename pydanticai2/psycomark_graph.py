@@ -145,6 +145,8 @@ async def s2_parallel_council_node(state: S2ParallelGraphState):
 
     logger.info(f"[{doc_id}] Convening PARALLEL Council (Anti-Echo Chamber)...")
 
+    logger.info(f"[{doc_id}] RAG Context {rag[:100]}...")  # Log snippet of RAG context
+
     result, usage = await run_s2_parallel_council(
         text=state["text"],
         s1_spans=state["s1_spans"],
@@ -172,6 +174,7 @@ async def s2_calibrated_judge_node(state: S2ParallelGraphState):
     text = state["text"]
     rag = state.get("rag_context", "")
     doc_id = state["doc_id"]
+    metadata = state.get("metadata", {})  # <--- Extract Metadata
 
     if not council or not council.votes:
         logger.error(f"[{doc_id}] Parallel Council failed (0 votes).")
@@ -193,12 +196,16 @@ async def s2_calibrated_judge_node(state: S2ParallelGraphState):
         )
         return {"calibrated_output": fallback, "final_output": legacy_output}
 
+    logger.info(f"[{doc_id}] Running Calibrated Judge...")
+    logger.info(f"[{doc_id}] RAG Context {rag[:100]}...")  # Log snippet of RAG context
+
     result, usage = await run_s2_calibrated_judge(
         text=text,
         council_result=council,
         doc_id=doc_id,
         rag_context=rag,
         return_usage=True,
+        metadata=metadata,  # <--- Pass Metadata for Contextual Priors
     )
 
     # Convert to legacy S2Output for backward compatibility

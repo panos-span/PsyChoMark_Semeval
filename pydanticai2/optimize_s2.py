@@ -53,12 +53,16 @@ litellm.completion = _robust_completion
 # Optional: Set global timeouts just in case
 os.environ["LITELLM_REQUEST_TIMEOUT"] = "120"
 # Third-party
+
 import mlflow
 import mlflow.genai
 from mlflow.genai import scorer
 from mlflow.genai.optimize import GepaPromptOptimizer
 from mlflow.entities import Feedback
 from loguru import logger
+
+# Import prompt loader
+from pydanticai2.prompt_loader import S2_PROMPTS
 
 
 # ---------- .env loader (no deps) ----------
@@ -92,7 +96,7 @@ from pydanticai2.psycomark_agents import (
     run_s2_calibrated_judge,
     # Utilities
     get_rag_collection,
-    retrieve_fewshots,
+    retrieve_hard_negatives_reranked,
     format_s2_rag_to_xml,
 )
 from pydanticai2.prompt_builder import (
@@ -133,7 +137,7 @@ PARALLEL_USER = None  # Shared user template for all parallel jurors
 CALIBRATED_JUDGE_SYS, CALIBRATED_JUDGE_USER = None, None
 
 # Mode flag
-USE_PARALLEL_MODE = False
+USE_PARALLEL_MODE = True
 
 # RAG Collection (Global)
 S2_RAG_COLLECTION = None
@@ -141,14 +145,17 @@ S2_RAG_COLLECTION = None
 
 def load_classification_data(path: str, limit: int = 20) -> List[Dict]:
     """
-    Loads and slices the Gold Standard dataset using the Trojan Horse pattern.
-    Gold labels are injected into INPUTS to bypass MLflow's target sanitization.
+    Loads dataset with [CRITICAL] Truncation to avoid ContextWindowExceededError.
     """
     dataset = []
     p = pathlib.Path(path)
     if not p.exists():
         logger.error(f"Dataset not found: {path}")
         return []
+
+    # [SAFETY] Truncation thresholds
+    MAX_TEXT_CHARS = 4000  # ~1000 tokens
+    MAX_MARKER_CHARS = 1000  # ~250 tokens
 
     with open(p, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f):
@@ -157,15 +164,18 @@ def load_classification_data(path: str, limit: int = 20) -> List[Dict]:
             try:
                 row = json.loads(line)
                 label = str(row.get("label", "non")).lower().strip()
-                text = row.get("text")
+
+                # [SAFETY] Truncate Main Text
+                text = row.get("text", "")
+                if len(text) > MAX_TEXT_CHARS:
+                    text = text[:MAX_TEXT_CHARS] + "...[TRUNCATED]"
+
                 doc_id = row.get("doc_id", f"line_{line_num}")
 
-                # [CRITICAL] Retrieve Pre-computed S1 Spans
                 s1_spans = row.get("s1_spans", [])
                 if not s1_spans and "spans" in row:
-                    s1_spans = row["spans"]  # Fallback to 'spans' key
+                    s1_spans = row["spans"]
 
-                # Generate the Marker Summary string needed by the prompts
                 if s1_spans:
                     marker_summary = "\n".join(
                         [f"- [{s['label'].upper()}]: {s['text']}" for s in s1_spans]
@@ -173,8 +183,12 @@ def load_classification_data(path: str, limit: int = 20) -> List[Dict]:
                 else:
                     marker_summary = "No specific forensic markers identified."
 
-                # --- THE TROJAN HORSE ---
-                # We inject gold data into INPUTS so it goes to the wrapper
+                # [SAFETY] Truncate Marker Summary
+                if len(marker_summary) > MAX_MARKER_CHARS:
+                    marker_summary = (
+                        marker_summary[:MAX_MARKER_CHARS] + "...[TRUNCATED]"
+                    )
+
                 payload = {
                     "gold_label": label,
                     "doc_id": doc_id,
@@ -189,10 +203,8 @@ def load_classification_data(path: str, limit: int = 20) -> List[Dict]:
                             "text": text,
                             "s1_spans": s1_spans,
                             "marker_summary": marker_summary,
-                            # --- THE TROJAN HORSE ---
                             "passthrough_gold": payload_str,
                         },
-                        # MLflow requires an output col, we give it a dummy
                         "outputs": {"dummy_target": "ignore_me"},
                     }
                 )
@@ -201,22 +213,15 @@ def load_classification_data(path: str, limit: int = 20) -> List[Dict]:
 
     dataset = dataset[:limit]
 
-    # Sanity Check
     conspiracy_count = sum(
         1
         for d in dataset
         if json.loads(d["inputs"]["passthrough_gold"])["gold_label"] == "conspiracy"
     )
-    hard_neg_count = sum(
-        1
-        for d in dataset
-        if json.loads(d["inputs"]["passthrough_gold"]).get("is_hard_negative", False)
-    )
-    logger.success(f"DATASET LOADED: {len(dataset)} items.")
+    logger.success(f"DATASET LOADED: {len(dataset)} items (Truncation Active).")
     logger.info(
         f" > Conspiracy: {conspiracy_count} | Non: {len(dataset) - conspiracy_count}"
     )
-    logger.info(f" > Hard Negatives: {hard_neg_count}")
 
     return dataset
 
@@ -433,22 +438,26 @@ def predict_wrapper(
             except Exception:
                 return None
 
-    # 2. Build RAG context dynamically
+    # [SAFETY] Dynamic RAG Context Truncation
+    # If this context is injected into 5 prompts, it multiplies 5x in the reflection history.
+    MAX_RAG_CHARS = 1500  # ~400 tokens
+
     rag_context = ""
     if S2_RAG_COLLECTION:
         try:
-            precedents = retrieve_fewshots(
-                S2_RAG_COLLECTION,
-                text,
-                k=4,
-                filters={"is_hard_negative": True},
-            )
+            precedents = retrieve_hard_negatives_reranked(
+                S2_RAG_COLLECTION, text, k=2
+            )  # Reduced k
             if precedents:
-                rag_context = json.dumps(precedents, indent=2, ensure_ascii=False)
+                rag_raw = json.dumps(precedents, indent=2, ensure_ascii=False)
+                if len(rag_raw) > MAX_RAG_CHARS:
+                    rag_raw = rag_raw[:MAX_RAG_CHARS] + "\n...[TRUNCATED]"
+                rag_context = rag_raw
         except Exception as e:
-            logger.warning(f"S2 Dynamic RAG Retrieval Failed: {e}")
+            logger.warning(f"RAG Failed: {e}")
 
-    rag_str = format_s2_rag_to_xml(rag_context)
+    md_rag = f"## Legal Precedents (RAG Context)\n{rag_context}"
+    rag_str = md_rag
 
     # 3. Load System Prompts with RAG context injection
     p_s = safe_fmt(P_SYS, rag_context=rag_str)
@@ -647,14 +656,14 @@ def main():
     parser = argparse.ArgumentParser(description="GEPA S2 Council Optimization Engine")
     parser.add_argument("--data", default="data/gold/optimization_set.jsonl")
     parser.add_argument("--limit", type=int, default=20, help="Examples to use")
-    parser.add_argument("--budget", type=int, default=60, help="Max metric calls")
+    parser.add_argument("--budget", type=int, default=40, help="Max metric calls")
     parser.add_argument(
-        "--rag-dir", default="data/rag_online_v3", help="Path to ChromaDB RAG"
+        "--rag-dir", default="data/rag_openai", help="Path to ChromaDB RAG"
     )
     parser.add_argument("--experiment", default="GEPA_S2_Optimization")
     parser.add_argument(
         "--model-reflector",
-        default="bedrock:/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        default="openai:/gpt-5.2",
     )
     parser.add_argument(
         "--phase",
@@ -699,7 +708,7 @@ def main():
     args = parser.parse_args()
 
     # Logger Setup: DEBUG to file, INFO to console
-    log_file = "optimization_s2.log"
+    log_file = f"optimization_s2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     if os.path.exists(log_file):
         os.remove(log_file)
     logger.remove()
@@ -743,50 +752,32 @@ def main():
         mlflow.log_params(vars(args))
         logger.info("Registering S2 Prompts & Logging Baselines...")
 
-        # 1. Generate Prompt Strings
-        pros_sys_str = build_s2_prosecutor_system()
-        def_sys_str = build_s2_defense_system()
-        lit_sys_str = build_s2_literalist_system()
-        prof_sys_str = build_s2_profiler_system()
-        judge_sys_str = build_s2_judge_system()
+        # 1. Load prompts using S2_PROMPTS singleton
+        s2_prompts = S2_PROMPTS
 
         # 2. Log baselines for comparison
-        mlflow.log_text(pros_sys_str, "baseline_prompts/s2_prosecutor.txt")
-        mlflow.log_text(def_sys_str, "baseline_prompts/s2_defense.txt")
-        mlflow.log_text(lit_sys_str, "baseline_prompts/s2_literalist.txt")
-        mlflow.log_text(prof_sys_str, "baseline_prompts/s2_profiler.txt")
-        mlflow.log_text(judge_sys_str, "baseline_prompts/s2_judge.txt")
-
-        # 3. Log prompts to file for verification
-        logger.debug(
-            f"=== PROSECUTOR (Warm Start) ===\n{pros_sys_str[:500]}\n==============================="
-        )
-        logger.debug(
-            f"=== DEFENSE (Warm Start) ===\n{def_sys_str[:500]}\n==============================="
-        )
+        mlflow.log_text(s2_prompts.pros_sys, "baseline_prompts/s2_prosecutor.txt")
+        mlflow.log_text(s2_prompts.def_sys, "baseline_prompts/s2_defense.txt")
+        mlflow.log_text(s2_prompts.lit_sys, "baseline_prompts/s2_literalist.txt")
+        mlflow.log_text(s2_prompts.prof_sys, "baseline_prompts/s2_profiler.txt")
+        mlflow.log_text(s2_prompts.judge_sys, "baseline_prompts/s2_judge.txt")
 
         # 4. Register Prompts
-        P_SYS = mlflow.genai.register_prompt("s2_pros_sys", pros_sys_str).uri
-        D_SYS = mlflow.genai.register_prompt("s2_def_sys", def_sys_str).uri
-        L_SYS = mlflow.genai.register_prompt("s2_lit_sys", lit_sys_str).uri
-        PR_SYS = mlflow.genai.register_prompt("s2_prof_sys", prof_sys_str).uri
+        P_SYS = mlflow.genai.register_prompt("s2_pros_sys", s2_prompts.pros_sys).uri
+        D_SYS = mlflow.genai.register_prompt("s2_def_sys", s2_prompts.def_sys).uri
+        L_SYS = mlflow.genai.register_prompt("s2_lit_sys", s2_prompts.lit_sys).uri
+        PR_SYS = mlflow.genai.register_prompt("s2_prof_sys", s2_prompts.prof_sys).uri
 
-        P_USER = mlflow.genai.register_prompt(
-            "s2_pros_user", build_s2_prosecutor_user_template()
-        ).uri
-        D_USER = mlflow.genai.register_prompt(
-            "s2_def_user", build_s2_defense_user_template()
-        ).uri
-        L_USER = mlflow.genai.register_prompt(
-            "s2_lit_user", build_s2_literalist_user_template()
-        ).uri
-        PR_USER = mlflow.genai.register_prompt(
-            "s2_prof_user", build_s2_profiler_user_template()
-        ).uri
+        P_USER = mlflow.genai.register_prompt("s2_pros_user", s2_prompts.pros_user).uri
+        D_USER = mlflow.genai.register_prompt("s2_def_user", s2_prompts.def_user).uri
+        L_USER = mlflow.genai.register_prompt("s2_lit_user", s2_prompts.lit_user).uri
+        PR_USER = mlflow.genai.register_prompt("s2_prof_user", s2_prompts.prof_user).uri
 
-        JUDGE_SYS = mlflow.genai.register_prompt("s2_judge_sys", judge_sys_str).uri
+        JUDGE_SYS = mlflow.genai.register_prompt(
+            "s2_judge_sys", s2_prompts.judge_sys
+        ).uri
         JUDGE_USER = mlflow.genai.register_prompt(
-            "s2_judge_user", build_s2_judge_user_template()
+            "s2_judge_user", s2_prompts.judge_user
         ).uri
 
         logger.success("Legacy Baseline Prompts Registered.")
@@ -794,55 +785,49 @@ def main():
         # 4b. Register Parallel (Anti-Echo Chamber) Prompts
         logger.info("Registering Parallel Anti-Echo Chamber Prompts...")
 
-        parallel_pros_sys_str = build_s2_parallel_prosecutor_system()
-        parallel_def_sys_str = build_s2_parallel_defense_system()
-        parallel_lit_sys_str = build_s2_parallel_literalist_system()
-        parallel_prof_sys_str = build_s2_parallel_profiler_system()
-        parallel_user_str = build_s2_parallel_user_template()
-        calibrated_judge_sys_str = build_s2_calibrated_judge_system()
-        calibrated_judge_user_str = build_s2_calibrated_judge_user_template()
-
-        # Log baselines for parallel prompts
         mlflow.log_text(
-            parallel_pros_sys_str, "baseline_prompts/s2_parallel_prosecutor.txt"
+            s2_prompts.parallel_pros_sys, "baseline_prompts/s2_parallel_prosecutor.txt"
         )
         mlflow.log_text(
-            parallel_def_sys_str, "baseline_prompts/s2_parallel_defense.txt"
+            s2_prompts.parallel_def_sys, "baseline_prompts/s2_parallel_defense.txt"
         )
         mlflow.log_text(
-            parallel_lit_sys_str, "baseline_prompts/s2_parallel_literalist.txt"
+            s2_prompts.parallel_lit_sys, "baseline_prompts/s2_parallel_literalist.txt"
         )
         mlflow.log_text(
-            parallel_prof_sys_str, "baseline_prompts/s2_parallel_profiler.txt"
-        )
-        mlflow.log_text(parallel_user_str, "baseline_prompts/s2_parallel_user.txt")
-        mlflow.log_text(
-            calibrated_judge_sys_str, "baseline_prompts/s2_calibrated_judge.txt"
+            s2_prompts.parallel_prof_sys, "baseline_prompts/s2_parallel_profiler.txt"
         )
         mlflow.log_text(
-            calibrated_judge_user_str, "baseline_prompts/s2_calibrated_judge_user.txt"
+            s2_prompts.parallel_user, "baseline_prompts/s2_parallel_user.txt"
+        )
+        mlflow.log_text(
+            s2_prompts.calibrated_judge_sys, "baseline_prompts/s2_calibrated_judge.txt"
+        )
+        mlflow.log_text(
+            s2_prompts.calibrated_judge_user,
+            "baseline_prompts/s2_calibrated_judge_user.txt",
         )
 
         PARALLEL_P_SYS = mlflow.genai.register_prompt(
-            "s2_parallel_pros_sys", parallel_pros_sys_str
+            "s2_parallel_pros_sys", s2_prompts.parallel_pros_sys
         ).uri
         PARALLEL_D_SYS = mlflow.genai.register_prompt(
-            "s2_parallel_def_sys", parallel_def_sys_str
+            "s2_parallel_def_sys", s2_prompts.parallel_def_sys
         ).uri
         PARALLEL_L_SYS = mlflow.genai.register_prompt(
-            "s2_parallel_lit_sys", parallel_lit_sys_str
+            "s2_parallel_lit_sys", s2_prompts.parallel_lit_sys
         ).uri
         PARALLEL_PR_SYS = mlflow.genai.register_prompt(
-            "s2_parallel_prof_sys", parallel_prof_sys_str
+            "s2_parallel_prof_sys", s2_prompts.parallel_prof_sys
         ).uri
         PARALLEL_USER = mlflow.genai.register_prompt(
-            "s2_parallel_user", parallel_user_str
+            "s2_parallel_user", s2_prompts.parallel_user
         ).uri
         CALIBRATED_JUDGE_SYS = mlflow.genai.register_prompt(
-            "s2_calibrated_judge_sys", calibrated_judge_sys_str
+            "s2_calibrated_judge_sys", s2_prompts.calibrated_judge_sys
         ).uri
         CALIBRATED_JUDGE_USER = mlflow.genai.register_prompt(
-            "s2_calibrated_judge_user", calibrated_judge_user_str
+            "s2_calibrated_judge_user", s2_prompts.calibrated_judge_user
         ).uri
 
         logger.success("Parallel Anti-Echo Chamber Prompts Registered.")
@@ -1013,7 +998,7 @@ def main():
             mlflow.log_artifact(log_file)
 
     # 6. Save Results
-    output_dir = pathlib.Path("prompts/optimized_s2")
+    output_dir = pathlib.Path("prompts/openai")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     optimized_list = []

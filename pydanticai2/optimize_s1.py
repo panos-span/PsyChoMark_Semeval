@@ -23,6 +23,7 @@ from datetime import datetime  # <--- NEW
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 # Third-party
+
 import mlflow
 import mlflow.genai
 from mlflow.genai import scorer
@@ -30,6 +31,9 @@ from mlflow.genai.optimize import GepaPromptOptimizer
 from mlflow.entities import Feedback
 from difflib import SequenceMatcher
 from loguru import logger
+
+# Import prompt loader
+from pydanticai2.prompt_loader import S1_PROMPTS
 
 
 # ---------- .env loader (no deps) ----------
@@ -56,9 +60,9 @@ from pydanticai2.psycomark_agents import (
     run_s1_discriminative,
     run_s1_ddcot,  # NEW: DD-CoT pipeline
     get_rag_collection,
-    retrieve_stratified_s1,
+    retrieve_stratified_s1_reranked,
     find_best_span,  # For span localization
-    format_s1_fewshots_to_xml,  # For few-shot formatting
+    format_s1_fewshots_to_markdown,  # For few-shot formatting
 )
 from pydanticai2.prompt_builder import (
     # Legacy prompts
@@ -511,7 +515,7 @@ DDCOT_CRITIC_SYS_URI, DDCOT_CRITIC_USER_URI = None, None
 DDCOT_REFINER_SYS_URI, DDCOT_REFINER_USER_URI = None, None
 
 S1_RAG_COLLECTION = None
-USE_DDCOT_MODE = False  # Flag to switch between legacy and DD-CoT
+USE_DDCOT_MODE = True  # Flag to switch between legacy and DD-CoT
 
 
 def predict_wrapper(text: str, passthrough_gold: str = "{}"):
@@ -525,8 +529,8 @@ def predict_wrapper(text: str, passthrough_gold: str = "{}"):
     # 1. Retrieve & Format RAG
     few_shots = []
     if S1_RAG_COLLECTION:
-        few_shots = retrieve_stratified_s1(S1_RAG_COLLECTION, text, k_total=6)
-    few_shots_str = format_s1_fewshots_to_xml(few_shots)
+        few_shots = retrieve_stratified_s1_reranked(S1_RAG_COLLECTION, text, k_total=2)
+    few_shots_str = format_s1_fewshots_to_markdown(few_shots)
 
     # 2. Helper to safely inject variables into prompts
     def load_with_context(uri):
@@ -706,19 +710,21 @@ def predict_wrapper(text: str, passthrough_gold: str = "{}"):
 def main():
     parser = argparse.ArgumentParser(description="GEPA Prompt Optimization Runner")
     parser.add_argument(
-        "--data", default="data/gold/optimization_set.jsonl", help="Path to eval data"
+        "--data", default="data/raw/dev_ready_flat.jsonl", help="Path to eval data"
     )
     parser.add_argument(
-        "--rag-dir", default="data/rag_online_v3", help="Path to ChromaDB RAG"
+        "--rag-dir", default="data/rag_openai", help="Path to ChromaDB RAG"
     )
     parser.add_argument("--limit", type=int, default=20, help="Examples to use")
-    parser.add_argument("--budget", type=int, default=100, help="Max metric calls")
+    parser.add_argument("--budget", type=int, default=40, help="Max metric calls")
     parser.add_argument(
-        "--experiment", default="GEPA_S1_Optimization_V2", help="MLflow Experiment Name"
+        "--experiment",
+        default="GEPA_S1_Optimization_V2_OPENAI",
+        help="MLflow Experiment Name",
     )
     parser.add_argument(
         "--model-reflector",
-        default="bedrock:/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        default="openai:/gpt-5.2",
     )
     parser.add_argument(
         "--phase",
@@ -764,7 +770,7 @@ def main():
     args = parser.parse_args()
 
     # Logger Setup
-    log_file = "optimization_s1.log"
+    log_file = f"optimization_s1_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     if os.path.exists(log_file):
         os.remove(log_file)
     logger.remove()
@@ -808,62 +814,63 @@ def main():
     with mlflow.start_run():
         mlflow.log_params(vars(args))
 
-        # Snapshot Baselines
-        gen_template = build_s1_discriminative_system()
-        critic_template = build_s1_critic_system()
-        refiner_template = build_s1_refiner_system()
-        mlflow.log_text(gen_template, "baseline_prompts/s1_generator.txt")
-        mlflow.log_text(critic_template, "baseline_prompts/s1_critic.txt")
-        mlflow.log_text(refiner_template, "baseline_prompts/s1_refiner.txt")
+        # Snapshot Baselines using S1Prompts
+        s1_prompts = S1_PROMPTS
+        mlflow.log_text(s1_prompts.gen_system, "baseline_prompts/s1_generator.txt")
+        mlflow.log_text(s1_prompts.critic_system, "baseline_prompts/s1_critic.txt")
+        mlflow.log_text(s1_prompts.refiner_system, "baseline_prompts/s1_refiner.txt")
 
         # Register Prompts
         logger.info("Registering Prompts...")
-        GEN_SYS_URI = mlflow.genai.register_prompt("s1_gen_sys", gen_template).uri
+        GEN_SYS_URI = mlflow.genai.register_prompt(
+            "s1_gen_sys", s1_prompts.gen_system
+        ).uri
         GEN_USER_URI = mlflow.genai.register_prompt(
-            "s1_gen_user", build_s1_user_template()
+            "s1_gen_user", s1_prompts.gen_user_template
         ).uri
         CRITIC_SYS_URI = mlflow.genai.register_prompt(
-            "s1_critic_sys", critic_template
+            "s1_critic_sys", s1_prompts.critic_system
         ).uri
         CRITIC_USER_URI = mlflow.genai.register_prompt(
-            "s1_critic_user", build_s1_critic_user_template()
+            "s1_critic_user", s1_prompts.critic_user_template
         ).uri
         REFINER_SYS_URI = mlflow.genai.register_prompt(
-            "s1_refiner_sys", refiner_template
+            "s1_refiner_sys", s1_prompts.refiner_system
         ).uri
         REFINER_USER_URI = mlflow.genai.register_prompt(
-            "s1_refiner_user", build_s1_refiner_user_template()
+            "s1_refiner_user", s1_prompts.refiner_user_template
         ).uri
         logger.success("Legacy Baseline Prompts Registered.")
 
         # ===== DD-CoT Prompts Registration =====
         logger.info("Registering DD-CoT Prompts...")
-        ddcot_gen_template = build_s1_ddcot_system()
-        ddcot_critic_template = build_s1_ddcot_critic_system()
-        ddcot_refiner_template = build_s1_ddcot_refiner_system()
-
-        # Snapshot DD-CoT baselines
-        mlflow.log_text(ddcot_gen_template, "baseline_prompts/s1_ddcot_generator.txt")
-        mlflow.log_text(ddcot_critic_template, "baseline_prompts/s1_ddcot_critic.txt")
-        mlflow.log_text(ddcot_refiner_template, "baseline_prompts/s1_ddcot_refiner.txt")
+        mlflow.log_text(
+            s1_prompts.ddcot_gen_system, "baseline_prompts/s1_ddcot_generator.txt"
+        )
+        mlflow.log_text(
+            s1_prompts.ddcot_critic_system, "baseline_prompts/s1_ddcot_critic.txt"
+        )
+        mlflow.log_text(
+            s1_prompts.ddcot_refiner_system, "baseline_prompts/s1_ddcot_refiner.txt"
+        )
 
         DDCOT_GEN_SYS_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_gen_sys", ddcot_gen_template
+            "s1_ddcot_gen_sys", s1_prompts.ddcot_gen_system
         ).uri
         DDCOT_GEN_USER_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_gen_user", build_s1_ddcot_user_template()
+            "s1_ddcot_gen_user", s1_prompts.ddcot_gen_user_template
         ).uri
         DDCOT_CRITIC_SYS_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_critic_sys", ddcot_critic_template
+            "s1_ddcot_critic_sys", s1_prompts.ddcot_critic_system
         ).uri
         DDCOT_CRITIC_USER_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_critic_user", build_s1_ddcot_critic_user_template()
+            "s1_ddcot_critic_user", s1_prompts.ddcot_critic_user_template
         ).uri
         DDCOT_REFINER_SYS_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_refiner_sys", ddcot_refiner_template
+            "s1_ddcot_refiner_sys", s1_prompts.ddcot_refiner_system
         ).uri
         DDCOT_REFINER_USER_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_refiner_user", build_s1_ddcot_refiner_user_template()
+            "s1_ddcot_refiner_user", s1_prompts.ddcot_refiner_user_template
         ).uri
         logger.success("DD-CoT Prompts Registered.")
 
@@ -979,7 +986,7 @@ def main():
             mlflow.log_artifact(log_file)
 
     # Save Results
-    output_dir = pathlib.Path("prompts/optimized_s1")
+    output_dir = pathlib.Path("prompts/openai")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     optimized_list = []

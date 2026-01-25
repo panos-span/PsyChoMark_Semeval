@@ -17,13 +17,12 @@ from collections import Counter, defaultdict
 from typing import TypedDict, List, Dict, Optional
 from loguru import logger
 from langgraph.graph import StateGraph, END, START
-from typing import Annotated  # Import Annotated
+from typing import Annotated, Any  # Import Annotated
 import operator
 
 
 # Import agents and utilities
 from psycomark_agents import (
-    run_s1_discriminative,
     run_s1_ddcot,
     S1Span,
     DDCoTSpan,
@@ -37,6 +36,7 @@ from psycomark_agents import (
     get_s1_ddcot_refiner,
     S1Deps,
     safe_agent_run,
+    find_span_with_context,
 )
 
 
@@ -74,6 +74,7 @@ class S1DDCoTGraphState(TypedDict):
     doc_id: str
     text: str  # The raw document
     few_shots: List[dict]  # Dynamic few-shot examples from RAG
+    metadata: Dict[str, Any]  # <--- Add this
 
     # DD-CoT Generator output
     text_complexity: str  # "simple" | "moderate" | "complex"
@@ -201,10 +202,20 @@ def s1_structure_verifier_node(state: S1GraphState) -> Dict:
         key = (label, snippet.strip())
         nth = assigned_count[key]
 
-        start, end = find_best_span(raw_text, snippet, nth=nth)
+        # Try Context-Aware Search FIRST (High Precision)
+        left = getattr(span, "preceding_context", "") or ""
+        right = getattr(span, "following_context", "") or ""
 
+        start, end = -1, -1
+
+        if left or right:
+            start, end = find_span_with_context(
+                raw_text, snippet, left_ctx=left, right_ctx=right
+            )
+
+        # Fallback to standard search if context fails or wasn't provided
         if start == -1:
-            start, end = find_best_span(raw_text, snippet, nth=0)
+            start, end = find_best_span(raw_text, snippet, nth=nth)
 
         if start != -1:
             located_spans.append(
@@ -243,6 +254,7 @@ async def s1_ddcot_generator_node(state: S1DDCoTGraphState) -> Dict:
     text = state["text"]
     few_shots = state.get("few_shots", [])
     doc_id = state.get("doc_id", "unknown")
+    metadata = state.get("metadata", {})  # <--- Extract Metadata
 
     logger.info(f"[{doc_id}] Starting DD-CoT Generator...")
 
@@ -253,6 +265,7 @@ async def s1_ddcot_generator_node(state: S1DDCoTGraphState) -> Dict:
             few_shots=few_shots,
             skip_critic=True,  # Only run generator
             return_full_extraction=True,
+            metadata=metadata,  # <--- Pass Metadata for Contextual Priors
             return_usage=True,  # <--- Request usage stats
         )
 
@@ -330,9 +343,9 @@ async def s1_ddcot_critic_node(state: S1DDCoTGraphState) -> Dict:
         # [FIX] Capture Usage
         usage = critique_res.usage()
         usage_dict = {
-            "input_tokens": usage.request_tokens or 0,
-            "output_tokens": usage.response_tokens or 0,
-            "total_tokens": usage.total_tokens or 0,
+            "input_tokens": getattr(usage, "request_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "response_tokens", 0) or 0,
+            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
         }
 
         n_errors = (
@@ -344,6 +357,7 @@ async def s1_ddcot_critic_node(state: S1DDCoTGraphState) -> Dict:
         logger.info(
             f"[{doc_id}] Critic: {n_errors} issues, requires_refinement={critique.requires_refinement}"
         )
+        logger.info(f"[{doc_id}] Critique Details: {critique.model_dump()}")
 
         return {
             "critique": critique,
@@ -426,10 +440,7 @@ def s1_ddcot_verifier_node(state: S1DDCoTGraphState) -> Dict:
     """
     Structure Verifier for DD-CoT: Maps spans to (start, end) indices.
 
-    Enhanced with:
-    - Overlap deduplication (removes subset spans)
-    - Boundary verification (ensures word-aligned spans)
-    - 5-strategy span location (exact -> case-insensitive -> normalized -> fuzzy -> alignment)
+    Now includes forensic logging for Context Alignment.
     """
     raw_text = state["text"]
     doc_id = state.get("doc_id", "unknown")
@@ -440,18 +451,60 @@ def s1_ddcot_verifier_node(state: S1DDCoTGraphState) -> Dict:
     located_spans = []
     assigned_count = defaultdict(int)
 
+    # [LOGGING] Statistics counters
+    stats = {"context_hits": 0, "fallback_hits": 0, "misses": 0}
+
     for span in candidates:
         snippet = span.text
         label = span.label
         why = getattr(span, "why_this_label", None)
 
+        # Extract Context
+        left_ctx = getattr(span, "preceding_context", "") or ""
+        right_ctx = getattr(span, "following_context", "") or ""
+
         key = (label, snippet.strip())
         nth = assigned_count[key]
 
-        start, end = find_best_span(raw_text, snippet, nth=nth)
-        if start == -1:
-            start, end = find_best_span(raw_text, snippet, nth=0)
+        start, end = -1, -1
+        method = "none"
 
+        # -------------------------------------------------------------
+        # 1. Try Context-Aware Search FIRST (High Precision)
+        # -------------------------------------------------------------
+        if left_ctx or right_ctx:
+            # We pass nth=0 because context usually makes it unique
+            start, end = find_span_with_context(
+                raw_text, snippet, left_ctx, right_ctx, nth=0
+            )
+
+            if start != -1:
+                stats["context_hits"] += 1
+                method = "context"
+                logger.debug(f"[{doc_id}] ✅ Context HIT: '{snippet}'")
+            else:
+                # Log WHY it failed (vital for debugging LLM hallucinations)
+                logger.debug(
+                    f"[{doc_id}] ⚠️ Context MISS: '{snippet}'\n"
+                    f"   Expected Left:  '{left_ctx}'\n"
+                    f"   Expected Right: '{right_ctx}'"
+                )
+
+        # -------------------------------------------------------------
+        # 2. Fallback to standard heuristic search
+        # -------------------------------------------------------------
+        if start == -1:
+            start, end = find_best_span(raw_text, snippet, nth=nth)
+
+            if start != -1:
+                stats["fallback_hits"] += 1
+                method = "fallback"
+                if left_ctx or right_ctx:
+                    logger.debug(f"[{doc_id}] 🔄 Recovered via Fallback: '{snippet}'")
+
+        # -------------------------------------------------------------
+        # 3. Save or Drop
+        # -------------------------------------------------------------
         if start != -1:
             located_spans.append(
                 {
@@ -460,26 +513,29 @@ def s1_ddcot_verifier_node(state: S1DDCoTGraphState) -> Dict:
                     "start": start,
                     "end": end,
                     "why": why,
+                    "method": method,  # Useful for downstream analysis
                 }
             )
             assigned_count[key] += 1
         else:
-            logger.warning(f"[{doc_id}] Dropped phantom span: '{snippet}'")
+            stats["misses"] += 1
+            logger.warning(
+                f"[{doc_id}] ❌ Dropped phantom span: '{snippet}' (Nth: {nth})"
+            )
 
-    # Apply post-processing improvements
-    # 1. Verify and fix boundaries
+    # Apply post-processing
     verified = verify_span_boundaries(located_spans, raw_text)
-
-    # 2. Remove overlapping/subset spans with same label
     deduped = deduplicate_overlapping_spans(verified, same_label_only=True)
-
-    # 3. Sort by document position
     final_output = sorted(deduped, key=lambda x: x["start"])
 
+    # [LOGGING] Summary
     logger.info(
-        f"[{doc_id}] Verifier: {len(candidates)} candidates -> "
-        f"{len(located_spans)} located -> {len(final_output)} final (after dedup)"
+        f"[{doc_id}] Verifier Summary: {len(candidates)} candidates -> {len(final_output)} final.\n"
+        f"   - Context Hits: {stats['context_hits']} (High Precision)\n"
+        f"   - Fallback Hits: {stats['fallback_hits']} (Heuristic)\n"
+        f"   - Phantom Misses: {stats['misses']}"
     )
+
     return {"final_spans": final_output}
 
 
