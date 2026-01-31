@@ -114,7 +114,7 @@ import pydanticai2.psycomark_agents as agents_mod
 import pydanticai2.prompt_builder as prompt_builder
 from pydanticai2.prompt_loader import S1_PROMPTS, S2_PROMPTS
 from pydanticai2.s1_graph import s1_graph
-from pydanticai2.psycomark_graph import s2_graph, s2_parallel_graph
+from pydanticai2.psycomark_graph import s2_parallel_graph
 
 # --- LIVE LOGGING CONFIGURATION ---
 logger.remove()
@@ -458,7 +458,7 @@ async def process_document(
                 "final_output": None,
             }
 
-            graph_to_use = s2_parallel_graph if args.s2_mode == "parallel" else s2_graph
+            graph_to_use = s2_parallel_graph
             final_state = await asyncio.wait_for(
                 graph_to_use.ainvoke(s2_initial_state), timeout=200
             )
@@ -519,7 +519,7 @@ async def main_async():
     parser.add_argument(
         "--concurrency", type=int, default=1, help="Max parallel documents"
     )
-    parser.add_argument("--experiment-name", default="PsyCoMark_SOTA")
+    parser.add_argument("--experiment-name", default="PsyCoMark_SOTA_Enhanced")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--resume",
@@ -615,10 +615,10 @@ async def main_async():
         try:
             logger.info(f"Loading RAG collections from {args.rag_dir}...")
             rag_collections["s1"] = agents_mod.get_rag_collection(
-                args.rag_dir, "s1_markers"
+                args.rag_dir, "s1_patterns"
             )
             rag_collections["s2"] = agents_mod.get_rag_collection(
-                args.rag_dir, "s2_examples"
+                args.rag_dir, "s2_precedents"
             )
             logger.info("RAG Collections Loaded.")
         except Exception as e:

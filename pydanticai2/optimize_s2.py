@@ -163,7 +163,20 @@ def load_classification_data(path: str, limit: int = 20) -> List[Dict]:
                 continue
             try:
                 row = json.loads(line)
-                label = str(row.get("label", "non")).lower().strip()
+                raw_label = row.get("label")
+                if not raw_label:
+                    raw_label = row.get("metadata", {}).get("label", "non")
+
+                # Normalize Label
+                label_str = str(raw_label).lower().strip()
+                if label_str in ["yes", "true", "1", "conspiracy"]:
+                    label = "conspiracy"
+                elif label_str in ["no", "false", "0", "non"]:
+                    label = "non"
+                else:
+                    # Skip 'cant_tell' or 'ambiguous' for binary optimization
+                    # unless you want to specifically train the 'ambiguous' flag
+                    continue
 
                 # [SAFETY] Truncate Main Text
                 text = row.get("text", "")
@@ -409,45 +422,27 @@ def predict_wrapper(
     s1_spans: List[dict],
     marker_summary: str,
     passthrough_gold: str = "{}",
+    # --- NEW: GEPA INJECTION POINTS ---
+    # These optional args catch the mutated strings from the optimizer
+    prosecutor_sys_opt: str = None,
+    defense_sys_opt: str = None,
+    literalist_sys_opt: str = None,
+    profiler_sys_opt: str = None,
+    judge_sys_opt: str = None,
+    judge_user_opt: str = None,
 ):
     """
-    Prediction wrapper with Trojan Horse pattern.
-
-    Args:
-        text: The input text for classification.
-        s1_spans: Pre-computed S1 spans.
-        marker_summary: Formatted string of S1 markers.
-        passthrough_gold: The hidden JSON payload containing gold labels.
+    Prediction wrapper that accepts GEPA-mutated prompts.
+    Prioritizes passed arguments (Optimized) over Global URIs (Static).
     """
     global _LOGGED_ONCE
 
-    # 1. Helper to safely inject variables into prompts
-    def safe_fmt(uri, **kwargs):
-        if not uri:
-            return None
-        try:
-            prompt_obj = mlflow.genai.load_prompt(uri)
-            template = prompt_obj.template
-            # Replace placeholders
-            for key, value in kwargs.items():
-                template = template.replace("{{" + key + "}}", str(value))
-            return template
-        except Exception:
-            try:
-                return mlflow.genai.load_prompt(uri).format()
-            except Exception:
-                return None
-
-    # [SAFETY] Dynamic RAG Context Truncation
-    # If this context is injected into 5 prompts, it multiplies 5x in the reflection history.
-    MAX_RAG_CHARS = 1500  # ~400 tokens
-
+    # 1. RAG Context Logic
+    MAX_RAG_CHARS = 1500
     rag_context = ""
     if S2_RAG_COLLECTION:
         try:
-            precedents = retrieve_hard_negatives_reranked(
-                S2_RAG_COLLECTION, text, k=2
-            )  # Reduced k
+            precedents = retrieve_hard_negatives_reranked(S2_RAG_COLLECTION, text, k=2)
             if precedents:
                 rag_raw = json.dumps(precedents, indent=2, ensure_ascii=False)
                 if len(rag_raw) > MAX_RAG_CHARS:
@@ -459,126 +454,114 @@ def predict_wrapper(
     md_rag = f"## Legal Precedents (RAG Context)\n{rag_context}"
     rag_str = md_rag
 
-    # 3. Load System Prompts with RAG context injection
-    p_s = safe_fmt(P_SYS, rag_context=rag_str)
-    d_s = safe_fmt(D_SYS, rag_context=rag_str)
-    l_s = safe_fmt(L_SYS, rag_context=rag_str)
-    pr_s = safe_fmt(PR_SYS, rag_context=rag_str)
-    j_s = safe_fmt(JUDGE_SYS, rag_context=rag_str)
+    # 2. Helper to Resolve Prompts (Opt String > Static URI)
+    def resolve_prompt(opt_string, static_uri):
+        if opt_string:
+            # GEPA passed a mutated string. Inject RAG manually.
+            return opt_string.replace("{{rag_context}}", rag_str)
+        elif static_uri:
+            # Fallback to static prompt from MLflow
+            try:
+                tmpl = mlflow.genai.load_prompt(static_uri).template
+                return tmpl.replace("{{rag_context}}", rag_str)
+            except:
+                return None
+        return None
 
-    # 4. Load User Templates with RAG context
-    p_u = safe_fmt(P_USER, rag_context=rag_str)
-    d_u = safe_fmt(D_USER, rag_context=rag_str)
-    l_u = safe_fmt(L_USER, rag_context=rag_str)
-    pr_u = safe_fmt(PR_USER, rag_context=rag_str)
-    j_u = safe_fmt(JUDGE_USER, rag_context=rag_str)
+    # 3. Resolve all prompts
+    # Note: We map the generic 'prosecutor_sys_opt' to either Legacy or Parallel globals based on mode
 
-    # [DEBUG] Log the actual prompts being used (Once per run)
-    if not _LOGGED_ONCE:
-        logger.info("--- [SNAPSHOT] Active System Prompts (First 200 chars) ---")
-        logger.info(f"Prosecutor: {str(p_s)[:200] if p_s else 'NOT LOADED'}...")
-        logger.info(f"Defense:    {str(d_s)[:200] if d_s else 'NOT LOADED'}...")
-        logger.info(f"Literalist: {str(l_s)[:200] if l_s else 'NOT LOADED'}...")
-        logger.info(f"Profiler:   {str(pr_s)[:200] if pr_s else 'NOT LOADED'}...")
-        logger.info(f"Judge:      {str(j_s)[:200] if j_s else 'NOT LOADED'}...")
-        _LOGGED_ONCE = True
+    if USE_PARALLEL_MODE:
+        p_s = resolve_prompt(prosecutor_sys_opt, PARALLEL_P_SYS)
+        d_s = resolve_prompt(defense_sys_opt, PARALLEL_D_SYS)
+        l_s = resolve_prompt(literalist_sys_opt, PARALLEL_L_SYS)
+        pr_s = resolve_prompt(profiler_sys_opt, PARALLEL_PR_SYS)
+        # For user template, we assume it's static unless optimized
+        par_u = resolve_prompt(None, PARALLEL_USER)
 
-    # Parse doc_id for logging
+        j_s = resolve_prompt(judge_sys_opt, CALIBRATED_JUDGE_SYS)
+        j_u = resolve_prompt(judge_user_opt, CALIBRATED_JUDGE_USER)
+    else:
+        # Legacy Mode
+        p_s = resolve_prompt(prosecutor_sys_opt, P_SYS)
+        d_s = resolve_prompt(defense_sys_opt, D_SYS)
+        l_s = resolve_prompt(literalist_sys_opt, L_SYS)
+        pr_s = resolve_prompt(profiler_sys_opt, PR_SYS)
+        # Load legacy user templates (static)
+        p_u = resolve_prompt(None, P_USER)
+        d_u = resolve_prompt(None, D_USER)
+        l_u = resolve_prompt(None, L_USER)
+        pr_u = resolve_prompt(None, PR_USER)
+
+        j_s = resolve_prompt(judge_sys_opt, JUDGE_SYS)
+        j_u = resolve_prompt(judge_user_opt, JUDGE_USER)
+
+    # 4. Parse Doc ID
     doc_id = "unknown"
     try:
-        payload = json.loads(passthrough_gold)
-        doc_id = payload.get("doc_id", "unknown")
-    except Exception:
+        doc_id = json.loads(passthrough_gold).get("doc_id", "unknown")
+    except:
         pass
 
     try:
         # =====================================================================
-        # PARALLEL MODE (Anti-Echo Chamber - Optimal Architecture)
+        # PARALLEL MODE
         # =====================================================================
         if USE_PARALLEL_MODE:
-            logger.debug(f"[{doc_id}] Running PARALLEL Council (Anti-Echo Chamber)...")
+            logger.debug(f"[{doc_id}] Running Parallel Council (Optimized)...")
 
-            # Load parallel prompts
-            par_p_s = safe_fmt(PARALLEL_P_SYS, rag_context=rag_str)
-            par_d_s = safe_fmt(PARALLEL_D_SYS, rag_context=rag_str)
-            par_l_s = safe_fmt(PARALLEL_L_SYS, rag_context=rag_str)
-            par_pr_s = safe_fmt(PARALLEL_PR_SYS, rag_context=rag_str)
-            par_user = safe_fmt(PARALLEL_USER, rag_context=rag_str)
-            cal_j_s = safe_fmt(CALIBRATED_JUDGE_SYS, rag_context=rag_str)
-            cal_j_u = safe_fmt(CALIBRATED_JUDGE_USER, rag_context=rag_str)
-
-            # Run Parallel Council
             council_res = asyncio.run(
                 run_s2_parallel_council(
                     text=text,
                     s1_spans=s1_spans,
                     marker_summary=marker_summary,
-                    rag_context="",  # Already injected into prompts
-                    prosecutor_sys_override=par_p_s,
-                    defense_sys_override=par_d_s,
-                    literalist_sys_override=par_l_s,
-                    profiler_sys_override=par_pr_s,
-                    parallel_user_template_override=par_user,
+                    rag_context="",  # Injected above
+                    prosecutor_sys_override=p_s,
+                    defense_sys_override=d_s,
+                    literalist_sys_override=l_s,
+                    profiler_sys_override=pr_s,
+                    parallel_user_template_override=par_u,
                 )
             )
 
-            logger.debug(
-                f"[{doc_id}] Parallel Council: {council_res.tally}, "
-                f"Consensus: {council_res.consensus_level}"
-            )
-
-            # Run Calibrated Judge
-            logger.debug(f"[{doc_id}] Running Calibrated Judge...")
             judge_res = asyncio.run(
                 run_s2_calibrated_judge(
                     text=text,
                     council_result=council_res,
                     rag_context=rag_context,
-                    judge_sys_override=cal_j_s,
-                    judge_user_template_override=cal_j_u,
+                    judge_sys_override=j_s,
+                    judge_user_template_override=j_u,
                 )
             )
 
-            logger.debug(
-                f"[{doc_id}] Calibrated Judge: {judge_res.label} "
-                f"(override={judge_res.council_override})"
-            )
-
-            # Serialize votes
+            # Formatting output (same as before)
             council_votes = []
             for vote in council_res.votes:
-                vote_dict = vote.model_dump() if hasattr(vote, "model_dump") else vote
-                if hasattr(vote_dict.get("juror"), "value"):
-                    vote_dict["juror"] = vote_dict["juror"].value
-                council_votes.append(vote_dict)
+                v = vote.model_dump() if hasattr(vote, "model_dump") else vote
+                if hasattr(v.get("juror"), "value"):
+                    v["juror"] = v["juror"].value
+                council_votes.append(v)
 
             return {
                 "final_label": judge_res.label,
-                "final_rationale": judge_res.rationale,
                 "final_confidence": judge_res.confidence,
                 "council_tally": council_res.tally,
                 "council_votes": council_votes,
-                # Parallel-specific fields
-                "consensus_level": council_res.consensus_level,
-                "dissent_strength": council_res.dissent_strength,
-                "council_override": judge_res.council_override,
-                "borderline_flag": judge_res.borderline_flag,
-                # Tunnel exit
                 "passthrough_gold_ref": passthrough_gold,
             }
 
         # =====================================================================
-        # LEGACY MODE (Sequential Debate - Backward Compatibility)
+        # LEGACY MODE
         # =====================================================================
         else:
-            logger.debug(f"[{doc_id}] Running S2 Council Debate (Legacy)...")
+            logger.debug(f"[{doc_id}] Running Legacy Debate (Optimized)...")
             council_res = asyncio.run(
                 run_s2_sequential_debate(
                     text=text,
                     s1_spans=s1_spans,
                     marker_summary=marker_summary,
+                    rag_context="",
                     prosecutor_sys_override=p_s,
-                    rag_context="",  # Already injected into prompts
                     defense_sys_override=d_s,
                     literalist_sys_override=l_s,
                     profiler_sys_override=pr_s,
@@ -589,10 +572,6 @@ def predict_wrapper(
                 )
             )
 
-            logger.debug(f"[{doc_id}] Council Tally: {council_res.tally}")
-
-            # Run Judge Review
-            logger.debug(f"[{doc_id}] Running S2 Judge Review...")
             judge_res = asyncio.run(
                 run_s2_judge_review(
                     text=text,
@@ -603,46 +582,18 @@ def predict_wrapper(
                 )
             )
 
-            logger.debug(f"[{doc_id}] Judge Verdict: {judge_res.label}")
-
-            # Serialize council votes
-            council_votes = []
-            if hasattr(council_res, "votes") and council_res.votes:
-                for vote in council_res.votes:
-                    if hasattr(vote, "model_dump"):
-                        vote_dict = vote.model_dump()
-                        if hasattr(vote_dict.get("juror"), "value"):
-                            vote_dict["juror"] = vote_dict["juror"].value
-                        council_votes.append(vote_dict)
-                    elif isinstance(vote, dict):
-                        council_votes.append(vote)
-                    else:
-                        council_votes.append(
-                            {
-                                "juror": str(getattr(vote, "juror", "unknown")),
-                                "verdict": str(getattr(vote, "verdict", "unknown")),
-                                "rationale": str(getattr(vote, "rationale", "")),
-                            }
-                        )
-
             return {
                 "final_label": judge_res.label,
-                "final_rationale": judge_res.rationale,
                 "final_confidence": judge_res.confidence,
                 "council_tally": council_res.tally,
-                "council_votes": council_votes,
-                # Tunnel exit
                 "passthrough_gold_ref": passthrough_gold,
             }
 
     except Exception as e:
-        logger.error(f"[{doc_id}] Prediction Wrapper Failed: {e}", exc_info=True)
+        logger.error(f"[{doc_id}] Prediction Failed: {e}", exc_info=True)
         return {
-            "final_label": "non",  # Safe default
+            "final_label": "non",
             "final_confidence": 0.0,
-            "final_rationale": f"SYSTEM_ERROR: {str(e)[:100]}",
-            "council_tally": {},
-            "council_votes": [],  # Empty list
             "passthrough_gold_ref": passthrough_gold,
         }
 
@@ -654,11 +605,11 @@ def predict_wrapper(
 
 def main():
     parser = argparse.ArgumentParser(description="GEPA S2 Council Optimization Engine")
-    parser.add_argument("--data", default="data/gold/optimization_set.jsonl")
-    parser.add_argument("--limit", type=int, default=20, help="Examples to use")
-    parser.add_argument("--budget", type=int, default=40, help="Max metric calls")
+    parser.add_argument("--data", default="data/raw/dev_ready_for_pipeline.jsonl")
+    parser.add_argument("--limit", type=int, default=10, help="Examples to use")
+    parser.add_argument("--budget", type=int, default=30, help="Max metric calls")
     parser.add_argument(
-        "--rag-dir", default="data/rag_openai", help="Path to ChromaDB RAG"
+        "--rag-dir", default="data/rag_openai_contrastive", help="Path to ChromaDB RAG"
     )
     parser.add_argument("--experiment", default="GEPA_S2_Optimization")
     parser.add_argument(
@@ -727,7 +678,7 @@ def main():
     if args.rag_dir and os.path.exists(args.rag_dir):
         logger.info(f"Initializing S2 RAG from {args.rag_dir}...")
         try:
-            S2_RAG_COLLECTION = get_rag_collection(args.rag_dir, "s2_examples")
+            S2_RAG_COLLECTION = get_rag_collection(args.rag_dir, "s2_precedents")
             logger.success("S2 RAG Collection Loaded.")
         except Exception as e:
             logger.warning(
@@ -1012,25 +963,14 @@ def main():
         optimized_list = results.optimized_prompts
 
     name_map = {
-        # Legacy prompts (Sequential Debate)
-        "s2_pros_sys": "s2_prosecutor_optimized.txt",
-        "s2_pros_user": "s2_prosecutor_user_optimized.txt",
-        "s2_def_sys": "s2_defense_optimized.txt",
-        "s2_def_user": "s2_defense_user_optimized.txt",
-        "s2_lit_sys": "s2_literalist_optimized.txt",
-        "s2_lit_user": "s2_literalist_user_optimized.txt",
-        "s2_prof_sys": "s2_profiler_optimized.txt",
-        "s2_prof_user": "s2_profiler_user_optimized.txt",
-        "s2_judge_sys": "s2_judge_optimized.txt",
-        "s2_judge_user": "s2_judge_user_optimized.txt",
         # Parallel prompts (Anti-Echo Chamber)
-        "s2_parallel_pros_sys": "s2_parallel_prosecutor_optimized.txt",
-        "s2_parallel_def_sys": "s2_parallel_defense_optimized.txt",
-        "s2_parallel_lit_sys": "s2_parallel_literalist_optimized.txt",
-        "s2_parallel_prof_sys": "s2_parallel_profiler_optimized.txt",
-        "s2_parallel_user": "s2_parallel_user_optimized.txt",
-        "s2_calibrated_judge_sys": "s2_calibrated_judge_optimized.txt",
-        "s2_calibrated_judge_user": "s2_calibrated_judge_user_optimized.txt",
+        "s2_parallel_pros_sys": "s2_parallel_prosecutor.txt",
+        "s2_parallel_def_sys": "s2_parallel_defense.txt",
+        "s2_parallel_lit_sys": "s2_parallel_literalist.txt",
+        "s2_parallel_prof_sys": "s2_parallel_profiler.txt",
+        "s2_parallel_user": "s2_parallel_user.txt",
+        "s2_calibrated_judge_sys": "s2_calibrated_judge_eda.txt",
+        "s2_calibrated_judge_user": "s2_calibrated_judge_user.txt",
     }
 
     saved_count = 0

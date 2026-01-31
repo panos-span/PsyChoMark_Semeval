@@ -16,8 +16,18 @@ import argparse
 import pathlib
 from typing import List, Dict
 
+from anthropic import APIConnectionError
+import litellm
 import pandas as pd  # <--- NEW
-from datetime import datetime  # <--- NEW
+from datetime import datetime
+
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
+from litellm.exceptions import RateLimitError, ServiceUnavailableError
 
 # --- Make repo root importable FIRST ---
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -34,6 +44,35 @@ from loguru import logger
 
 # Import prompt loader
 from pydanticai2.prompt_loader import S1_PROMPTS
+
+# 1. Save the original function
+_original_litellm_completion = litellm.completion
+
+
+# 2. Define the retry logic (Expanded to catch Connection Errors)
+@retry(
+    retry=retry_if_exception_type(
+        (
+            RateLimitError,
+            ServiceUnavailableError,
+            APIConnectionError,  # <--- Added this for your specific error
+            ConnectionError,
+        )
+    ),
+    stop=stop_after_attempt(20),  # Try 20 times
+    wait=wait_exponential(multiplier=2, min=5, max=60),  # Wait up to 60s
+    reraise=True,
+)
+def _robust_completion(*args, **kwargs):
+    """Wrapper that forces retries on RateLimit & Connection Errors"""
+    return _original_litellm_completion(*args, **kwargs)
+
+
+# 3. Apply the patch
+litellm.completion = _robust_completion
+
+# 4. Increase Timeout
+os.environ["LITELLM_REQUEST_TIMEOUT"] = "120"
 
 
 # ---------- .env loader (no deps) ----------
@@ -62,7 +101,9 @@ from pydanticai2.psycomark_agents import (
     get_rag_collection,
     retrieve_stratified_s1_reranked,
     find_best_span,  # For span localization
-    format_s1_fewshots_to_markdown,  # For few-shot formatting
+    format_s1_fewshots_to_markdown,
+    run_s1_pattern_recognition,  # For few-shot formatting
+    S1Deps,
 )
 from pydanticai2.prompt_builder import (
     # Legacy prompts
@@ -90,7 +131,9 @@ FEEDBACK_LOG = []  # <--- NEW
 
 
 def load_eval_data(path: str, limit: int = 20) -> List[Dict]:
-    """Loads and slices the Gold Standard dataset."""
+    """
+    Loads dataset, handling nested metadata structure.
+    """
     dataset = []
     p = pathlib.Path(path)
     if not p.exists():
@@ -104,14 +147,39 @@ def load_eval_data(path: str, limit: int = 20) -> List[Dict]:
             try:
                 row = json.loads(line)
 
-                # 1. Get Spans
-                gold_spans = row.get("spans", [])
+                # --- [FIX] ROBUST SPAN EXTRACTION ---
+                # Check root first, then metadata
+                gold_spans = row.get("spans")
+                if not gold_spans:
+                    gold_spans = row.get("markers")
+                if not gold_spans:
+                    gold_spans = row.get("metadata", {}).get("markers")
+                if not gold_spans:
+                    gold_spans = row.get("metadata", {}).get("spans")
+
+                # Default to empty if nothing found
                 if not isinstance(gold_spans, list):
                     gold_spans = []
 
-                # 2. Serialize Payload
+                # --- FILTER LOGIC (Keep Positives) ---
+                if len(gold_spans) == 0:
+                    continue
+
+                # Normalize keys (some data has 'startIndex', some has 'start')
+                normalized_spans = []
+                for s in gold_spans:
+                    n = s.copy()
+                    # Fix start/end keys
+                    if "startIndex" in n:
+                        n["start"] = n.pop("startIndex")
+                    if "endIndex" in n:
+                        n["end"] = n.pop("endIndex")
+                    if "type" in n:
+                        n["label"] = n.pop("type")
+                    normalized_spans.append(n)
+
                 payload = {
-                    "gold_spans": gold_spans,
+                    "gold_spans": normalized_spans,
                     "doc_id": row.get("doc_id", f"line_{line_num}"),
                 }
                 payload_str = json.dumps(payload)
@@ -120,26 +188,19 @@ def load_eval_data(path: str, limit: int = 20) -> List[Dict]:
                     {
                         "inputs": {
                             "text": row["text"],
-                            # --- THE TROJAN HORSE ---
-                            # We inject gold data into INPUTS so it goes to the wrapper
                             "passthrough_gold": payload_str,
                         },
-                        # MLflow requires an output col, we give it a dummy
                         "outputs": {"dummy_target": "ignore_me"},
                     }
                 )
+
+                if len(dataset) >= limit:
+                    break
+
             except Exception as e:
                 logger.warning(f"Skipping bad line {line_num}: {e}")
 
-    dataset = dataset[:limit]
-
-    # Sanity Check
-    valid_count = sum(
-        1 for d in dataset if json.loads(d["inputs"]["passthrough_gold"])["gold_spans"]
-    )
-    logger.success(f"DATASET LOADED: {len(dataset)} items.")
-    logger.info(f" > Items with Spans: {valid_count}")
-
+    logger.success(f"DATASET LOADED: {len(dataset)} valid examples.")
     return dataset
 
 
@@ -369,22 +430,31 @@ def s1_rich_scorer(outputs, expectations):
 
     if gold_spans and not pred_spans:
         # Format expected spans with labels for better feedback
+        # CASE: The model stayed silent, but shouldn't have.
+        # This is the specific failure mode for "Professional" texts.
+        snippet = outputs.get("passthrough_gold_ref", "")[:100]  # Context hint
+
+        # [FIX] Now actually using the snippet in the log
+        logger.warning(
+            f"[{doc_id}] ⚠️ SILENT FAILURE (Recall 0.0) | "
+            f"Gold had {len(gold_spans)} markers, Model found 0.\n"
+            f"Context Snippet: '{snippet}...'\n"
+            f"Check if Guardrails are too strict."
+        )
+
         expected = [f"{g.get('label', '?')}:'{g.get('text', '')}'" for g in gold_spans]
-        logger.debug(f"[{doc_id}] S1 Score: 0.0 | FAILED (Recall). Missed: {expected}")
         return Feedback(
             value=0.0,
-            rationale=f"EXTRACT MISSING: {'; '.join(expected)}. The model found nothing but these markers exist.",
+            rationale=f"EXTRACT MISSING: {'; '.join(expected)}. The model found nothing.",
         )
 
     if pred_spans and not gold_spans:
+        logger.warning(
+            f"[{doc_id}] ⚠️ HALLUCINATION (Precision 0.0) | "
+            f"Model found {len(pred_spans)} markers in a clean text."
+        )
         halluc = [f"'{p.get('text', '')}'" for p in pred_spans]
-        logger.debug(
-            f"[{doc_id}] S1 Score: 0.0 | FAILED (Precision). Hallucinated: {halluc}"
-        )
-        return Feedback(
-            value=0.0,
-            rationale=f"REMOVE ALL: {'; '.join(halluc)}. This text has NO conspiracy markers - it's a negative example.",
-        )
+        return Feedback(value=0.0, rationale=f"REMOVE ALL: {'; '.join(halluc)}.")
 
     # ---------------------------------------------------------
     # MATCHING ALGORITHM (Enhanced with Position-Based Scoring)
@@ -510,7 +580,7 @@ CRITIC_SYS_URI, CRITIC_USER_URI = None, None
 REFINER_SYS_URI, REFINER_USER_URI = None, None
 
 # DD-CoT prompt URIs (NEW)
-DDCOT_GEN_SYS_URI, DDCOT_GEN_USER_URI = None, None
+PAT_SYS_URI, PAT_USER_URI = None, None
 DDCOT_CRITIC_SYS_URI, DDCOT_CRITIC_USER_URI = None, None
 DDCOT_REFINER_SYS_URI, DDCOT_REFINER_USER_URI = None, None
 
@@ -518,70 +588,70 @@ S1_RAG_COLLECTION = None
 USE_DDCOT_MODE = True  # Flag to switch between legacy and DD-CoT
 
 
-def predict_wrapper(text: str, passthrough_gold: str = "{}"):
+def predict_wrapper(
+    text: str,
+    passthrough_gold: str = "{}",
+    # Pattern Key
+    s1_pattern_sys: str = None,
+    s1_pattern_user: str = None,
+):
     """
-    Unified prediction wrapper supporting both Legacy and DD-CoT modes.
-
-    Args:
-        text: The input text for the model.
-        passthrough_gold: The hidden JSON payload containing gold labels.
+    Unified prediction wrapper that accepts GEPA-mutated prompts.
     """
-    # 1. Retrieve & Format RAG
+    # 1. Retrieve RAG
     few_shots = []
     if S1_RAG_COLLECTION:
-        few_shots = retrieve_stratified_s1_reranked(S1_RAG_COLLECTION, text, k_total=2)
+        few_shots = retrieve_stratified_s1_reranked(S1_RAG_COLLECTION, text, k_total=3)
     few_shots_str = format_s1_fewshots_to_markdown(few_shots)
 
-    # 2. Helper to safely inject variables into prompts
-    def load_with_context(uri):
-        if not uri:
-            return None
-        try:
-            prompt_obj = mlflow.genai.load_prompt(uri)
-            template = prompt_obj.template
-            # Replace double-brace placeholder used in our templates
-            if "{{few_shot_examples}}" in template:
-                template = template.replace("{{few_shot_examples}}", few_shots_str)
-            return template
-        except Exception as e:
-            logger.warning(f"Failed to load prompt from {uri}: {e}")
-            return None
+    # 2. Helper to Hydrate Prompts (Opt String > Static URI)
+    def resolve(opt_str, static_uri):
+        if opt_str:
+            # GEPA passed a mutated string. Inject variables manually.
+            return opt_str.replace("{{few_shot_examples}}", few_shots_str)
+        elif static_uri:
+            # Fallback to static prompt from MLflow
+            try:
+                tmpl = mlflow.genai.load_prompt(static_uri).template
+                return tmpl.replace("{{few_shot_examples}}", few_shots_str)
+            except:
+                return None
+        return None
+
+    # 3. Setup Dependencies
+    deps = S1Deps(raw_text=text, few_shots=few_shots, doc_id="eval_sample")
 
     try:
-        # =====================================================================
-        # DD-CoT MODE (Optimal Architecture)
-        # =====================================================================
-        if USE_DDCOT_MODE:
-            logger.debug("[DD-CoT Mode] Loading prompts...")
+        # Resolve Pattern Prompt (Primary Target)
+        pat_sys_prompt = resolve(s1_pattern_sys, PAT_SYS_URI)
 
-            # Load DD-CoT prompts
-            g_sys = load_with_context(DDCOT_GEN_SYS_URI)
-            c_sys = load_with_context(DDCOT_CRITIC_SYS_URI)
-            r_sys = load_with_context(DDCOT_REFINER_SYS_URI)
+        pat_user_prompt = resolve(s1_pattern_user, PAT_USER_URI)
 
-            g_usr = (
-                mlflow.genai.load_prompt(DDCOT_GEN_USER_URI).template
-                if DDCOT_GEN_USER_URI
-                else None
-            )
-            c_usr = (
-                mlflow.genai.load_prompt(DDCOT_CRITIC_USER_URI).template
-                if DDCOT_CRITIC_USER_URI
-                else None
-            )
-            r_usr = (
-                mlflow.genai.load_prompt(DDCOT_REFINER_USER_URI).template
-                if DDCOT_REFINER_USER_URI
-                else None
+        # Run Pattern Recognition Agent
+        # Note: We prioritize the Pattern Agent if PAT_SYS_URI is active or passed
+        if pat_sys_prompt or s1_pattern_sys:
+            logger.debug("[S1 Pattern] Running Optimized Pattern Agent...")
+            extraction_result = asyncio.run(
+                run_s1_pattern_recognition(
+                    text=text,
+                    deps=deps,
+                    temperature=0.0,
+                    system_prompt_override=pat_sys_prompt,  # INJECTED HERE
+                    user_prompt_template_override=pat_user_prompt,  # INJECTED HERE
+                )
             )
 
-            logger.debug(f"[DD-CoT] Few shots count: {len(few_shots)}")
+            if isinstance(extraction_result, tuple):
+                extraction_result = extraction_result[0]
 
-            # Run DD-CoT pipeline
-            spans = asyncio.run(
+            raw_spans = extraction_result.extractions
+
+        else:
+            # Run Legacy DD-CoT Pipeline with Overrides
+            raw_spans = asyncio.run(
                 run_s1_ddcot(
                     text,
-                    few_shots=[],  # Already injected into g_sys
+                    few_shots=[],  # Already injected
                     gen_prompt_override=g_sys,
                     gen_user_template_override=g_usr,
                     critic_prompt_override=c_sys,
@@ -591,101 +661,48 @@ def predict_wrapper(text: str, passthrough_gold: str = "{}"):
                 )
             )
 
-        # =====================================================================
-        # LEGACY MODE (Backward Compatibility)
-        # =====================================================================
-        else:
-            logger.debug("[Legacy Mode] Loading prompts...")
+        # Handle tuple return if usage is enabled in agent
+        if isinstance(extraction_result, tuple):
+            extraction_result = extraction_result[0]
 
-            # Load Legacy prompts
-            g_sys = load_with_context(GEN_SYS_URI)
-            c_sys = load_with_context(CRITIC_SYS_URI)
-            r_sys = load_with_context(REFINER_SYS_URI)
+        # 4. Extract Spans
+        raw_spans = extraction_result.extractions
 
-            g_usr = (
-                mlflow.genai.load_prompt(GEN_USER_URI).template
-                if GEN_USER_URI
-                else None
-            )
-            c_usr = (
-                mlflow.genai.load_prompt(CRITIC_USER_URI).template
-                if CRITIC_USER_URI
-                else None
-            )
-            r_usr = (
-                mlflow.genai.load_prompt(REFINER_USER_URI).template
-                if REFINER_USER_URI
-                else None
-            )
-
-            logger.debug(f"[Legacy] Few shots count: {len(few_shots)}")
-
-            # Run legacy pipeline
-            spans = asyncio.run(
-                run_s1_discriminative(
-                    text,
-                    gen_prompt_override=g_sys,
-                    few_shots=[],  # Already injected into g_sys
-                    user_prompt_template_override=g_usr,
-                    critic_prompt_override=c_sys,
-                    critic_user_template_override=c_usr,
-                    refiner_prompt_override=r_sys,
-                    refiner_user_template_override=r_usr,
-                )
-            )
-
-        # Debug: Log what the model returned
-        logger.debug(f"Model returned {len(spans)} spans")
-        if spans:
-            logger.debug(f"Sample span: {spans[0]}")
-
-        # Convert spans to dicts and LOCALIZE (calculate start/end indices)
+        # 5. Deterministic Verification (The "Map-Reduce" Engine)
+        # This calculates exact start/end indices and drops hallucinations
         final_spans = []
-        assigned_count = {}  # Track occurrences for duplicate spans
+        assigned_count = {}  # Track nth occurrence for duplicates
 
-        for s in spans:
-            if hasattr(s, "model_dump"):
-                span_dict = s.model_dump()
-            elif hasattr(s, "dict"):
-                span_dict = s.dict()
-            elif isinstance(s, dict):
-                span_dict = s
+        for span in raw_spans:
+            # Normalize label
+            label = normalize_label(span.label)
+            span_text = span.text.strip()
+
+            if not span_text:
+                continue
+
+            # Track occurrences
+            key = (label, span_text)
+            nth = assigned_count.get(key, 0)
+
+            # Find best span logic
+            start, end = find_best_span(text, span_text, nth=nth)
+
+            if start != -1:
+                final_spans.append(
+                    {
+                        "label": label,
+                        "text": text[start:end],  # Use verbatim source text
+                        "start": start,
+                        "end": end,
+                        "why": span.why_this_label,  # Preserve reasoning
+                    }
+                )
+                assigned_count[key] = nth + 1
             else:
-                span_dict = {"text": str(s), "label": "Unknown"}
+                logger.warning(f"Span not found in text: '{span_text}'")
 
-            # Normalize the label in the output
-            if "label" in span_dict:
-                span_dict["label"] = normalize_label(span_dict["label"])
-
-            # --- LOCALIZE SPAN: Calculate start/end indices ---
-            span_text = span_dict.get("text", "")
-            if span_text and (
-                span_dict.get("start") is None or span_dict.get("end") is None
-            ):
-                # Track which occurrence we're looking for
-                key = (span_dict.get("label", ""), span_text.strip())
-                nth = assigned_count.get(key, 0)
-
-                # Find the span in the original text
-                start, end = find_best_span(text, span_text, nth=nth)
-
-                if start != -1:
-                    span_dict["start"] = start
-                    span_dict["end"] = end
-                    # Use the actual text from the document (verbatim)
-                    span_dict["text"] = text[start:end]
-                    assigned_count[key] = nth + 1
-                else:
-                    # Span not found in text - mark as potential hallucination
-                    logger.warning(f"Span not found in text: '{span_text}'")
-                    span_dict["start"] = -1
-                    span_dict["end"] = -1
-
-            final_spans.append(span_dict)
-
-        logger.debug(
-            f"Final spans to return: {final_spans if final_spans else 'empty'}"
-        )
+        logger.debug(f"S1 Extracted {len(final_spans)} valid markers.")
 
         return {
             "final_spans": final_spans,
@@ -697,7 +714,7 @@ def predict_wrapper(text: str, passthrough_gold: str = "{}"):
     except Exception as e:
         logger.error(f"Prediction Wrapper Failed: {e}", exc_info=True)
         return {
-            "final_spans": [{"text": "SYSTEM_CRASH", "label": "Error"}],
+            "final_spans": [],  # Fail safe: Return empty list, not crash
             "passthrough_gold_ref": passthrough_gold,
         }
 
@@ -710,13 +727,15 @@ def predict_wrapper(text: str, passthrough_gold: str = "{}"):
 def main():
     parser = argparse.ArgumentParser(description="GEPA Prompt Optimization Runner")
     parser.add_argument(
-        "--data", default="data/raw/dev_ready_flat.jsonl", help="Path to eval data"
+        "--data",
+        default="data/raw/dev_ready_for_pipeline.jsonl",
+        help="Path to eval data",
     )
     parser.add_argument(
-        "--rag-dir", default="data/rag_openai", help="Path to ChromaDB RAG"
+        "--rag-dir", default="data/rag_openai_contrastive", help="Path to ChromaDB RAG"
     )
-    parser.add_argument("--limit", type=int, default=20, help="Examples to use")
-    parser.add_argument("--budget", type=int, default=40, help="Max metric calls")
+    parser.add_argument("--limit", type=int, default=10, help="Examples to use")
+    parser.add_argument("--budget", type=int, default=30, help="Max metric calls")
     parser.add_argument(
         "--experiment",
         default="GEPA_S1_Optimization_V2_OPENAI",
@@ -741,7 +760,9 @@ def main():
             "ddcot-all",
             "ddcot-gen",
             "ddcot-critic",
+            "pattern-sys",
             "ddcot-refiner",
+            "pattern-user",
             "ddcot-gen-sys",
             "ddcot-critic-sys",
             "ddcot-refiner-sys",
@@ -762,7 +783,8 @@ def main():
             'ddcot-gen'       = Optimize DD-CoT Generator (sys + user)
             'ddcot-critic'    = Optimize DD-CoT Critic (sys + user)
             'ddcot-refiner'   = Optimize DD-CoT Refiner (sys + user)
-            'ddcot-gen-sys'   = Optimize ONLY DD-CoT Generator system (RECOMMENDED)
+            'pattern-sys'     = Optimize ONLY Pattern system (RECOMMENDED)
+            'pattern-user'    = Optimize ONLY Pattern user template
             'ddcot-critic-sys'= Optimize ONLY DD-CoT Critic system
             'ddcot-refiner-sys'= Optimize ONLY DD-CoT Refiner system
         """,
@@ -782,7 +804,7 @@ def main():
     if args.rag_dir and os.path.exists(args.rag_dir):
         logger.info(f"Initializing RAG from {args.rag_dir}...")
         try:
-            S1_RAG_COLLECTION = get_rag_collection(args.rag_dir, "s1_markers")
+            S1_RAG_COLLECTION = get_rag_collection(args.rag_dir, "s1_patterns")
             logger.success("RAG Collection Loaded successfully.")
         except Exception as e:
             logger.warning(
@@ -803,13 +825,14 @@ def main():
     global GEN_SYS_URI, GEN_USER_URI
     global CRITIC_SYS_URI, CRITIC_USER_URI
     global REFINER_SYS_URI, REFINER_USER_URI
-    global DDCOT_GEN_SYS_URI, DDCOT_GEN_USER_URI
+    global PAT_USER_URI, PAT_SYS_URI
     global DDCOT_CRITIC_SYS_URI, DDCOT_CRITIC_USER_URI
     global DDCOT_REFINER_SYS_URI, DDCOT_REFINER_USER_URI
     global USE_DDCOT_MODE
 
     # Determine mode based on phase
     USE_DDCOT_MODE = args.phase.startswith("ddcot")
+    USE_PATTERN_MODE = args.phase == "pattern-sys"
 
     with mlflow.start_run():
         mlflow.log_params(vars(args))
@@ -822,25 +845,25 @@ def main():
 
         # Register Prompts
         logger.info("Registering Prompts...")
-        GEN_SYS_URI = mlflow.genai.register_prompt(
-            "s1_gen_sys", s1_prompts.gen_system
-        ).uri
-        GEN_USER_URI = mlflow.genai.register_prompt(
-            "s1_gen_user", s1_prompts.gen_user_template
-        ).uri
-        CRITIC_SYS_URI = mlflow.genai.register_prompt(
-            "s1_critic_sys", s1_prompts.critic_system
-        ).uri
-        CRITIC_USER_URI = mlflow.genai.register_prompt(
-            "s1_critic_user", s1_prompts.critic_user_template
-        ).uri
-        REFINER_SYS_URI = mlflow.genai.register_prompt(
-            "s1_refiner_sys", s1_prompts.refiner_system
-        ).uri
-        REFINER_USER_URI = mlflow.genai.register_prompt(
-            "s1_refiner_user", s1_prompts.refiner_user_template
-        ).uri
-        logger.success("Legacy Baseline Prompts Registered.")
+        # GEN_SYS_URI = mlflow.genai.register_prompt(
+        #    "s1_gen_sys", s1_prompts.gen_system
+        # ).uri
+        # GEN_USER_URI = mlflow.genai.register_prompt(
+        #    "s1_gen_user", s1_prompts.gen_user_template
+        # ).uri
+        # CRITIC_SYS_URI = mlflow.genai.register_prompt(
+        #    "s1_critic_sys", s1_prompts.critic_system
+        # ).uri
+        # CRITIC_USER_URI = mlflow.genai.register_prompt(
+        #    "s1_critic_user", s1_prompts.critic_user_template
+        # ).uri
+        # REFINER_SYS_URI = mlflow.genai.register_prompt(
+        #    "s1_refiner_sys", s1_prompts.refiner_system
+        # ).uri
+        # REFINER_USER_URI = mlflow.genai.register_prompt(
+        #    "s1_refiner_user", s1_prompts.refiner_user_template
+        # ).uri
+        # logger.success("Legacy Baseline Prompts Registered.")
 
         # ===== DD-CoT Prompts Registration =====
         logger.info("Registering DD-CoT Prompts...")
@@ -854,25 +877,32 @@ def main():
             s1_prompts.ddcot_refiner_system, "baseline_prompts/s1_ddcot_refiner.txt"
         )
 
-        DDCOT_GEN_SYS_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_gen_sys", s1_prompts.ddcot_gen_system
+        # DDCOT_GEN_SYS_URI = mlflow.genai.register_prompt(
+        #    "s1_ddcot_gen_sys", s1_prompts.ddcot_gen_system
+        # ).uri
+        # DDCOT_GEN_USER_URI = mlflow.genai.register_prompt(
+        #    "s1_ddcot_gen_user", s1_prompts.ddcot_gen_user_template
+        # ).uri
+        # DDCOT_CRITIC_SYS_URI = mlflow.genai.register_prompt(
+        #    "s1_ddcot_critic_sys", s1_prompts.ddcot_critic_system
+        # ).uri
+        # DDCOT_CRITIC_USER_URI = mlflow.genai.register_prompt(
+        #    "s1_ddcot_critic_user", s1_prompts.ddcot_critic_user_template
+        # ).uri
+        # DDCOT_REFINER_SYS_URI = mlflow.genai.register_prompt(
+        #    "s1_ddcot_refiner_sys", s1_prompts.ddcot_refiner_system
+        # ).uri
+        # DDCOT_REFINER_USER_URI = mlflow.genai.register_prompt(
+        #    "s1_ddcot_refiner_user", s1_prompts.ddcot_refiner_user_template
+        # ).uri
+        # logger.success("DD-CoT Prompts Registered.")
+
+        PAT_SYS_URI = mlflow.genai.register_prompt(
+            "s1_pat_sys", s1_prompts.pat_system
         ).uri
-        DDCOT_GEN_USER_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_gen_user", s1_prompts.ddcot_gen_user_template
+        PAT_USER_URI = mlflow.genai.register_prompt(
+            "s1_pat_user", s1_prompts.pat_user_template
         ).uri
-        DDCOT_CRITIC_SYS_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_critic_sys", s1_prompts.ddcot_critic_system
-        ).uri
-        DDCOT_CRITIC_USER_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_critic_user", s1_prompts.ddcot_critic_user_template
-        ).uri
-        DDCOT_REFINER_SYS_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_refiner_sys", s1_prompts.ddcot_refiner_system
-        ).uri
-        DDCOT_REFINER_USER_URI = mlflow.genai.register_prompt(
-            "s1_ddcot_refiner_user", s1_prompts.ddcot_refiner_user_template
-        ).uri
-        logger.success("DD-CoT Prompts Registered.")
 
         # Build Prompt URI List Based on Phase
         # ===== LEGACY PHASES =====
@@ -905,19 +935,12 @@ def main():
         # ===== DD-CoT PHASES (Optimal Architecture) =====
         elif args.phase == "ddcot-all":
             prompt_uris_to_optimize = [
-                DDCOT_GEN_SYS_URI,
-                DDCOT_GEN_USER_URI,
                 DDCOT_CRITIC_SYS_URI,
                 DDCOT_CRITIC_USER_URI,
                 DDCOT_REFINER_SYS_URI,
                 DDCOT_REFINER_USER_URI,
             ]
             logger.info("🎯 Phase: DDCOT-ALL - Optimizing all 6 DD-CoT prompts")
-        elif args.phase == "ddcot-gen":
-            prompt_uris_to_optimize = [DDCOT_GEN_SYS_URI, DDCOT_GEN_USER_URI]
-            logger.info(
-                "🎯 Phase: DDCOT-GEN - Optimizing DD-CoT Generator (sys + user)"
-            )
         elif args.phase == "ddcot-critic":
             prompt_uris_to_optimize = [DDCOT_CRITIC_SYS_URI, DDCOT_CRITIC_USER_URI]
             logger.info(
@@ -928,11 +951,14 @@ def main():
             logger.info(
                 "🎯 Phase: DDCOT-REFINER - Optimizing DD-CoT Refiner (sys + user)"
             )
-        elif args.phase == "ddcot-gen-sys":
-            prompt_uris_to_optimize = [DDCOT_GEN_SYS_URI]
+        elif args.phase == "pattern-sys":
+            prompt_uris_to_optimize = [PAT_SYS_URI]
             logger.info(
-                "🎯 Phase: DDCOT-GEN-SYS - Optimizing DD-CoT Generator system (RECOMMENDED)"
+                "🎯 Phase: PATTERN-SYS - Optimizing Pattern system (RECOMMENDED)"
             )
+        elif args.phase == "pattern-user":
+            prompt_uris_to_optimize = [PAT_USER_URI]
+            logger.info("🎯 Phase: PATTERN-USER - Optimizing Pattern user template")
         elif args.phase == "ddcot-critic-sys":
             prompt_uris_to_optimize = [DDCOT_CRITIC_SYS_URI]
             logger.info("🎯 Phase: DDCOT-CRITIC-SYS - Optimizing DD-CoT Critic system")
@@ -1000,20 +1026,8 @@ def main():
         optimized_list = results.optimized_prompts
 
     name_to_filename = {
-        # ===== Legacy Prompts =====
-        "s1_gen_sys": "s1_generator_optimized.txt",
-        "s1_gen_user": "s1_user_optimized.txt",
-        "s1_critic_sys": "s1_critic_optimized.txt",
-        "s1_critic_user": "s1_critic_user_optimized.txt",
-        "s1_refiner_sys": "s1_refiner_optimized.txt",
-        "s1_refiner_user": "s1_refiner_user_optimized.txt",
-        # ===== DD-CoT Prompts (Optimal Architecture) =====
-        "s1_ddcot_gen_sys": "s1_ddcot_generator_optimized.txt",
-        "s1_ddcot_gen_user": "s1_ddcot_user_optimized.txt",
-        "s1_ddcot_critic_sys": "s1_ddcot_critic_optimized.txt",
-        "s1_ddcot_critic_user": "s1_ddcot_critic_user_optimized.txt",
-        "s1_ddcot_refiner_sys": "s1_ddcot_refiner_optimized.txt",
-        "s1_ddcot_refiner_user": "s1_ddcot_refiner_user_optimized.txt",
+        "s1_pat_sys": "s1_pattern_generator.txt",
+        "s1_pat_user": "s1_pattern_user.txt",
     }
 
     for prompt_obj in optimized_list:

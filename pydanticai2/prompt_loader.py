@@ -29,12 +29,14 @@ from pydanticai2.prompt_builder import (
 # --- Directory Configuration ---
 # S1 prompts: Check dedicated s1 dir FIRST (has newer/larger prompts)
 S1_PROMPT_DIRS = [
+    Path("prompts/openai"),  # Primary (dedicated OpenAI S1 dir)
     Path("prompts/optimized_s1"),  # Primary (dedicated S1 dir - NEWEST)
     Path("prompts/optimized"),  # Fallback (legacy unified)
 ]
 
 # S2 prompts: Check dedicated s2 dir FIRST
 S2_PROMPT_DIRS = [
+    Path("prompts/openai"),  # Primary (dedicated OpenAI S1 dir)
     Path("prompts/optimized_s2"),  # Primary (dedicated S2 dir)
     Path("prompts/optimized"),  # Fallback (legacy unified)
 ]
@@ -50,7 +52,7 @@ def load_prompt_or_default(
     If missing in all, falls back to the hardcoded Python builder function.
     """
     if search_dirs is None:
-        search_dirs = [Path("prompts/optimized")]
+        search_dirs = [Path("prompts/openai")]
 
     for prompt_dir in search_dirs:
         filepath = prompt_dir / filename
@@ -148,6 +150,16 @@ class S1Prompts:
             build_s1_ddcot_refiner_user_template,
             S1_PROMPT_DIRS,
         )
+        self.pat_system = load_prompt_or_default(
+            "s1_pattern_generator.txt",
+            lambda: "You are a forensic pattern filter...",
+            S1_PROMPT_DIRS,
+        )
+        self.pat_user_template = load_prompt_or_default(
+            "s1_pattern_user.txt",
+            lambda: "You are a forensic pattern filter user template...",
+            S1_PROMPT_DIRS,
+        )
 
 
 # Singleton instance
@@ -219,22 +231,22 @@ class S2Prompts:
 
         # Parallel Juror System Prompts
         self.parallel_pros_sys = load_prompt_or_default(
-            "s2_parallel_prosecutor_optimized.txt",
+            "s2_parallel_prosecutor.txt",
             build_s2_parallel_prosecutor_system,
             S2_PROMPT_DIRS,
         )
         self.parallel_def_sys = load_prompt_or_default(
-            "s2_parallel_defense_optimized.txt",
+            "s2_parallel_defense.txt",
             build_s2_parallel_defense_system,
             S2_PROMPT_DIRS,
         )
         self.parallel_lit_sys = load_prompt_or_default(
-            "s2_parallel_literalist_optimized.txt",
+            "s2_parallel_literalist.txt",
             build_s2_parallel_literalist_system,
             S2_PROMPT_DIRS,
         )
         self.parallel_prof_sys = load_prompt_or_default(
-            "s2_parallel_profiler_optimized.txt",
+            "s2_parallel_profiler.txt",
             build_s2_parallel_profiler_system,
             S2_PROMPT_DIRS,
         )
@@ -248,12 +260,12 @@ class S2Prompts:
 
         # Calibrated Judge (Anti-Echo Chamber)
         self.calibrated_judge_sys = load_prompt_or_default(
-            "s2_calibrated_judge_optimized.txt",
+            "s2_calibrated_judge_eda.txt",
             build_s2_calibrated_judge_system,
             S2_PROMPT_DIRS,
         )
         self.calibrated_judge_user = load_prompt_or_default(
-            "s2_calibrated_judge_user_optimized.txt",
+            "s2_calibrated_judge_user.txt",
             build_s2_calibrated_judge_user_template,
             S2_PROMPT_DIRS,
         )
