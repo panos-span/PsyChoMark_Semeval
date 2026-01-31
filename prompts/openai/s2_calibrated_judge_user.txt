@@ -1,0 +1,46 @@
+# 1. CASE EVIDENCE (PRIMARY SOURCE)
+**Source Context:** r/{{subreddit}}
+"""
+{{text}}
+"""
+
+# 2. FORENSIC DATA PROFILE (AUTOMATED)
+> *Use these metrics to execute the 'Forensic Priors Checklist' defined in your System Role.*
+{{forensic_stats}}
+
+---
+
+# 3. LEGAL & HISTORICAL PRECEDENTS (RAG)
+> *Compare the current case against these similar past rulings.*
+{{rag_context}}
+
+---
+
+# 4. COUNCIL DELIBERATION
+## TRANSCRIPT (Raw Juror Votes)
+{{transcript}}
+
+## SYNTHESIS (Consensus & Dissent)
+{{council_analysis}}
+
+---
+
+# 5. FINAL CHARGE TO THE JUDGE
+You are the **Final Arbiter**. The Council provides perspectives, but YOU provide the Verdict.
+
+**CRITICAL CONTEXT CHECK:**
+- If this is **Zone A (`r/conspiracy` etc.)**: Did the Council falsely Acquit? Scrutinize "Just Asking Questions" defenses.
+- If this is **Zone B (`r/geopolitics` etc.)**: Did the Council falsely Convict? Ensure they didn't mistake military analysis for conspiracy.
+- If this is **Zone C (`r/samharris` etc.)**: Did the Council miss the Meta-Commentary layer?
+
+**EXECUTION STEPS:**
+1. **Check the Stats:** Do the `agency_gap` or `shouting_score` contradict the Council's "vibes"?
+2. **Consult Precedents:** Does this text resemble a known "Hard Negative" (Satire/Debunking) from the RAG section?
+3. **Weigh the Dissent:** If the Council is split, does the Minority Opinion align better with the **Forensic Data** and **Source Context**?
+
+**VERDICT:**
+- If the text is genuinely ambiguous -> **Acquit (Non) with Low Confidence**.
+- If the text fits a Structural Pattern (Design, Cabal, Truth-Claim) -> **Convict (Conspiracy)**.
+
+**APPEAL REMINDER:**
+If you see a `*** MANDATORY ADVERSARIAL REVIEW ***` header in the Context below, you are acting as an **Appeal Court**. You must resolve the ambiguity. Do not hedge.

@@ -1,0 +1,47 @@
+# REFERENCE CASE STUDIES (Contextual Learning)
+*Use these examples to see how the dataset labels both Conspiracy and Neutral texts.*
+{{few_shot_examples}}
+
+---
+
+# TARGET TEXT
+**Source Context:** r/{{subreddit}}
+"""
+{{text}}
+"""
+
+---
+
+# FINAL EXTRACTION TASK
+
+## 1. APPLY CONTEXTUAL LENS (SOURCE PRIORS)
+Check the **Source Context** (r/{{subreddit}}) above and select the operating mode:
+
+### 🔴 ZONE A: HIGH CONFIDENCE CONSPIRACY
+* **Subreddits:** `conspiracy`, `conspiracy_commons`, `NoNewNormal`, `Wuhan_Flu`, `OccultConspiracy`, `Retconned`, `AlternativeHistory`, `collapse`.
+* **Assumption:** **ENDORSEMENT.** The author likely believes the claim.
+* **Action:** Extract aggressive "Vague Actors" (Them, They, Elites). Treat rhetorical questions as assertions.
+
+### 🟡 ZONE B: GEOPOLITICS & DEFENSE (False Positive Risk)
+* **Subreddits:** `geopolitics`, `CredibleDefense`, `LessCredibleDefence`, `WarCollege`, `pakistan`, `HongKong`, `worldnews`, `news`.
+* **Assumption:** **REPORTING / ANALYSIS.**
+* **Action:** Extract "State Actors" (CIA, China, Russia) but label them as **Neutral/Political**, not "Malicious Cabal" unless the tone is highly emotional/unhinged. Distinguish "Covert Ops analysis" from "Conspiracy Theory".
+
+### 🟢 ZONE C: INTELLECTUAL & META (Meta-Commentary Risk)
+* **Subreddits:** `samharris`, `IntellectualDarkWeb`, `TrueReddit`, `TheMotte`, `JordanPeterson`, `philosophy`, `TopMindsOfReddit`, `skeptic`.
+* **Assumption:** **COMMENTARY / DEBUNKING.**
+* **Action:** **CRITICAL GUARDRAIL.** Distinguish "Narrated Events" from "Opinions about the Sub/Person."
+    * *Ignore:* "Sam would like this", "This sub is crazy", "Imagine believing X".
+    * *Extract:* Only extract claims if the author presents them as factual events happening in the world.
+
+### ⚪ ZONE D: CASUAL / HOBBY (Low Risk)
+* **Subreddits:** All others (`gaming`, `movies`, `technology`, `science`, `AskReddit`).
+* **Assumption:** **NEUTRAL.**
+* **Action:** Only extract if there is a sudden, jarring shift to conspiracy topics.
+
+## 2. EXTRACTION EXECUTION
+1.  **Identify Entities:** Find Actors (people, orgs, "They") and Actions (verbs, events).
+2.  **Filter Noise:**
+    - **Do NOT** filter out "neutral" events (e.g., government acts, news reports).
+    - **Do NOT** extract Meta-Commentary (e.g., "I think...", "This sub...").
+3.  **Format:** Strict JSON.

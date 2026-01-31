@@ -1,5 +1,7 @@
 ## CASE EVIDENCE (PRIMARY SOURCE)
 
+**Source Context:** r/{{subreddit}}
+
 ### Text Under Analysis
 {{text}}
 
@@ -8,39 +10,54 @@
 
 ---
 
+## LEGAL PRECEDENTS (RAG CONTEXT)
+*Review these similar past cases to calibrate your standard of proof.*
+{{rag_context}}
+
+---
+
 ## INSTRUCTIONS (BLIND & INDEPENDENT VOTE)
 
 You are voting **INDEPENDENTLY**.
 You have **NOT** seen any other juror’s vote or analysis.
 
-Analyze the evidence **only** according to your assigned role and framework.
+**STEP 1: APPLY CONTEXTUAL FRAMEWORK**
+Check the **Source Context** above to adjust your "Standard of Proof":
 
-Do **NOT** infer intent beyond what your role permits.
-Do **NOT** assume endorsement unless justified by your role’s standards.
+* **IF `r/conspiracy`, `r/NoNewNormal`, `r/Wuhan_Flu`:**
+    * **Assumption:** The author likely *believes* the claim.
+    * **Ambiguity:** Treat rhetorical questions ("Why are they hiding it?") as **Accusations**, not genuine queries.
+    
+* **IF `r/geopolitics`, `r/CredibleDefense`, `r/news`:**
+    * **Assumption:** The author is likely *analyzing* statecraft.
+    * **Ambiguity:** Discussion of "covert operations" or "intelligence agencies" is likely **Standard Analysis**, not a Conspiracy Theory, unless it alleges a secret *illegitimate* cabal.
+
+* **IF `r/samharris`, `r/skeptic`, `r/TopMindsOfReddit`:**
+    * **Assumption:** The author is likely *analyzing* the discourse.
+    * **Ambiguity:** A description of a plot is likely a **Summary for Refutation** or **Meta-Commentary**, not an endorsement.
+
+**STEP 2: EXECUTE YOUR ROLE**
+Analyze the evidence according to your specific persona (Literalist/Defense/etc.), keeping the context in mind.
 
 ---
 
-## REQUIRED OUTPUT FORMAT (STRICT)
+## REQUIRED OUTPUT FORMAT (STRICT JSON)
 
 Provide **all** of the following fields:
 
 - **verdict:** `"conspiracy"` or `"non"`
 - **confidence:** Float between `0.0` and `1.0`  
   - `0.5` = genuinely uncertain
-- **rationale:**  
-  - 2–3 sentences  
-  - Reference the **text**, not other jurors
-- **key_signal:**  
-  - The **single most important phrase, pattern, or signal**
-- **steelman_opposing:**  
-  - The **strongest argument** for the opposite verdict
-- **uncertainty_flags:**  
-  - Bullet list of factors that make this case ambiguous or borderline
+- **rationale:** - 2–3 sentences  
+  - **Explicitly mention if the Subreddit Context influenced your interpretation of ambiguity.**
+- **key_signal:** - The **single most important phrase, pattern, or signal**
+- **steelman_opposing:** - The **strongest argument** for the opposite verdict
+- **uncertainty_flags:** - Bullet list of factors that make this case ambiguous or borderline
 
 ---
 
 ## CALIBRATION REMINDER
 
-- Questions ≠ endorsement unless **presuppositional**
-- Reporting ≠ belief unless **affirmed**
-- Ambiguity should be reflected in **confidence**, not ignored
+- Questions ≠ endorsement unless **presuppositional** (and context implies malice).
+- Reporting ≠ belief unless **affirmed** (or context implies a shared agenda).
+- Ambiguity should be reflected in **confidence**, not ignored.
